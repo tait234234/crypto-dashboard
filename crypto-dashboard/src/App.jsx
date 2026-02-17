@@ -39,21 +39,21 @@ function useTrendingTokens() {
 
   const fetchTrending = useCallback(async () => {
     try {
-      // Step 1: Get top boosted tokens (these are trending)
+      // Step 1: Get top boosted tokens
       const boostRes = await fetch("https://api.dexscreener.com/token-boosts/top/v1");
-      if (!boostRes.ok) throw new Error("DexScreener boost API failed");
+      if (!boostRes.ok) throw new Error("DexScreener boost API failed (" + boostRes.status + ")");
       const boostData = await boostRes.json();
 
-      // Filter for Solana and Base chains, get unique token addresses
+      // Filter for Solana and Base, deduplicate
       const seen = new Set();
-      const relevantTokens = boostData
+      const relevantTokens = (Array.isArray(boostData) ? boostData : [])
         .filter((t) => t.chainId === "solana" || t.chainId === "base")
         .filter((t) => {
           if (seen.has(t.tokenAddress)) return false;
           seen.add(t.tokenAddress);
           return true;
         })
-        .slice(0, 20);
+        .slice(0, 24);
 
       if (relevantTokens.length === 0) {
         setTokens([]);
@@ -62,18 +62,35 @@ function useTrendingTokens() {
         return;
       }
 
-      // Step 2: Fetch detailed pair data for each token
-      // DexScreener allows batch token lookups (comma separated, max 30)
-      const tokenAddresses = relevantTokens.map((t) => t.tokenAddress).join(",");
-      const detailRes = await fetch(
-        `https://api.dexscreener.com/tokens/v1/${tokenAddresses}`
-      );
-      if (!detailRes.ok) throw new Error("DexScreener token API failed");
-      const pairs = await detailRes.json();
+      // Step 2: Group tokens by chain (API requires chainId in path)
+      const byChain = {};
+      relevantTokens.forEach((t) => {
+        if (!byChain[t.chainId]) byChain[t.chainId] = [];
+        byChain[t.chainId].push(t);
+      });
 
-      // Group pairs by token, pick the highest volume pair per token
+      // Step 3: Fetch pair data per chain (max 30 addresses per call)
+      const allPairs = [];
+      for (const [chainId, chainTokens] of Object.entries(byChain)) {
+        const addresses = chainTokens.map((t) => t.tokenAddress).join(",");
+        try {
+          const res = await fetch(
+            `https://api.dexscreener.com/tokens/v1/${chainId}/${addresses}`
+          );
+          if (res.ok) {
+            const pairs = await res.json();
+            if (Array.isArray(pairs)) {
+              allPairs.push(...pairs);
+            }
+          }
+        } catch (e) {
+          console.warn(`Failed to fetch ${chainId} tokens:`, e);
+        }
+      }
+
+      // Step 4: Pick highest volume pair per token
       const tokenMap = new Map();
-      (Array.isArray(pairs) ? pairs : []).forEach((pair) => {
+      allPairs.forEach((pair) => {
         const addr = pair.baseToken?.address;
         if (!addr) return;
         const existing = tokenMap.get(addr);
@@ -82,7 +99,10 @@ function useTrendingTokens() {
         }
       });
 
-      // Build token list with boost info
+      // Step 5: Build enriched token list
+      const boostMap = new Map();
+      relevantTokens.forEach((t) => boostMap.set(t.tokenAddress, t));
+
       const enrichedTokens = relevantTokens
         .map((boost) => {
           const pair = tokenMap.get(boost.tokenAddress);
@@ -91,11 +111,10 @@ function useTrendingTokens() {
             ...pair,
             boostAmount: boost.totalAmount || 0,
             icon: boost.icon || pair.info?.imageUrl || null,
-            chainId: boost.chainId,
           };
         })
         .filter(Boolean)
-        .filter((t) => t.volume?.h24 > 1000) // Filter out dead tokens
+        .filter((t) => (t.volume?.h24 || 0) > 500)
         .sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0))
         .slice(0, 12);
 
@@ -110,7 +129,7 @@ function useTrendingTokens() {
 
   useEffect(() => {
     fetchTrending();
-    const interval = setInterval(fetchTrending, 120000); // Refresh every 2 min
+    const interval = setInterval(fetchTrending, 120000);
     return () => clearInterval(interval);
   }, [fetchTrending]);
 
@@ -144,8 +163,7 @@ function formatVolume(num) {
 
 function formatAge(createdAt) {
   if (!createdAt) return "—";
-  const now = Date.now();
-  const diffMs = now - createdAt;
+  const diffMs = Date.now() - createdAt;
   const diffMins = diffMs / 60000;
   if (diffMins < 60) return Math.round(diffMins) + "m";
   const diffHrs = diffMins / 60;
@@ -162,14 +180,12 @@ function getChainLabel(chainId) {
   return chainId?.toUpperCase() || "?";
 }
 
-// Generate a color from token name for avatar bg
 function hashColor(str) {
   let hash = 0;
   for (let i = 0; i < (str || "").length; i++) {
     hash = str.charCodeAt(i) + ((hash << 5) - hash);
   }
-  const h = Math.abs(hash) % 360;
-  return `hsl(${h}, 40%, 15%)`;
+  return `hsl(${Math.abs(hash) % 360}, 40%, 15%)`;
 }
 
 // ─── Components ───
@@ -224,12 +240,7 @@ const TokenCard = ({ pair }) => {
   const dexUrl = pair.url || `https://dexscreener.com/${pair.chainId}/${pair.pairAddress}`;
 
   return (
-    <a
-      href={dexUrl}
-      target="_blank"
-      rel="noopener noreferrer"
-      style={{ textDecoration: "none", color: "inherit" }}
-    >
+    <a href={dexUrl} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "none", color: "inherit" }}>
       <div
         style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 14, padding: "18px 20px", display: "flex", flexDirection: "column", gap: 4, transition: "border-color 0.2s", cursor: "pointer", height: "100%" }}
         onMouseEnter={(e) => (e.currentTarget.style.borderColor = "#334155")}
@@ -237,38 +248,30 @@ const TokenCard = ({ pair }) => {
       >
         <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
           <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-            {iconUrl ? (
-              <img
-                src={iconUrl}
-                alt={symbol}
-                style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid #ffffff11", objectFit: "cover" }}
-                onError={(e) => { e.target.style.display = "none"; e.target.nextSibling.style.display = "flex"; }}
-              />
-            ) : null}
-            <div
-              style={{
-                width: 40, height: 40, borderRadius: 10, background: hashColor(symbol),
-                display: iconUrl ? "none" : "flex", alignItems: "center", justifyContent: "center",
-                fontSize: 14, fontWeight: 700, color: "#e2e8f0", border: "1px solid #ffffff11",
-              }}
-            >
-              {symbol.slice(0, 2)}
+            <div style={{ position: "relative", width: 40, height: 40 }}>
+              {iconUrl && (
+                <img src={iconUrl} alt={symbol} style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid #ffffff11", objectFit: "cover", position: "absolute", top: 0, left: 0 }}
+                  onError={(e) => { e.target.style.display = "none"; }}
+                />
+              )}
+              <div style={{ width: 40, height: 40, borderRadius: 10, background: hashColor(symbol), display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 700, color: "#e2e8f0", border: "1px solid #ffffff11" }}>
+                {symbol.slice(0, 2)}
+              </div>
             </div>
             <div>
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                 <span style={{ color: "#f1f5f9", fontWeight: 700, fontSize: 15, letterSpacing: 0.3 }}>{symbol}</span>
                 <ChainBadge chain={chain} />
+                {pair.boostAmount > 0 && (
+                  <span style={{ fontSize: 10, color: "#f59e0b", fontWeight: 600 }}>🔥 {pair.boostAmount}</span>
+                )}
               </div>
               <div style={{ color: "#94a3b8", fontSize: 12, marginTop: 2, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</div>
               <div style={{ color: "#64748b", fontSize: 11, marginTop: 2 }}>
                 Age <span style={{ color: "#94a3b8" }}>{age}</span>
+                {"  "}Price <span style={{ color: "#94a3b8" }}>{pair.priceUsd ? formatPrice(parseFloat(pair.priceUsd)) : "—"}</span>
               </div>
             </div>
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
-            <span style={{ color: "#94a3b8", fontSize: 11, fontWeight: 600 }}>
-              {pair.priceUsd ? formatPrice(parseFloat(pair.priceUsd)) : "—"}
-            </span>
           </div>
         </div>
 
@@ -406,9 +409,7 @@ export default function App() {
         </div>
 
         {priceError && (
-          <div style={{ background: "#7f1d1d33", border: "1px solid #991b1b", borderRadius: 8, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 13 }}>
-            ⚠ Price fetch failed: {priceError}
-          </div>
+          <div style={{ background: "#7f1d1d33", border: "1px solid #991b1b", borderRadius: 8, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 13 }}>⚠ Price fetch failed: {priceError}</div>
         )}
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16 }}>
@@ -441,18 +442,12 @@ export default function App() {
 
       {/* Trending Tokens */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 16 }}>
-        <h2 style={{ fontSize: 16, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#f1f5f9", margin: 0 }}>
-          🔥 Trending Tokens
-        </h2>
-        <span style={{ color: "#64748b", fontSize: 12 }}>
-          Powered by DexScreener • Updates every 2 min
-        </span>
+        <h2 style={{ fontSize: 16, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#f1f5f9", margin: 0 }}>🔥 Trending Tokens</h2>
+        <span style={{ color: "#64748b", fontSize: 12 }}>Powered by DexScreener • Click to view</span>
       </div>
 
       {tokenError && (
-        <div style={{ background: "#7f1d1d33", border: "1px solid #991b1b", borderRadius: 8, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 13 }}>
-          ⚠ Token fetch failed: {tokenError}. Will retry...
-        </div>
+        <div style={{ background: "#7f1d1d33", border: "1px solid #991b1b", borderRadius: 8, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 13 }}>⚠ Token fetch failed: {tokenError}. Will retry...</div>
       )}
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 14 }}>
@@ -464,14 +459,11 @@ export default function App() {
       </div>
 
       {!tokenLoading && filteredTokens.length === 0 && !tokenError && (
-        <div style={{ textAlign: "center", color: "#475569", padding: 48, fontSize: 14 }}>
-          No trending tokens found for this chain right now.
-        </div>
+        <div style={{ textAlign: "center", color: "#475569", padding: 48, fontSize: 14 }}>No trending tokens found for this chain right now.</div>
       )}
 
-      {/* Footer */}
       <div style={{ textAlign: "center", color: "#334155", fontSize: 11, marginTop: 40, paddingBottom: 20 }}>
-        Prices from CoinGecko • Token data from DexScreener • Click any token to view on DexScreener
+        Prices from CoinGecko • Tokens from DexScreener • Auto-refreshes every 2 min
       </div>
     </div>
   );
