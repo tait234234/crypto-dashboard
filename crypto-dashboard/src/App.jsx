@@ -290,32 +290,36 @@ function getHealthLabel(score) {
 // ─── Bot / Wash Trade Detection ───
 function detectSuspicious(pair) {
   const vol24 = pair.volume?.h24 || 0;
-  const vol6h = pair.volume?.h6 || 0;
   const vol1h = pair.volume?.h1 || 0;
   const liq = pair.liquidity?.usd || 0;
   const buys = pair.txns?.h24?.buys || 0;
   const sells = pair.txns?.h24?.sells || 0;
   const totalTxns = buys + sells;
-  const reasons = [];
+  const volLiqRatio = liq > 0 ? vol24 / liq : 0;
+  const avgTxSize = totalTxns > 0 ? vol24 / totalTxns : 0;
+  const buyPct = totalTxns > 0 ? buys / totalTxns : 0;
 
-  // Extreme vol/liq ratio — likely wash trading
-  if (liq > 0 && vol24 / liq > 40) reasons.push("vol/liq >40x");
+  const strong = []; // 1 alone = flagged
+  const soft = [];   // need 2 = flagged
 
-  // Avg transaction size under $8 — micro-bot pattern
-  if (totalTxns > 50 && vol24 / totalTxns < 8) reasons.push("avg tx <$8");
+  // ── Strong signals (single one is damning enough) ──
+  if (volLiqRatio > 80) strong.push(`vol/liq ${Math.round(volLiqRatio)}x`);
+  if (totalTxns > 20 && buyPct > 0.95 && vol24 > 10000) strong.push(">95% buys");
 
-  // Suspiciously uniform volume across timeframes (bot keeps steady cadence)
-  // If 1h vol * 24 ≈ h24 vol within 5%, it's too perfect
-  if (vol1h > 0 && vol24 > 0) {
-    const projected = vol1h * 24;
-    const deviation = Math.abs(projected - vol24) / vol24;
-    if (deviation < 0.05 && totalTxns > 100) reasons.push("uniform vol");
+  // ── Soft signals (need 2 together) ──
+  if (volLiqRatio > 22) soft.push(`vol/liq ${Math.round(volLiqRatio)}x`);
+  if (totalTxns > 25 && avgTxSize < 20) soft.push(`avg tx $${avgTxSize.toFixed(0)}`);
+  if (totalTxns > 20 && buyPct > 0.88 && vol24 > 15000) soft.push(`${(buyPct * 100).toFixed(0)}% buys`);
+  // Uniform cadence: 1h × 24 ≈ h24 within 10% (organic trading is never this regular)
+  if (vol1h > 0 && vol24 > 0 && totalTxns > 40) {
+    const deviation = Math.abs(vol1h * 24 - vol24) / vol24;
+    if (deviation < 0.10) soft.push("uniform vol");
   }
+  // PumpSwap new token with suspicious vol structure
+  if (pair.dexId === "pumpswap" && volLiqRatio > 15 && totalTxns > 50) soft.push("pumpswap+high vol");
 
-  // Near-100% buy ratio with huge volume = pump without organic sell pressure
-  if (totalTxns > 30 && buys / totalTxns > 0.92 && vol24 > 50000) reasons.push(">92% buys");
-
-  return { isSuspicious: reasons.length >= 2, reasons };
+  const reasons = strong.length >= 1 ? strong : soft.length >= 2 ? soft : [];
+  return { isSuspicious: reasons.length > 0, reasons };
 }
 
 // ─── Components ───
@@ -369,7 +373,7 @@ const PriceChangeText = ({ value }) => {
   return <span style={{ color: positive ? "#4ade80" : "#f87171", fontSize: 13, fontWeight: 600 }}>{formatChange(value)}</span>;
 };
 
-const TokenCard = ({ pair }) => {
+const TokenCard = ({ pair, onBubblemap }) => {
   const symbol = pair.baseToken?.symbol || "???";
   const name = pair.baseToken?.name || "Unknown";
   const chain = getChainLabel(pair.chainId);
@@ -433,7 +437,14 @@ const TokenCard = ({ pair }) => {
               </div>
             </div>
           </div>
-          <HealthBadge score={healthScore} />
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8, flexShrink: 0 }}>
+            <HealthBadge score={healthScore} />
+            <button
+              onClick={(e) => { e.preventDefault(); e.stopPropagation(); onBubblemap && onBubblemap(pair); }}
+              title="View Bubblemaps holder distribution"
+              style={{ background: "#6366f118", border: "1px solid #6366f144", borderRadius: 7, color: "#a5b4fc", fontSize: 11, fontWeight: 700, cursor: "pointer", padding: "3px 9px", display: "flex", alignItems: "center", gap: 4, whiteSpace: "nowrap" }}
+            >🫧 Bubblemap</button>
+          </div>
         </div>
 
         <div style={{ marginTop: 10 }}>
@@ -482,6 +493,63 @@ const TokenCard = ({ pair }) => {
         )}
       </div>
     </a>
+  );
+};
+
+// ─── Bubblemaps chain id mapping ───
+const BUBBLEMAP_CHAIN = { solana: "solana", base: "base", ethereum: "eth", bsc: "bsc" };
+
+const BubblemapsModal = ({ pair, onClose }) => {
+  const chain = BUBBLEMAP_CHAIN[pair.chainId] || pair.chainId;
+  const addr = pair.baseToken?.address || "";
+  const symbol = pair.baseToken?.symbol || "";
+  const src = `https://iframe.bubblemaps.io/map?address=${addr}&chain=${chain}&partnerId=demo`;
+
+  // Close on backdrop click or Escape key
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      onClick={onClose}
+      style={{ position: "fixed", inset: 0, background: "#00000088", backdropFilter: "blur(4px)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ background: "#0d1321", border: "1px solid #334155", borderRadius: 16, width: "100%", maxWidth: 900, height: "80vh", display: "flex", flexDirection: "column", overflow: "hidden" }}
+      >
+        {/* Header */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 20px", borderBottom: "1px solid #1e293b", flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontSize: 20 }}>🫧</span>
+            <span style={{ color: "#f1f5f9", fontWeight: 700, fontSize: 16 }}>Bubblemaps — {symbol}</span>
+            <span style={{ color: "#64748b", fontSize: 12, fontFamily: "monospace" }}>{addr.slice(0, 8)}…{addr.slice(-6)}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <a
+              href={`https://app.bubblemaps.io/${chain}/token/${addr}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: "#a5b4fc", fontSize: 12, fontWeight: 600, textDecoration: "none", border: "1px solid #6366f144", borderRadius: 6, padding: "4px 10px", background: "#6366f118" }}
+            >Open full site ↗</a>
+            <button
+              onClick={onClose}
+              style={{ background: "transparent", border: "1px solid #334155", borderRadius: 8, color: "#94a3b8", fontSize: 18, cursor: "pointer", padding: "2px 10px", lineHeight: 1 }}
+            >×</button>
+          </div>
+        </div>
+        {/* Bubblemaps iframe */}
+        <iframe
+          src={src}
+          title={`Bubblemaps ${symbol}`}
+          style={{ flex: 1, border: "none", width: "100%", background: "#0a0f1a" }}
+          allow="clipboard-write"
+        />
+      </div>
+    </div>
   );
 };
 
@@ -536,6 +604,7 @@ export default function App() {
   const [sortBy, setSortBy] = useState("volume");
   const [minHealth, setMinHealth] = useState(0);
   const [hideBots, setHideBots] = useState(true);
+  const [bubblemapPair, setBubblemapPair] = useState(null);
 
   useEffect(() => {
     if (prices || tokens.length > 0) setLastUpdated(new Date());
@@ -731,7 +800,7 @@ export default function App() {
         {tokenLoading
           ? [1, 2, 3, 4, 5, 6].map((i) => <TokenSkeleton key={i} />)
           : filteredTokens.map((pair, i) => (
-              <TokenCard key={`${pair.pairAddress}-${i}`} pair={pair} />
+              <TokenCard key={`${pair.pairAddress}-${i}`} pair={pair} onBubblemap={setBubblemapPair} />
             ))}
       </div>
 
@@ -742,6 +811,10 @@ export default function App() {
       <div style={{ textAlign: "center", color: "#334155", fontSize: 11, marginTop: 40, paddingBottom: 20 }}>
         Prices from CoinGecko • Tokens from DexScreener • Auto-refreshes every 2 min
       </div>
+
+      {bubblemapPair && (
+        <BubblemapsModal pair={bubblemapPair} onClose={() => setBubblemapPair(null)} />
+      )}
     </div>
   );
 }
