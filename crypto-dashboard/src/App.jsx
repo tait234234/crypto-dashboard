@@ -322,6 +322,41 @@ function detectSuspicious(pair) {
   return { isSuspicious: reasons.length > 0, reasons };
 }
 
+// ─── Token Lookup by Mint Address ───
+function useTokenLookup() {
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const lookup = useCallback(async (address) => {
+    const addr = address.trim();
+    if (!addr) return;
+    setLoading(true);
+    setError(null);
+    setResult(null);
+    try {
+      const res = await fetch(`https://api.dexscreener.com/tokens/v1/solana/${addr}`);
+      if (!res.ok) throw new Error("DexScreener returned an error");
+      const pairs = await res.json();
+      if (!Array.isArray(pairs) || pairs.length === 0) throw new Error("No pairs found for this address — it may not be tradeable yet");
+      // Pick the highest-liquidity Solana pair
+      const best = [...pairs]
+        .filter((p) => p.chainId === "solana")
+        .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
+      if (!best) throw new Error("No Solana pair found for this token");
+      setResult(best);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const clear = useCallback(() => { setResult(null); setError(null); }, []);
+
+  return { result, loading, error, lookup, clear };
+}
+
 // ─── Components ───
 const ChainBadge = ({ chain }) => {
   const colors = {
@@ -401,11 +436,11 @@ const TokenCard = ({ pair, onBubblemap }) => {
   const isSuspicious = pair._isSuspicious || false;
 
   return (
-    <a href={dexUrl} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "none", color: "inherit" }}>
       <div
         style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 14, padding: "18px 20px", display: "flex", flexDirection: "column", gap: 4, transition: "border-color 0.2s", cursor: "pointer", height: "100%" }}
         onMouseEnter={(e) => (e.currentTarget.style.borderColor = "#334155")}
         onMouseLeave={(e) => (e.currentTarget.style.borderColor = "#1e293b")}
+        onClick={() => window.open(dexUrl, "_blank", "noopener,noreferrer")}
       >
         <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
           <div style={{ display: "flex", gap: 12, alignItems: "center", flex: 1, minWidth: 0 }}>
@@ -440,7 +475,7 @@ const TokenCard = ({ pair, onBubblemap }) => {
           <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8, flexShrink: 0 }}>
             <HealthBadge score={healthScore} />
             <button
-              onClick={(e) => { e.preventDefault(); e.stopPropagation(); onBubblemap && onBubblemap(pair); }}
+              onClick={(e) => { e.stopPropagation(); onBubblemap && onBubblemap(pair); }}
               title="View Bubblemaps holder distribution"
               style={{ background: "#6366f118", border: "1px solid #6366f144", borderRadius: 7, color: "#a5b4fc", fontSize: 11, fontWeight: 700, cursor: "pointer", padding: "3px 9px", display: "flex", alignItems: "center", gap: 4, whiteSpace: "nowrap" }}
             >🫧 Bubblemap</button>
@@ -491,8 +526,27 @@ const TokenCard = ({ pair, onBubblemap }) => {
             <span style={{ color: "#f87171", fontSize: 11, fontWeight: 600 }}>Suspicious: {pair._suspiciousReasons?.join(", ")}</span>
           </div>
         )}
+
+        {/* Action buttons */}
+        <div style={{ display: "flex", gap: 8, marginTop: 10 }} onClick={(e) => e.stopPropagation()}>
+          <a
+            href={`https://jup.ag/swap/SOL-${tokenAddr}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, background: "#16a34a18", border: "1px solid #16a34a44", borderRadius: 8, padding: "7px 0", color: "#4ade80", fontSize: 12, fontWeight: 700, textDecoration: "none" }}
+          >
+            <span>◎</span> Buy on Jupiter
+          </a>
+          <a
+            href={dexUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, background: "#0d1321", border: "1px solid #1e293b", borderRadius: 8, padding: "7px 0", color: "#64748b", fontSize: 12, fontWeight: 700, textDecoration: "none" }}
+          >
+            Chart ↗
+          </a>
+        </div>
       </div>
-    </a>
   );
 };
 
@@ -598,6 +652,8 @@ const LiveIndicator = () => (
 export default function App() {
   const { prices, loading: priceLoading, error: priceError, refetch: refetchPrices } = useCryptoPrices();
   const { tokens, loading: tokenLoading, error: tokenError, refetch: refetchTokens } = useTrendingTokens();
+  const { result: lookupResult, loading: lookupLoading, error: lookupError, lookup, clear: clearLookup } = useTokenLookup();
+  const [searchAddr, setSearchAddr] = useState("");
   const [lastUpdated, setLastUpdated] = useState(null);
   const [sortBy, setSortBy] = useState("volume");
   const [minHealth, setMinHealth] = useState(0);
@@ -605,6 +661,18 @@ export default function App() {
   const [minMcap, setMinMcap] = useState(100_000);
   const [hideBots, setHideBots] = useState(true);
   const [bubblemapPair, setBubblemapPair] = useState(null);
+
+  const handleLookup = () => {
+    const addr = searchAddr.trim();
+    if (addr.length >= 32) lookup(addr);
+  };
+
+  // Enrich a lookup result the same way trending tokens are enriched
+  const enrichLookup = (pair) => {
+    if (!pair) return null;
+    const { isSuspicious, reasons } = detectSuspicious(pair);
+    return { ...pair, _healthScore: calculateHealthScore(pair), _isSuspicious: isSuspicious, _suspiciousReasons: reasons };
+  };
 
   useEffect(() => {
     if (prices || tokens.length > 0) setLastUpdated(new Date());
@@ -718,6 +786,47 @@ export default function App() {
                 );
               })}
         </div>
+      </div>
+
+      {/* Token Address Lookup */}
+      <div style={{ marginBottom: 24 }}>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input
+            value={searchAddr}
+            onChange={(e) => setSearchAddr(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleLookup()}
+            placeholder="Paste any Solana token address to look it up…"
+            style={{
+              flex: 1, background: "#111827", border: "1px solid #1e293b", borderRadius: 10,
+              padding: "10px 14px", color: "#f1f5f9", fontSize: 13, fontFamily: "monospace",
+              outline: "none", transition: "border-color 0.2s",
+            }}
+            onFocus={(e) => (e.target.style.borderColor = "#6366f1")}
+            onBlur={(e) => (e.target.style.borderColor = "#1e293b")}
+          />
+          <button
+            onClick={handleLookup}
+            disabled={lookupLoading}
+            style={{ background: "#6366f1", border: "none", borderRadius: 10, color: "#fff", fontWeight: 700, fontSize: 13, padding: "10px 20px", cursor: "pointer", opacity: lookupLoading ? 0.6 : 1, whiteSpace: "nowrap" }}
+          >{lookupLoading ? "Looking up…" : "Look up"}</button>
+          {(lookupResult || lookupError) && (
+            <button onClick={() => { clearLookup(); setSearchAddr(""); }} style={{ background: "transparent", border: "1px solid #334155", borderRadius: 10, color: "#64748b", fontSize: 13, padding: "10px 14px", cursor: "pointer" }}>✕ Clear</button>
+          )}
+        </div>
+        {lookupError && (
+          <div style={{ marginTop: 8, color: "#f87171", fontSize: 12, paddingLeft: 4 }}>⚠ {lookupError}</div>
+        )}
+        {lookupResult && (() => {
+          const enriched = enrichLookup(lookupResult);
+          return (
+            <div style={{ marginTop: 12 }}>
+              <div style={{ color: "#a5b4fc", fontSize: 11, fontWeight: 700, marginBottom: 8, letterSpacing: 0.5 }}>📌 PINNED LOOKUP</div>
+              <div style={{ maxWidth: 420 }}>
+                <TokenCard pair={enriched} onBubblemap={setBubblemapPair} />
+              </div>
+            </div>
+          );
+        })()}
       </div>
 
       {/* Trending Tokens */}
