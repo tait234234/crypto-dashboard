@@ -322,6 +322,55 @@ function detectSuspicious(pair) {
   return { isSuspicious: reasons.length > 0, reasons };
 }
 
+// ─── Pinned Tokens (always fetched, always shown regardless of trending) ───
+const PINNED_ADDRESSES = [
+  "HaUXAdAWWUkb2WTmh8z1TdaEmZkYjnQnmC6tHUdTAHvi",
+];
+
+function usePinnedTokens() {
+  const [tokens, setTokens] = useState([]);
+  const [loading, setLoading] = useState(PINNED_ADDRESSES.length > 0);
+
+  const fetchPinned = useCallback(async () => {
+    if (!PINNED_ADDRESSES.length) { setLoading(false); return; }
+    try {
+      const results = await Promise.allSettled(
+        PINNED_ADDRESSES.map((addr) =>
+          fetch(`https://api.dexscreener.com/tokens/v1/solana/${addr}`)
+            .then((r) => (r.ok ? r.json() : []))
+            .catch(() => [])
+        )
+      );
+      const enriched = [];
+      results.forEach((s) => {
+        if (s.status !== "fulfilled" || !Array.isArray(s.value)) return;
+        const pairs = s.value.filter((p) => p.chainId === "solana");
+        if (!pairs.length) return;
+        const best = [...pairs].sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
+        const { isSuspicious, reasons } = detectSuspicious(best);
+        enriched.push({
+          ...best,
+          _pinned: true,
+          _healthScore: calculateHealthScore(best),
+          _isSuspicious: isSuspicious,
+          _suspiciousReasons: reasons,
+        });
+      });
+      setTokens(enriched);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchPinned();
+    const interval = setInterval(fetchPinned, 120000);
+    return () => clearInterval(interval);
+  }, [fetchPinned]);
+
+  return { tokens, loading };
+}
+
 // ─── Token Lookup by Mint Address ───
 function useTokenLookup() {
   const [result, setResult] = useState(null);
@@ -437,9 +486,9 @@ const TokenCard = ({ pair, onBubblemap }) => {
 
   return (
       <div
-        style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 14, padding: "18px 20px", display: "flex", flexDirection: "column", gap: 4, transition: "border-color 0.2s", cursor: "pointer", height: "100%" }}
-        onMouseEnter={(e) => (e.currentTarget.style.borderColor = "#334155")}
-        onMouseLeave={(e) => (e.currentTarget.style.borderColor = "#1e293b")}
+        style={{ background: "#111827", border: `1px solid ${pair._pinned ? "#f59e0b66" : "#1e293b"}`, borderRadius: 14, padding: "18px 20px", display: "flex", flexDirection: "column", gap: 4, transition: "border-color 0.2s", cursor: "pointer", height: "100%" }}
+        onMouseEnter={(e) => (e.currentTarget.style.borderColor = pair._pinned ? "#f59e0b" : "#334155")}
+        onMouseLeave={(e) => (e.currentTarget.style.borderColor = pair._pinned ? "#f59e0b66" : "#1e293b")}
         onClick={() => window.open(dexUrl, "_blank", "noopener,noreferrer")}
       >
         <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
@@ -461,6 +510,9 @@ const TokenCard = ({ pair, onBubblemap }) => {
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                 <span style={{ color: "#f1f5f9", fontWeight: 700, fontSize: 15, letterSpacing: 0.3 }}>{symbol}</span>
                 <ChainBadge chain={chain} />
+                {pair._pinned && (
+                  <span style={{ background: "#f59e0b22", color: "#f59e0b", border: "1px solid #f59e0b55", fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, letterSpacing: 0.5 }}>📌 PINNED</span>
+                )}
                 {pair.boostAmount > 0 && (
                   <span style={{ fontSize: 10, color: "#f59e0b", fontWeight: 600 }}>🔥 {pair.boostAmount}</span>
                 )}
@@ -557,7 +609,6 @@ const BubblemapsModal = ({ pair, onClose }) => {
   const chain = BUBBLEMAP_CHAIN[pair.chainId] || pair.chainId;
   const addr = pair.baseToken?.address || "";
   const symbol = pair.baseToken?.symbol || "";
-  const src = `https://iframe.bubblemaps.io/map?address=${addr}&chain=${chain}&partnerId=demo`;
 
   // Close on backdrop click or Escape key
   useEffect(() => {
@@ -595,13 +646,21 @@ const BubblemapsModal = ({ pair, onClose }) => {
             >×</button>
           </div>
         </div>
-        {/* Bubblemaps iframe */}
-        <iframe
-          src={src}
-          title={`Bubblemaps ${symbol}`}
-          style={{ flex: 1, border: "none", width: "100%", background: "#0a0f1a" }}
-          allow="clipboard-write"
-        />
+        {/* Bubblemaps cannot be iframe-embedded (CSP/X-Frame-Options block on their end) — link out instead */}
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, padding: 40, background: "#0a0f1a" }}>
+          <div style={{ fontSize: 64 }}>🫧</div>
+          <div style={{ color: "#94a3b8", fontSize: 15, textAlign: "center", lineHeight: 1.8 }}>
+            <strong style={{ color: "#f1f5f9" }}>Bubblemaps</strong> blocks direct embedding.<br />
+            Click below to open the full interactive map in a new tab.
+          </div>
+          <a
+            href={`https://app.bubblemaps.io/${chain}/token/${addr}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ background: "#6366f1", color: "#fff", fontWeight: 700, fontSize: 15, padding: "13px 32px", borderRadius: 12, textDecoration: "none", letterSpacing: 0.3, boxShadow: "0 0 28px #6366f155", border: "1px solid #818cf844" }}
+          >Open Bubblemaps ↗</a>
+          <div style={{ fontFamily: "monospace", fontSize: 12, color: "#334155", letterSpacing: 0.5 }}>{addr}</div>
+        </div>
       </div>
     </div>
   );
@@ -652,6 +711,7 @@ const LiveIndicator = () => (
 export default function App() {
   const { prices, loading: priceLoading, error: priceError, refetch: refetchPrices } = useCryptoPrices();
   const { tokens, loading: tokenLoading, error: tokenError, refetch: refetchTokens } = useTrendingTokens();
+  const { tokens: pinnedTokens, loading: pinnedLoading } = usePinnedTokens();
   const { result: lookupResult, loading: lookupLoading, error: lookupError, lookup, clear: clearLookup } = useTokenLookup();
   const [searchAddr, setSearchAddr] = useState("");
   const [lastUpdated, setLastUpdated] = useState(null);
@@ -826,6 +886,23 @@ export default function App() {
           </div>
         )}
       </div>
+
+      {/* Pinned Tokens — always shown, bypass all filters */}
+      {PINNED_ADDRESSES.length > 0 && (
+        <div style={{ marginBottom: 28 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+            <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#f59e0b", margin: 0 }}>📌 Pinned Tokens</h2>
+            <span style={{ color: "#64748b", fontSize: 12 }}>Always shown — refreshes every 2 min</span>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 14 }}>
+            {pinnedLoading
+              ? [1].map((i) => <TokenSkeleton key={i} />)
+              : pinnedTokens.map((pair, i) => (
+                  <TokenCard key={`pinned-${pair.pairAddress}-${i}`} pair={pair} onBubblemap={setBubblemapPair} />
+                ))}
+          </div>
+        </div>
+      )}
 
       {/* Trending Tokens */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 16 }}>
