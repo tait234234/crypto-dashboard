@@ -188,6 +188,69 @@ function hashColor(str) {
   return `hsl(${Math.abs(hash) % 360}, 40%, 15%)`;
 }
 
+// ─── Health Score ───
+function calculateHealthScore(pair) {
+  let score = 0;
+
+  // Liquidity depth (0-25 pts) — low liquidity = easy to rug
+  const liq = pair.liquidity?.usd || 0;
+  if (liq >= 200000) score += 25;
+  else if (liq >= 50000) score += 18;
+  else if (liq >= 10000) score += 10;
+  else if (liq >= 1000) score += 4;
+
+  // Pair age (0-20 pts) — older = more battle-tested
+  const ageMs = pair.pairCreatedAt ? Date.now() - pair.pairCreatedAt : 0;
+  const ageHrs = ageMs / 3600000;
+  if (ageHrs >= 168) score += 20;       // 7d+
+  else if (ageHrs >= 24) score += 15;   // 1d+
+  else if (ageHrs >= 6) score += 8;
+  else if (ageHrs >= 1) score += 3;
+
+  // Volume/Liquidity ratio (0-20 pts) — sweet spot is 0.5-3x, too high = wash trading
+  if (liq > 0) {
+    const vlRatio = (pair.volume?.h24 || 0) / liq;
+    if (vlRatio >= 0.5 && vlRatio <= 3) score += 20;
+    else if (vlRatio > 3 && vlRatio <= 10) score += 10;
+    else if (vlRatio > 10) score += 2;  // suspicious
+    else if (vlRatio > 0.1) score += 12;
+  }
+
+  // Buy/sell balance (0-15 pts) — extreme imbalance = manipulation
+  const buys = pair.txns?.h24?.buys || 0;
+  const sells = pair.txns?.h24?.sells || 0;
+  const totalTxns = buys + sells;
+  if (totalTxns > 0) {
+    const buyRatio = buys / totalTxns;
+    const balance = 1 - Math.abs(buyRatio - 0.5) * 2; // 1 = perfectly balanced, 0 = all one side
+    score += Math.round(balance * 15);
+  }
+
+  // Transaction count (0-10 pts) — more unique txns = more real users
+  if (totalTxns >= 500) score += 10;
+  else if (totalTxns >= 100) score += 7;
+  else if (totalTxns >= 30) score += 4;
+  else if (totalTxns >= 5) score += 2;
+
+  // Has info / socials (0-10 pts) — legit projects fill out their profile
+  const info = pair.info;
+  if (info) {
+    if (info.websites?.length > 0) score += 4;
+    if (info.socials?.length > 0) score += 3;
+    if (info.imageUrl) score += 3;
+  }
+
+  return Math.min(score, 100);
+}
+
+function getHealthLabel(score) {
+  if (score >= 75) return { label: "Strong", color: "#4ade80", bg: "#4ade8018" };
+  if (score >= 55) return { label: "Solid", color: "#a3e635", bg: "#a3e63518" };
+  if (score >= 35) return { label: "Moderate", color: "#fbbf24", bg: "#fbbf2418" };
+  if (score >= 20) return { label: "Risky", color: "#fb923c", bg: "#fb923c18" };
+  return { label: "High Risk", color: "#f87171", bg: "#f8717118" };
+}
+
 // ─── Components ───
 const ChainBadge = ({ chain }) => {
   const colors = {
@@ -200,6 +263,21 @@ const ChainBadge = ({ chain }) => {
     <span style={{ background: c.bg, color: c.text, border: `1px solid ${c.border}`, fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, letterSpacing: 0.5, fontFamily: "monospace" }}>
       {chain}
     </span>
+  );
+};
+
+const HealthBadge = ({ score }) => {
+  const { label, color, bg } = getHealthLabel(score);
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+      <div style={{ background: bg, border: `1px solid ${color}33`, borderRadius: 6, padding: "3px 8px", display: "flex", alignItems: "center", gap: 5 }}>
+        <div style={{ width: 18, height: 18, borderRadius: "50%", background: `conic-gradient(${color} ${score * 3.6}deg, #1e293b ${score * 3.6}deg)`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <div style={{ width: 12, height: 12, borderRadius: "50%", background: "#111827" }} />
+        </div>
+        <span style={{ color, fontSize: 11, fontWeight: 700 }}>{score}</span>
+        <span style={{ color, fontSize: 10, fontWeight: 600, opacity: 0.8 }}>{label}</span>
+      </div>
+    </div>
   );
 };
 
@@ -238,6 +316,7 @@ const TokenCard = ({ pair }) => {
   const age = formatAge(pair.pairCreatedAt);
   const iconUrl = pair.icon || pair.info?.imageUrl || null;
   const dexUrl = pair.url || `https://dexscreener.com/${pair.chainId}/${pair.pairAddress}`;
+  const healthScore = pair._healthScore ?? calculateHealthScore(pair);
 
   return (
     <a href={dexUrl} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "none", color: "inherit" }}>
@@ -247,8 +326,8 @@ const TokenCard = ({ pair }) => {
         onMouseLeave={(e) => (e.currentTarget.style.borderColor = "#1e293b")}
       >
         <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
-          <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-            <div style={{ position: "relative", width: 40, height: 40 }}>
+          <div style={{ display: "flex", gap: 12, alignItems: "center", flex: 1, minWidth: 0 }}>
+            <div style={{ position: "relative", width: 40, height: 40, flexShrink: 0 }}>
               {iconUrl && (
                 <img src={iconUrl} alt={symbol} style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid #ffffff11", objectFit: "cover", position: "absolute", top: 0, left: 0 }}
                   onError={(e) => { e.target.style.display = "none"; }}
@@ -273,6 +352,7 @@ const TokenCard = ({ pair }) => {
               </div>
             </div>
           </div>
+          <HealthBadge score={healthScore} />
         </div>
 
         <div style={{ marginTop: 10 }}>
@@ -352,6 +432,8 @@ export default function App() {
   const { prices, loading: priceLoading, error: priceError, refetch: refetchPrices } = useCryptoPrices();
   const { tokens, loading: tokenLoading, error: tokenError, refetch: refetchTokens } = useTrendingTokens();
   const [lastUpdated, setLastUpdated] = useState(null);
+  const [sortBy, setSortBy] = useState("volume");
+  const [minHealth, setMinHealth] = useState(0);
 
   useEffect(() => {
     if (prices || tokens.length > 0) setLastUpdated(new Date());
@@ -362,12 +444,31 @@ export default function App() {
     refetchTokens();
   };
 
-  const filteredTokens = tokens.filter((t) => {
-    if (activeChain === "All Chains") return true;
-    if (activeChain === "Solana") return t.chainId === "solana";
-    if (activeChain === "Base") return t.chainId === "base";
-    return true;
-  });
+  // Pre-compute health scores once per render
+  const scoredTokens = tokens.map((t) => ({
+    ...t,
+    _healthScore: calculateHealthScore(t),
+  }));
+
+  const filteredTokens = scoredTokens
+    .filter((t) => {
+      if (activeChain === "Solana" && t.chainId !== "solana") return false;
+      if (activeChain === "Base" && t.chainId !== "base") return false;
+      if (t._healthScore < minHealth) return false;
+      return true;
+    })
+    .sort((a, b) => {
+      switch (sortBy) {
+        case "volume": return (b.volume?.h24 || 0) - (a.volume?.h24 || 0);
+        case "mcap": return (b.marketCap || b.fdv || 0) - (a.marketCap || a.fdv || 0);
+        case "health": return b._healthScore - a._healthScore;
+        case "1h": return (b.priceChange?.h1 || 0) - (a.priceChange?.h1 || 0);
+        case "6h": return (b.priceChange?.h6 || 0) - (a.priceChange?.h6 || 0);
+        case "newest": return (b.pairCreatedAt || 0) - (a.pairCreatedAt || 0);
+        case "liquidity": return (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0);
+        default: return 0;
+      }
+    });
 
   const coinConfigs = [
     { id: "bitcoin", symbol: "BTC", color: "#F7931A" },
@@ -444,6 +545,54 @@ export default function App() {
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 16 }}>
         <h2 style={{ fontSize: 16, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#f1f5f9", margin: 0 }}>🔥 Trending Tokens</h2>
         <span style={{ color: "#64748b", fontSize: 12 }}>Powered by DexScreener • Click to view</span>
+      </div>
+
+      {/* Filter Bar */}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 16, alignItems: "center" }}>
+        <span style={{ color: "#64748b", fontSize: 12, fontWeight: 600, marginRight: 4 }}>Sort:</span>
+        {[
+          { key: "volume", label: "Vol 24h" },
+          { key: "mcap", label: "MCap" },
+          { key: "health", label: "Health" },
+          { key: "1h", label: "1h Chg" },
+          { key: "6h", label: "6h Chg" },
+          { key: "liquidity", label: "Liquidity" },
+          { key: "newest", label: "Newest" },
+        ].map((opt) => (
+          <button
+            key={opt.key}
+            onClick={() => setSortBy(opt.key)}
+            style={{
+              padding: "5px 12px", borderRadius: 8, border: "1px solid",
+              fontSize: 12, fontWeight: 600, cursor: "pointer", transition: "all 0.2s",
+              background: sortBy === opt.key ? "#6366f122" : "transparent",
+              borderColor: sortBy === opt.key ? "#6366f1" : "#1e293b",
+              color: sortBy === opt.key ? "#a5b4fc" : "#64748b",
+            }}
+          >{opt.label}</button>
+        ))}
+
+        <div style={{ width: 1, height: 20, background: "#1e293b", margin: "0 6px" }} />
+
+        <span style={{ color: "#64748b", fontSize: 12, fontWeight: 600, marginRight: 4 }}>Min Health:</span>
+        {[
+          { value: 0, label: "All" },
+          { value: 35, label: "35+" },
+          { value: 55, label: "55+" },
+          { value: 75, label: "75+" },
+        ].map((opt) => (
+          <button
+            key={opt.value}
+            onClick={() => setMinHealth(opt.value)}
+            style={{
+              padding: "5px 10px", borderRadius: 8, border: "1px solid",
+              fontSize: 12, fontWeight: 600, cursor: "pointer", transition: "all 0.2s",
+              background: minHealth === opt.value ? "#4ade8018" : "transparent",
+              borderColor: minHealth === opt.value ? "#4ade8044" : "#1e293b",
+              color: minHealth === opt.value ? "#4ade80" : "#64748b",
+            }}
+          >{opt.label}</button>
+        ))}
       </div>
 
       {tokenError && (
