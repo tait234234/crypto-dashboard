@@ -39,21 +39,36 @@ function useTrendingTokens() {
 
   const fetchTrending = useCallback(async () => {
     try {
-      // Step 1: Get top boosted tokens
-      const boostRes = await fetch("https://api.dexscreener.com/token-boosts/top/v1");
-      if (!boostRes.ok) throw new Error("DexScreener boost API failed (" + boostRes.status + ")");
-      const boostData = await boostRes.json();
+      // Step 1: Fetch from 3 endpoints in parallel for maximum coverage
+      const [topBoostRes, latestBoostRes, latestProfileRes] = await Promise.allSettled([
+        fetch("https://api.dexscreener.com/token-boosts/top/v1"),
+        fetch("https://api.dexscreener.com/token-boosts/latest/v1"),
+        fetch("https://api.dexscreener.com/token-profiles/latest/v1"),
+      ]);
 
-      // Filter for Solana and Base, deduplicate
+      const parseRes = async (settled) => {
+        if (settled.status !== "fulfilled" || !settled.value.ok) return [];
+        try {
+          const data = await settled.value.json();
+          return Array.isArray(data) ? data : [];
+        } catch { return []; }
+      };
+
+      const topBoosts = await parseRes(topBoostRes);
+      const latestBoosts = await parseRes(latestBoostRes);
+      const latestProfiles = await parseRes(latestProfileRes);
+
+      // Step 2: Merge all sources, deduplicate, keep Solana + Base
       const seen = new Set();
-      const relevantTokens = (Array.isArray(boostData) ? boostData : [])
+      const allRaw = [...topBoosts, ...latestBoosts, ...latestProfiles];
+      const relevantTokens = allRaw
         .filter((t) => t.chainId === "solana" || t.chainId === "base")
         .filter((t) => {
-          if (seen.has(t.tokenAddress)) return false;
-          seen.add(t.tokenAddress);
+          const addr = t.tokenAddress;
+          if (!addr || seen.has(`${t.chainId}:${addr}`)) return false;
+          seen.add(`${t.chainId}:${addr}`);
           return true;
-        })
-        .slice(0, 24);
+        });
 
       if (relevantTokens.length === 0) {
         setTokens([]);
@@ -62,29 +77,30 @@ function useTrendingTokens() {
         return;
       }
 
-      // Step 2: Group tokens by chain (API requires chainId in path)
+      // Step 3: Group by chain, then batch into chunks of 30 (API limit)
       const byChain = {};
       relevantTokens.forEach((t) => {
         if (!byChain[t.chainId]) byChain[t.chainId] = [];
         byChain[t.chainId].push(t);
       });
 
-      // Step 3: Fetch pair data per chain (max 30 addresses per call)
       const allPairs = [];
       for (const [chainId, chainTokens] of Object.entries(byChain)) {
-        const addresses = chainTokens.map((t) => t.tokenAddress).join(",");
-        try {
-          const res = await fetch(
-            `https://api.dexscreener.com/tokens/v1/${chainId}/${addresses}`
-          );
-          if (res.ok) {
-            const pairs = await res.json();
-            if (Array.isArray(pairs)) {
-              allPairs.push(...pairs);
+        // Chunk into groups of 30
+        for (let i = 0; i < chainTokens.length; i += 30) {
+          const chunk = chainTokens.slice(i, i + 30);
+          const addresses = chunk.map((t) => t.tokenAddress).join(",");
+          try {
+            const res = await fetch(
+              `https://api.dexscreener.com/tokens/v1/${chainId}/${addresses}`
+            );
+            if (res.ok) {
+              const pairs = await res.json();
+              if (Array.isArray(pairs)) allPairs.push(...pairs);
             }
+          } catch (e) {
+            console.warn(`Failed to fetch ${chainId} chunk:`, e);
           }
-        } catch (e) {
-          console.warn(`Failed to fetch ${chainId} tokens:`, e);
         }
       }
 
@@ -93,19 +109,21 @@ function useTrendingTokens() {
       allPairs.forEach((pair) => {
         const addr = pair.baseToken?.address;
         if (!addr) return;
-        const existing = tokenMap.get(addr);
+        const key = `${pair.chainId}:${addr}`;
+        const existing = tokenMap.get(key);
         if (!existing || (pair.volume?.h24 || 0) > (existing.volume?.h24 || 0)) {
-          tokenMap.set(addr, pair);
+          tokenMap.set(key, pair);
         }
       });
 
-      // Step 5: Build enriched token list
+      // Step 5: Build enriched token list — no artificial limits
       const boostMap = new Map();
-      relevantTokens.forEach((t) => boostMap.set(t.tokenAddress, t));
+      relevantTokens.forEach((t) => boostMap.set(`${t.chainId}:${t.tokenAddress}`, t));
 
       const enrichedTokens = relevantTokens
         .map((boost) => {
-          const pair = tokenMap.get(boost.tokenAddress);
+          const key = `${boost.chainId}:${boost.tokenAddress}`;
+          const pair = tokenMap.get(key);
           if (!pair) return null;
           return {
             ...pair,
@@ -114,9 +132,7 @@ function useTrendingTokens() {
           };
         })
         .filter(Boolean)
-        .filter((t) => (t.volume?.h24 || 0) > 500)
-        .sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0))
-        .slice(0, 12);
+        .sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0));
 
       setTokens(enrichedTokens);
       setError(null);
@@ -307,6 +323,9 @@ const TokenCard = ({ pair }) => {
   const name = pair.baseToken?.name || "Unknown";
   const chain = getChainLabel(pair.chainId);
   const mcap = pair.marketCap || pair.fdv || 0;
+  const vol5m = pair.volume?.m5 || 0;
+  const vol1h = pair.volume?.h1 || 0;
+  const vol6h = pair.volume?.h6 || 0;
   const vol24 = pair.volume?.h24 || 0;
   const liq = pair.liquidity?.usd || 0;
   const change1h = pair.priceChange?.h1 ?? null;
@@ -372,9 +391,22 @@ const TokenCard = ({ pair }) => {
               </div>
             </div>
           </div>
-          <div style={{ color: "#64748b", fontSize: 12, marginTop: 6 }}>
-            Vol <span style={{ color: "#94a3b8" }}>{formatVolume(vol24)}</span>
-            {"   "}Liq <span style={{ color: "#94a3b8" }}>{formatVolume(liq)}</span>
+          <div style={{ display: "flex", gap: 10, marginTop: 8, flexWrap: "wrap" }}>
+            {[
+              { label: "5m", val: vol5m },
+              { label: "1h", val: vol1h },
+              { label: "6h", val: vol6h },
+              { label: "24h", val: vol24 },
+            ].map((v) => (
+              <div key={v.label} style={{ background: "#0d1321", borderRadius: 6, padding: "3px 8px", display: "flex", flexDirection: "column", alignItems: "center", minWidth: 52 }}>
+                <span style={{ color: "#475569", fontSize: 9, fontWeight: 600, letterSpacing: 0.5 }}>VOL {v.label}</span>
+                <span style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700 }}>{formatVolume(v.val)}</span>
+              </div>
+            ))}
+            <div style={{ background: "#0d1321", borderRadius: 6, padding: "3px 8px", display: "flex", flexDirection: "column", alignItems: "center", minWidth: 52 }}>
+              <span style={{ color: "#475569", fontSize: 9, fontWeight: 600, letterSpacing: 0.5 }}>LIQ</span>
+              <span style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700 }}>{formatVolume(liq)}</span>
+            </div>
           </div>
         </div>
 
@@ -460,6 +492,8 @@ export default function App() {
     .sort((a, b) => {
       switch (sortBy) {
         case "volume": return (b.volume?.h24 || 0) - (a.volume?.h24 || 0);
+        case "vol6h": return (b.volume?.h6 || 0) - (a.volume?.h6 || 0);
+        case "vol1h": return (b.volume?.h1 || 0) - (a.volume?.h1 || 0);
         case "mcap": return (b.marketCap || b.fdv || 0) - (a.marketCap || a.fdv || 0);
         case "health": return b._healthScore - a._healthScore;
         case "1h": return (b.priceChange?.h1 || 0) - (a.priceChange?.h1 || 0);
@@ -543,7 +577,10 @@ export default function App() {
 
       {/* Trending Tokens */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 16 }}>
-        <h2 style={{ fontSize: 16, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#f1f5f9", margin: 0 }}>🔥 Trending Tokens</h2>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <h2 style={{ fontSize: 16, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#f1f5f9", margin: 0 }}>🔥 Trending Tokens</h2>
+          {!tokenLoading && <span style={{ background: "#6366f122", color: "#a5b4fc", border: "1px solid #6366f144", fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 10 }}>{filteredTokens.length}/{tokens.length}</span>}
+        </div>
         <span style={{ color: "#64748b", fontSize: 12 }}>Powered by DexScreener • Click to view</span>
       </div>
 
@@ -552,6 +589,8 @@ export default function App() {
         <span style={{ color: "#64748b", fontSize: 12, fontWeight: 600, marginRight: 4 }}>Sort:</span>
         {[
           { key: "volume", label: "Vol 24h" },
+          { key: "vol6h", label: "Vol 6h" },
+          { key: "vol1h", label: "Vol 1h" },
           { key: "mcap", label: "MCap" },
           { key: "health", label: "Health" },
           { key: "1h", label: "1h Chg" },
