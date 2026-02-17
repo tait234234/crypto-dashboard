@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 
 // ─── Live Price Hook (CoinGecko) ───
 function useCryptoPrices() {
@@ -530,7 +530,7 @@ const TokenCard = ({ pair, onBubblemap }) => {
         {/* Action buttons */}
         <div style={{ display: "flex", gap: 8, marginTop: 10 }} onClick={(e) => e.stopPropagation()}>
           <a
-            href={`https://jup.ag/swap/SOL-${tokenAddr}`}
+            href={`https://jup.ag/tokens/${tokenAddr}`}
             target="_blank"
             rel="noopener noreferrer"
             style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, background: "#16a34a18", border: "1px solid #16a34a44", borderRadius: 8, padding: "7px 0", color: "#4ade80", fontSize: 12, fontWeight: 700, textDecoration: "none" }}
@@ -667,12 +667,13 @@ export default function App() {
     if (addr.length >= 32) lookup(addr);
   };
 
-  // Enrich a lookup result the same way trending tokens are enriched
-  const enrichLookup = (pair) => {
-    if (!pair) return null;
-    const { isSuspicious, reasons } = detectSuspicious(pair);
-    return { ...pair, _healthScore: calculateHealthScore(pair), _isSuspicious: isSuspicious, _suspiciousReasons: reasons };
-  };
+  // Enrich a lookup result the same way trending tokens are enriched — memoized so it
+  // only reruns when the actual lookup result changes, not on every render
+  const enrichedLookup = useMemo(() => {
+    if (!lookupResult) return null;
+    const { isSuspicious, reasons } = detectSuspicious(lookupResult);
+    return { ...lookupResult, _healthScore: calculateHealthScore(lookupResult), _isSuspicious: isSuspicious, _suspiciousReasons: reasons };
+  }, [lookupResult]);
 
   useEffect(() => {
     if (prices || tokens.length > 0) setLastUpdated(new Date());
@@ -683,8 +684,8 @@ export default function App() {
     refetchTokens();
   };
 
-  // Pre-compute health scores + bot detection once per render
-  const scoredTokens = tokens.map((t) => {
+  // Pre-compute health scores + bot detection — only re-runs when tokens changes
+  const scoredTokens = useMemo(() => tokens.map((t) => {
     const { isSuspicious, reasons } = detectSuspicious(t);
     return {
       ...t,
@@ -692,7 +693,7 @@ export default function App() {
       _isSuspicious: isSuspicious,
       _suspiciousReasons: reasons,
     };
-  });
+  }), [tokens]);
 
   const filteredTokens = scoredTokens
     .filter((t) => {
@@ -816,17 +817,14 @@ export default function App() {
         {lookupError && (
           <div style={{ marginTop: 8, color: "#f87171", fontSize: 12, paddingLeft: 4 }}>⚠ {lookupError}</div>
         )}
-        {lookupResult && (() => {
-          const enriched = enrichLookup(lookupResult);
-          return (
-            <div style={{ marginTop: 12 }}>
-              <div style={{ color: "#a5b4fc", fontSize: 11, fontWeight: 700, marginBottom: 8, letterSpacing: 0.5 }}>📌 PINNED LOOKUP</div>
-              <div style={{ maxWidth: 420 }}>
-                <TokenCard pair={enriched} onBubblemap={setBubblemapPair} />
-              </div>
+        {enrichedLookup && (
+          <div style={{ marginTop: 12 }}>
+            <div style={{ color: "#a5b4fc", fontSize: 11, fontWeight: 700, marginBottom: 8, letterSpacing: 0.5 }}>📌 PINNED LOOKUP</div>
+            <div style={{ maxWidth: 420 }}>
+              <TokenCard pair={enrichedLookup} onBubblemap={setBubblemapPair} />
             </div>
-          );
-        })()}
+          </div>
+        )}
       </div>
 
       {/* Trending Tokens */}
