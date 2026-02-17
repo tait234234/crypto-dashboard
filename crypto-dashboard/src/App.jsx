@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 
 // ─── Live Price Hook (CoinGecko) ───
 function useCryptoPrices() {
@@ -287,6 +287,37 @@ function getHealthLabel(score) {
   return { label: "High Risk", color: "#f87171", bg: "#f8717118" };
 }
 
+// ─── Bot / Wash Trade Detection ───
+function detectSuspicious(pair) {
+  const vol24 = pair.volume?.h24 || 0;
+  const vol6h = pair.volume?.h6 || 0;
+  const vol1h = pair.volume?.h1 || 0;
+  const liq = pair.liquidity?.usd || 0;
+  const buys = pair.txns?.h24?.buys || 0;
+  const sells = pair.txns?.h24?.sells || 0;
+  const totalTxns = buys + sells;
+  const reasons = [];
+
+  // Extreme vol/liq ratio — likely wash trading
+  if (liq > 0 && vol24 / liq > 40) reasons.push("vol/liq >40x");
+
+  // Avg transaction size under $8 — micro-bot pattern
+  if (totalTxns > 50 && vol24 / totalTxns < 8) reasons.push("avg tx <$8");
+
+  // Suspiciously uniform volume across timeframes (bot keeps steady cadence)
+  // If 1h vol * 24 ≈ h24 vol within 5%, it's too perfect
+  if (vol1h > 0 && vol24 > 0) {
+    const projected = vol1h * 24;
+    const deviation = Math.abs(projected - vol24) / vol24;
+    if (deviation < 0.05 && totalTxns > 100) reasons.push("uniform vol");
+  }
+
+  // Near-100% buy ratio with huge volume = pump without organic sell pressure
+  if (totalTxns > 30 && buys / totalTxns > 0.92 && vol24 > 50000) reasons.push(">92% buys");
+
+  return { isSuspicious: reasons.length >= 2, reasons };
+}
+
 // ─── Components ───
 const ChainBadge = ({ chain }) => {
   const colors = {
@@ -353,9 +384,17 @@ const TokenCard = ({ pair }) => {
   const buys24 = pair.txns?.h24?.buys || 0;
   const sells24 = pair.txns?.h24?.sells || 0;
   const age = formatAge(pair.pairCreatedAt);
-  const iconUrl = pair.icon || pair.info?.imageUrl || null;
+  const tokenAddr = pair.baseToken?.address || "";
+  // Icon sources in priority order — CDN URL always works as last resort
+  const iconSources = [
+    pair.icon,
+    pair.info?.imageUrl,
+    tokenAddr ? `https://dd.dexscreener.com/ds-data/tokens/${pair.chainId}/${tokenAddr}/icon.png` : null,
+  ].filter(Boolean);
+  const [iconIdx, setIconIdx] = useState(0);
   const dexUrl = pair.url || `https://dexscreener.com/${pair.chainId}/${pair.pairAddress}`;
   const healthScore = pair._healthScore ?? calculateHealthScore(pair);
+  const isSuspicious = pair._isSuspicious || false;
 
   return (
     <a href={dexUrl} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "none", color: "inherit" }}>
@@ -367,9 +406,12 @@ const TokenCard = ({ pair }) => {
         <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
           <div style={{ display: "flex", gap: 12, alignItems: "center", flex: 1, minWidth: 0 }}>
             <div style={{ position: "relative", width: 44, height: 44, flexShrink: 0 }}>
-              {iconUrl && (
-                <img src={iconUrl} alt={symbol} style={{ width: 44, height: 44, borderRadius: "50%", border: "2px solid #ffffff15", objectFit: "cover", position: "absolute", top: 0, left: 0, zIndex: 1, background: "#111827" }}
-                  onError={(e) => { e.target.style.display = "none"; }}
+              {iconIdx < iconSources.length && (
+                <img
+                  src={iconSources[iconIdx]}
+                  alt={symbol}
+                  style={{ width: 44, height: 44, borderRadius: "50%", border: "2px solid #ffffff15", objectFit: "cover", position: "absolute", top: 0, left: 0, zIndex: 1, background: "#111827" }}
+                  onError={() => setIconIdx((i) => i + 1)}
                 />
               )}
               <div style={{ width: 44, height: 44, borderRadius: "50%", background: hashColor(symbol), display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, fontWeight: 700, color: "#e2e8f0", border: "2px solid #ffffff15" }}>
@@ -431,6 +473,13 @@ const TokenCard = ({ pair }) => {
         </div>
 
         <BuySellBar buys={buys24} sells={sells24} />
+
+        {isSuspicious && (
+          <div style={{ marginTop: 8, background: "#f8717111", border: "1px solid #f8717133", borderRadius: 6, padding: "4px 10px", display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ fontSize: 11 }}>🤖</span>
+            <span style={{ color: "#f87171", fontSize: 11, fontWeight: 600 }}>Suspicious: {pair._suspiciousReasons?.join(", ")}</span>
+          </div>
+        )}
       </div>
     </a>
   );
@@ -486,6 +535,7 @@ export default function App() {
   const [lastUpdated, setLastUpdated] = useState(null);
   const [sortBy, setSortBy] = useState("volume");
   const [minHealth, setMinHealth] = useState(0);
+  const [hideBots, setHideBots] = useState(true);
 
   useEffect(() => {
     if (prices || tokens.length > 0) setLastUpdated(new Date());
@@ -496,17 +546,23 @@ export default function App() {
     refetchTokens();
   };
 
-  // Pre-compute health scores once per render
-  const scoredTokens = tokens.map((t) => ({
-    ...t,
-    _healthScore: calculateHealthScore(t),
-  }));
+  // Pre-compute health scores + bot detection once per render
+  const scoredTokens = tokens.map((t) => {
+    const { isSuspicious, reasons } = detectSuspicious(t);
+    return {
+      ...t,
+      _healthScore: calculateHealthScore(t),
+      _isSuspicious: isSuspicious,
+      _suspiciousReasons: reasons,
+    };
+  });
 
   const filteredTokens = scoredTokens
     .filter((t) => {
       if (activeChain === "Solana" && t.chainId !== "solana") return false;
       if (activeChain === "Base" && t.chainId !== "base") return false;
       if (t._healthScore < minHealth) return false;
+      if (hideBots && t._isSuspicious) return false;
       return true;
     })
     .sort((a, b) => {
@@ -630,6 +686,19 @@ export default function App() {
             }}
           >{opt.label}</button>
         ))}
+
+        <div style={{ width: 1, height: 20, background: "#1e293b", margin: "0 6px" }} />
+
+        <button
+          onClick={() => setHideBots((v) => !v)}
+          style={{
+            padding: "5px 12px", borderRadius: 8, border: "1px solid",
+            fontSize: 12, fontWeight: 600, cursor: "pointer", transition: "all 0.2s",
+            background: hideBots ? "#f8717118" : "transparent",
+            borderColor: hideBots ? "#f87171" : "#1e293b",
+            color: hideBots ? "#f87171" : "#64748b",
+          }}
+        >{hideBots ? "🤖 Bots Hidden" : "🤖 Show Bots"}</button>
 
         <div style={{ width: 1, height: 20, background: "#1e293b", margin: "0 6px" }} />
 
