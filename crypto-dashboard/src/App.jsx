@@ -37,8 +37,12 @@ function useTrendingTokens() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  const fetchTrending = useCallback(async () => {
+  const fetchTrending = useCallback(async (hardReset = false) => {
     try {
+      if (hardReset) {
+        setTokens([]);
+        setLoading(true);
+      }
       // Step 1: Fetch from 3 endpoints in parallel for maximum coverage
       const [topBoostRes, latestBoostRes, latestProfileRes] = await Promise.allSettled([
         fetch("https://api.dexscreener.com/token-boosts/top/v1"),
@@ -105,30 +109,45 @@ function useTrendingTokens() {
       }
 
       // Step 4: Pick highest volume pair per token
+      // Index by BOTH baseToken and quoteToken address to catch all matches
       const tokenMap = new Map();
       allPairs.forEach((pair) => {
-        const addr = pair.baseToken?.address;
-        if (!addr) return;
-        const key = `${pair.chainId}:${addr}`;
-        const existing = tokenMap.get(key);
-        if (!existing || (pair.volume?.h24 || 0) > (existing.volume?.h24 || 0)) {
-          tokenMap.set(key, pair);
+        const addrs = [pair.baseToken?.address, pair.quoteToken?.address].filter(Boolean);
+        addrs.forEach((addr) => {
+          const key = `${pair.chainId}:${addr}`;
+          const existing = tokenMap.get(key);
+          if (!existing || (pair.volume?.h24 || 0) > (existing.volume?.h24 || 0)) {
+            tokenMap.set(key, pair);
+          }
+        });
+      });
+
+      // Step 5: Build icon map from all source endpoints (profiles have best icons)
+      const iconMap = new Map();
+      // Profiles first (best quality), then boosts
+      [...latestProfiles, ...topBoosts, ...latestBoosts].forEach((t) => {
+        if (t.icon && t.chainId && t.tokenAddress) {
+          const key = `${t.chainId}:${t.tokenAddress}`;
+          if (!iconMap.has(key)) iconMap.set(key, t.icon);
         }
       });
 
-      // Step 5: Build enriched token list — no artificial limits
-      const boostMap = new Map();
-      relevantTokens.forEach((t) => boostMap.set(`${t.chainId}:${t.tokenAddress}`, t));
-
+      // Step 6: Build enriched token list — no artificial limits
       const enrichedTokens = relevantTokens
         .map((boost) => {
           const key = `${boost.chainId}:${boost.tokenAddress}`;
           const pair = tokenMap.get(key);
           if (!pair) return null;
+          // Resolve icon: profile icon > boost icon > pair imageUrl > header
+          const icon = iconMap.get(key)
+            || boost.icon
+            || pair.info?.imageUrl
+            || pair.info?.header
+            || null;
           return {
             ...pair,
             boostAmount: boost.totalAmount || 0,
-            icon: boost.icon || pair.info?.imageUrl || null,
+            icon,
           };
         })
         .filter(Boolean)
@@ -149,7 +168,8 @@ function useTrendingTokens() {
     return () => clearInterval(interval);
   }, [fetchTrending]);
 
-  return { tokens, loading, error, refetch: fetchTrending };
+  const hardRefetch = useCallback(() => fetchTrending(true), [fetchTrending]);
+  return { tokens, loading, error, refetch: hardRefetch };
 }
 
 // ─── Helpers ───
@@ -346,13 +366,13 @@ const TokenCard = ({ pair }) => {
       >
         <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
           <div style={{ display: "flex", gap: 12, alignItems: "center", flex: 1, minWidth: 0 }}>
-            <div style={{ position: "relative", width: 40, height: 40, flexShrink: 0 }}>
+            <div style={{ position: "relative", width: 44, height: 44, flexShrink: 0 }}>
               {iconUrl && (
-                <img src={iconUrl} alt={symbol} style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid #ffffff11", objectFit: "cover", position: "absolute", top: 0, left: 0 }}
+                <img src={iconUrl} alt={symbol} style={{ width: 44, height: 44, borderRadius: "50%", border: "2px solid #ffffff15", objectFit: "cover", position: "absolute", top: 0, left: 0, zIndex: 1, background: "#111827" }}
                   onError={(e) => { e.target.style.display = "none"; }}
                 />
               )}
-              <div style={{ width: 40, height: 40, borderRadius: 10, background: hashColor(symbol), display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 700, color: "#e2e8f0", border: "1px solid #ffffff11" }}>
+              <div style={{ width: 44, height: 44, borderRadius: "50%", background: hashColor(symbol), display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, fontWeight: 700, color: "#e2e8f0", border: "2px solid #ffffff15" }}>
                 {symbol.slice(0, 2)}
               </div>
             </div>
