@@ -62,11 +62,11 @@ function useTrendingTokens() {
       const latestBoosts = await parseRes(latestBoostRes);
       const latestProfiles = await parseRes(latestProfileRes);
 
-      // Step 2: Merge all sources, deduplicate, keep Solana + Base
+      // Step 2: Merge all sources, deduplicate — Solana only
       const seen = new Set();
       const allRaw = [...topBoosts, ...latestBoosts, ...latestProfiles];
       const relevantTokens = allRaw
-        .filter((t) => t.chainId === "solana" || t.chainId === "base")
+        .filter((t) => t.chainId === "solana")
         .filter((t) => {
           const addr = t.tokenAddress;
           if (!addr || seen.has(`${t.chainId}:${addr}`)) return false;
@@ -596,13 +596,13 @@ const LiveIndicator = () => (
 
 // ─── Main App ───
 export default function App() {
-  const [activeChain, setActiveChain] = useState("All Chains");
-  const chains = ["All Chains", "Solana", "Base"];
   const { prices, loading: priceLoading, error: priceError, refetch: refetchPrices } = useCryptoPrices();
   const { tokens, loading: tokenLoading, error: tokenError, refetch: refetchTokens } = useTrendingTokens();
   const [lastUpdated, setLastUpdated] = useState(null);
   const [sortBy, setSortBy] = useState("volume");
   const [minHealth, setMinHealth] = useState(0);
+  const [minVol24, setMinVol24] = useState(1_000_000);
+  const [minMcap, setMinMcap] = useState(100_000);
   const [hideBots, setHideBots] = useState(true);
   const [bubblemapPair, setBubblemapPair] = useState(null);
 
@@ -628,8 +628,10 @@ export default function App() {
 
   const filteredTokens = scoredTokens
     .filter((t) => {
-      if (activeChain === "Solana" && t.chainId !== "solana") return false;
-      if (activeChain === "Base" && t.chainId !== "base") return false;
+      const vol24 = t.volume?.h24 || 0;
+      const mcap = t.marketCap || t.fdv || 0;
+      if (vol24 < minVol24) return false;
+      if (mcap < minMcap) return false;
       if (t._healthScore < minHealth) return false;
       if (hideBots && t._isSuspicious) return false;
       return true;
@@ -663,10 +665,8 @@ export default function App() {
           <h1 style={{ fontSize: 32, fontWeight: 800, margin: 0, color: "#f8fafc", fontStyle: "italic", letterSpacing: -0.5 }}>Morning</h1>
           <p style={{ color: "#64748b", fontSize: 14, margin: "4px 0 0" }}>What happened while you slept</p>
         </div>
-        <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-          {chains.map((chain) => (
-            <button key={chain} onClick={() => setActiveChain(chain)} style={{ padding: "7px 16px", borderRadius: 20, border: "none", fontSize: 13, fontWeight: 600, cursor: "pointer", transition: "all 0.2s", background: activeChain === chain ? "#6366f1" : "transparent", color: activeChain === chain ? "#fff" : "#94a3b8" }}>{chain}</button>
-          ))}
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <span style={{ background: "#9945FF22", color: "#c084fc", border: "1px solid #9945FF44", fontSize: 12, fontWeight: 700, padding: "6px 14px", borderRadius: 20, letterSpacing: 0.5 }}>◎ Solana</span>
           <button onClick={handleRefresh} style={{ padding: "7px 14px", borderRadius: 20, border: "none", background: "transparent", color: "#94a3b8", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Refresh</button>
           <button style={{ width: 34, height: 34, borderRadius: "50%", border: "1px solid #1e293b", background: "transparent", color: "#94a3b8", fontSize: 16, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>⚙</button>
         </div>
@@ -773,7 +773,7 @@ export default function App() {
 
         <span style={{ color: "#64748b", fontSize: 12, fontWeight: 600, marginRight: 4 }}>Min Health:</span>
         {[
-          { value: 0, label: "All" },
+          { value: 0, label: "Any" },
           { value: 35, label: "35+" },
           { value: 55, label: "55+" },
           { value: 75, label: "75+" },
@@ -787,6 +787,50 @@ export default function App() {
               background: minHealth === opt.value ? "#4ade8018" : "transparent",
               borderColor: minHealth === opt.value ? "#4ade8044" : "#1e293b",
               color: minHealth === opt.value ? "#4ade80" : "#64748b",
+            }}
+          >{opt.label}</button>
+        ))}
+
+        <div style={{ width: 1, height: 20, background: "#1e293b", margin: "0 6px" }} />
+
+        <span style={{ color: "#64748b", fontSize: 12, fontWeight: 600, marginRight: 4 }}>Min Vol 24h:</span>
+        {[
+          { value: 0, label: "Any" },
+          { value: 500_000, label: "$500K" },
+          { value: 1_000_000, label: "$1M" },
+          { value: 5_000_000, label: "$5M" },
+        ].map((opt) => (
+          <button
+            key={opt.value}
+            onClick={() => setMinVol24(opt.value)}
+            style={{
+              padding: "5px 10px", borderRadius: 8, border: "1px solid",
+              fontSize: 12, fontWeight: 600, cursor: "pointer", transition: "all 0.2s",
+              background: minVol24 === opt.value ? "#fbbf2418" : "transparent",
+              borderColor: minVol24 === opt.value ? "#fbbf2444" : "#1e293b",
+              color: minVol24 === opt.value ? "#fbbf24" : "#64748b",
+            }}
+          >{opt.label}</button>
+        ))}
+
+        <div style={{ width: 1, height: 20, background: "#1e293b", margin: "0 6px" }} />
+
+        <span style={{ color: "#64748b", fontSize: 12, fontWeight: 600, marginRight: 4 }}>Min MCap:</span>
+        {[
+          { value: 0, label: "Any" },
+          { value: 100_000, label: "$100K" },
+          { value: 500_000, label: "$500K" },
+          { value: 1_000_000, label: "$1M" },
+        ].map((opt) => (
+          <button
+            key={opt.value}
+            onClick={() => setMinMcap(opt.value)}
+            style={{
+              padding: "5px 10px", borderRadius: 8, border: "1px solid",
+              fontSize: 12, fontWeight: 600, cursor: "pointer", transition: "all 0.2s",
+              background: minMcap === opt.value ? "#38bdf818" : "transparent",
+              borderColor: minMcap === opt.value ? "#38bdf844" : "#1e293b",
+              color: minMcap === opt.value ? "#38bdf8" : "#64748b",
             }}
           >{opt.label}</button>
         ))}
