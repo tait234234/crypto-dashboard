@@ -502,19 +502,24 @@ function formatChange(num) {
 function formatVolume(num) {
   if (!num) return "$0";
   if (num >= 1e12) return "$" + (num / 1e12).toFixed(2) + "T";
-  if (num >= 1e9) return "$" + (num / 1e9).toFixed(1) + "B";
-  if (num >= 1e6) return "$" + (num / 1e6).toFixed(1) + "M";
-  if (num >= 1e3) return "$" + (num / 1e3).toFixed(1) + "K";
-  return "$" + num.toFixed(0);
+  if (num >= 1e9)  return "$" + (num / 1e9).toFixed(1)  + "B";
+  if (num >= 1e6)  return "$" + (num / 1e6).toFixed(1)  + "M";
+  if (num >= 1e3)  return "$" + (num / 1e3).toFixed(1)  + "K";
+  if (num >= 10)   return "$" + Math.round(num);
+  return "$" + num.toFixed(2);
 }
 
 function formatAge(createdAt) {
   if (!createdAt) return "—";
   const diffMs = Date.now() - createdAt;
-  const diffMins = diffMs / 60000;
-  if (diffMins < 60) return Math.round(diffMins) + "m";
-  const diffHrs = diffMins / 60;
-  if (diffHrs < 24) return diffHrs.toFixed(1) + "h";
+  const diffMins = Math.round(diffMs / 60000);
+  if (diffMins < 60) return diffMins + "m";
+  const diffHrs = diffMs / 3600000;
+  if (diffHrs < 2) {
+    const m = Math.round(diffMins % 60);
+    return "1h" + (m > 0 ? " " + m + "m" : "");
+  }
+  if (diffHrs < 24) return Math.round(diffHrs) + "h";
   const diffDays = diffHrs / 24;
   if (diffDays < 30) return Math.round(diffDays) + "d";
   return Math.round(diffDays / 30) + "mo";
@@ -548,10 +553,10 @@ function truncateAddr(addr) {
 
 function getGreeting() {
   const h = new Date().getHours();
-  if (h >= 5  && h < 12) return { title: "Morning",   panel: "Good morning",   sub: "Here's what happened overnight" };
-  if (h >= 12 && h < 17) return { title: "Afternoon", panel: "Good afternoon", sub: "Here's what's happening right now" };
-  if (h >= 17 && h < 21) return { title: "Evening",   panel: "Good evening",   sub: "Here's what's been moving today" };
-  return                         { title: "Night",     panel: "Late night",     sub: "Checking in while the world sleeps" };
+  if (h >= 5  && h < 12) return { title: "Morning",   panel: "Good morning",   sub: "Here's what happened overnight",       emoji: "☕" };
+  if (h >= 12 && h < 17) return { title: "Afternoon", panel: "Good afternoon", sub: "Here's what's happening right now",     emoji: "☀️" };
+  if (h >= 17 && h < 21) return { title: "Evening",   panel: "Good evening",   sub: "Here's what's been moving today",      emoji: "🌆" };
+  return                         { title: "Night",     panel: "Late night",     sub: "Checking in while the world sleeps",   emoji: "🌙" };
 }
 
 function getHolderType(pct) {
@@ -786,9 +791,9 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin }) => {
                 )}
               </div>
               <div style={{ color: "#94a3b8", fontSize: 12, marginTop: 2, maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</div>
-              <div style={{ color: "#64748b", fontSize: 11, marginTop: 2 }}>
-                Age <span style={{ color: "#94a3b8" }}>{age}</span>
-                {"  "}Price <span style={{ color: "#94a3b8" }}>{pair.priceUsd ? formatPrice(parseFloat(pair.priceUsd)) : "—"}</span>
+              <div style={{ display: "flex", gap: 10, color: "#64748b", fontSize: 11, marginTop: 2 }}>
+                <span>Age <span style={{ color: "#94a3b8" }}>{age}</span></span>
+                <span>Price <span style={{ color: "#94a3b8" }}>{pair.priceUsd ? formatPrice(parseFloat(pair.priceUsd)) : "—"}</span></span>
               </div>
             </div>
           </div>
@@ -811,9 +816,9 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin }) => {
               </div>
             </div>
           </div>
-          <div style={{ color: "#64748b", fontSize: 12, marginTop: 6 }}>
-            Vol <span style={{ color: "#94a3b8" }}>{formatVolume(vol24)}</span>
-            {"   "}Liq <span style={{ color: "#94a3b8" }}>{formatVolume(liq)}</span>
+          <div style={{ display: "flex", gap: 12, color: "#64748b", fontSize: 12, marginTop: 6 }}>
+            <span>Vol <span style={{ color: "#94a3b8" }}>{formatVolume(vol24)}</span></span>
+            <span>Liq <span style={{ color: "#94a3b8" }}>{formatVolume(liq)}</span></span>
           </div>
         </div>
       </a>
@@ -939,7 +944,7 @@ const WalletCard = ({ wallet, onRemove }) => {
           </button>
           <div>
             {wallet.label && <div style={{ color: "#f1f5f9", fontWeight: 600, fontSize: 14 }}>{wallet.label}</div>}
-            <div style={{ color: "#64748b", fontSize: 12, fontFamily: "monospace" }}>{wallet.address}</div>
+            <div style={{ color: "#64748b", fontSize: 12, fontFamily: "monospace" }} title={wallet.address}>{truncateAddr(wallet.address)}</div>
           </div>
           <span style={{ background: "#9945FF22", color: "#c084fc", border: "1px solid #9945FF44", fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, fontFamily: "monospace" }}>SOL</span>
         </div>
@@ -984,7 +989,7 @@ const AddCAPanel = ({ onAdd, onClose }) => {
       if (!Array.isArray(pairs) || pairs.length === 0) throw new Error("Token not found on DexScreener");
       onAdd(trimmed, chainId);
       setStatus("ok");
-      setTimeout(onClose, 800);
+      setTimeout(onClose, 1200);
     } catch (e) {
       setStatus("error:" + e.message);
     }
@@ -1311,7 +1316,7 @@ export default function App() {
       <div style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 16, padding: 24, marginBottom: 32 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-            <span style={{ fontSize: 28 }}>☕</span>
+            <span style={{ fontSize: 28 }}>{greeting.emoji}</span>
             <div>
               <div style={{ fontWeight: 700, fontSize: 17, color: "#f1f5f9" }}>{greeting.panel}</div>
               <div style={{ color: "#64748b", fontSize: 13 }}>{greeting.sub}</div>
@@ -1319,7 +1324,7 @@ export default function App() {
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
             <LiveIndicator />
-            {lastUpdated && <span style={{ color: "#475569", fontSize: 11 }}>Updated {lastUpdated.toLocaleTimeString()}</span>}
+            {lastUpdated && <span style={{ color: "#475569", fontSize: 11 }}>Updated {lastUpdated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>}
           </div>
         </div>
 
