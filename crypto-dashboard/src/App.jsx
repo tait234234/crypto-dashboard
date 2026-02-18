@@ -178,6 +178,114 @@ function usePinnedTokens(pinnedCAs) {
   return { tokens, loading, refetch: fetchPinned };
 }
 
+// ─── Top Volume Tokens Hook (GeckoTerminal) ───
+function useTopVolumeTokens(activeChain) {
+  const [tokens, setTokens] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  const fetchTopVol = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const networksToFetch =
+        activeChain === "Solana" ? ["solana"]
+        : activeChain === "Base" ? ["base"]
+        : ["solana", "base"];
+
+      const allTokens = [];
+
+      for (const network of networksToFetch) {
+        try {
+          const res = await fetch(
+            `https://api.geckoterminal.com/api/v2/networks/${network}/pools?page=1&sort=h24_volume_usd_desc&include=base_token`
+          );
+          if (!res.ok) continue;
+          const data = await res.json();
+
+          // Build token lookup from included array
+          const tokenMap = new Map();
+          (data.included || []).forEach((item) => {
+            if (item.type === "token") tokenMap.set(item.id, item.attributes);
+          });
+
+          const chainId = network === "solana" ? "solana" : "base";
+
+          (data.data || []).forEach((pool) => {
+            const baseTokenId = pool.relationships?.base_token?.data?.id;
+            const tokenAttrs = tokenMap.get(baseTokenId);
+            if (!tokenAttrs) return;
+
+            const ca = baseTokenId?.replace(`${network}_`, "") || "";
+            const vol24 = parseFloat(pool.attributes.volume_usd?.h24 || 0);
+            if (vol24 < 1000) return; // skip dust
+
+            allTokens.push({
+              baseToken: {
+                symbol: tokenAttrs.symbol || "???",
+                name: tokenAttrs.name || "Unknown",
+                address: ca,
+              },
+              chainId,
+              marketCap: parseFloat(pool.attributes.market_cap_usd || pool.attributes.fdv_usd || 0),
+              fdv: parseFloat(pool.attributes.fdv_usd || 0),
+              volume: { h24: vol24 },
+              liquidity: { usd: parseFloat(pool.attributes.reserve_in_usd || 0) },
+              priceChange: {
+                h1: parseFloat(pool.attributes.price_change_percentage?.h1 || 0),
+                h6: parseFloat(pool.attributes.price_change_percentage?.h6 || 0),
+              },
+              txns: {
+                h24: {
+                  buys: pool.attributes.transactions?.h24?.buys || 0,
+                  sells: pool.attributes.transactions?.h24?.sells || 0,
+                },
+              },
+              pairCreatedAt: pool.attributes.pool_created_at
+                ? new Date(pool.attributes.pool_created_at).getTime()
+                : null,
+              priceUsd: pool.attributes.base_token_price_usd,
+              icon: tokenAttrs.image_url || null,
+              pairAddress: pool.attributes.address,
+              boostAmount: 0,
+              url: `https://dexscreener.com/${chainId}/${pool.attributes.address}`,
+            });
+          });
+        } catch (e) {
+          console.warn(`GeckoTerminal ${network} fetch error:`, e);
+        }
+      }
+
+      // Deduplicate by CA, already sorted by volume desc from API
+      const seen = new Set();
+      const deduped = allTokens
+        .sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0))
+        .filter((t) => {
+          const ca = t.baseToken.address;
+          if (!ca || seen.has(ca)) return false;
+          seen.add(ca);
+          return true;
+        })
+        .slice(0, 24);
+
+      setTokens(deduped);
+      setError(null);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [activeChain]);
+
+  useEffect(() => {
+    fetchTopVol();
+    const interval = setInterval(fetchTopVol, 120000);
+    return () => clearInterval(interval);
+  }, [fetchTopVol]);
+
+  return { tokens, loading, error, refetch: fetchTopVol };
+}
+
 // ─── Wallet Tokens Hook (Solana RPC) ───
 function useWalletTokens(address) {
   const [holdings, setHoldings] = useState([]);
@@ -854,6 +962,7 @@ export default function App() {
   });
 
   const { tokens: pinnedTokens, loading: pinnedLoading, refetch: refetchPinned } = usePinnedTokens(pinnedCAs);
+  const { tokens: topVolTokens, loading: topVolLoading, error: topVolError, refetch: refetchTopVol } = useTopVolumeTokens(activeChain);
 
   // Wallets: [{address, label}]
   const [wallets, setWallets] = useState(() => {
@@ -907,7 +1016,7 @@ export default function App() {
     localStorage.setItem("trackedWallets", JSON.stringify(wallets));
   }, [wallets]);
 
-  const handleRefresh = () => { refetchPrices(); refetchTokens(); refetchPinned(); };
+  const handleRefresh = () => { refetchPrices(); refetchTokens(); refetchPinned(); refetchTopVol(); };
 
   const pinToken = (ca, chainId) => {
     setPinnedCAs((prev) => prev.find((p) => p.ca === ca) ? prev : [...prev, { ca, chainId }]);
@@ -934,6 +1043,8 @@ export default function App() {
 
   const filteredTokens = applyFilters(tokens.filter(chainFilter));
   const filteredPinned = applyFilters(pinnedTokens.filter(chainFilter));
+  // topVolTokens already fetched per-chain by the hook; still apply sort/filter controls
+  const filteredTopVol = applyFilters(topVolTokens);
 
   const coinConfigs = [
     { id: "bitcoin", symbol: "BTC", color: "#F7931A" },
@@ -1009,7 +1120,8 @@ export default function App() {
       <div style={{ display: "flex", gap: 4, marginBottom: 24, borderBottom: "1px solid #1e293b", paddingBottom: 0 }}>
         {[
           { key: "discover", label: "🔥 Discover" },
-          { key: "wallets", label: `👜 Wallets${wallets.length > 0 ? ` (${wallets.length})` : ""}` },
+          { key: "topvol",   label: "📊 Top Vol" },
+          { key: "wallets",  label: `👜 Wallets${wallets.length > 0 ? ` (${wallets.length})` : ""}` },
         ].map((s) => (
           <button
             key={s.key}
@@ -1123,6 +1235,55 @@ export default function App() {
 
           {!tokenLoading && filteredTokens.length === 0 && !tokenError && (
             <div style={{ textAlign: "center", color: "#475569", padding: 48, fontSize: 14 }}>No trending tokens found for this chain right now.</div>
+          )}
+        </>
+      )}
+
+      {/* ─── Top Vol Section ─── */}
+      {activeSection === "topvol" && (
+        <>
+          <FilterBar
+            sortBy={sortBy}
+            sortDir={sortDir}
+            onSort={handleSort}
+            minVol={minVol}
+            onMinVol={setMinVol}
+            minMcap={minMcap}
+            onMinMcap={setMinMcap}
+            minChange1h={minChange1h}
+            onMinChange1h={setMinChange1h}
+            count={filteredTopVol.length}
+            total={topVolTokens.length}
+          />
+
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 16 }}>
+            <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#f59e0b", margin: 0 }}>📊 Top Volume Today</h2>
+            <span style={{ color: "#64748b", fontSize: 12 }}>Powered by GeckoTerminal • Sorted by 24h Vol</span>
+          </div>
+
+          {topVolError && (
+            <div style={{ background: "#7f1d1d33", border: "1px solid #991b1b", borderRadius: 8, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 13 }}>⚠ Fetch failed: {topVolError}</div>
+          )}
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 14 }}>
+            {topVolLoading
+              ? [1, 2, 3, 4, 5, 6].map((i) => <TokenSkeleton key={i} />)
+              : filteredTopVol.map((pair, i) => {
+                  const ca = pair.baseToken?.address || "";
+                  return (
+                    <TokenCard
+                      key={`topvol-${pair.pairAddress}-${i}`}
+                      pair={pair}
+                      isPinned={pinnedCAs.some((p) => p.ca === ca)}
+                      onPin={pinToken}
+                      onUnpin={unpinToken}
+                    />
+                  );
+                })}
+          </div>
+
+          {!topVolLoading && filteredTopVol.length === 0 && !topVolError && (
+            <div style={{ textAlign: "center", color: "#475569", padding: 48, fontSize: 14 }}>No tokens found for this chain / filter combination.</div>
           )}
         </>
       )}
