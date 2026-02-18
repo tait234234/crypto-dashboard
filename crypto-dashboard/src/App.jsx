@@ -42,6 +42,66 @@ function writeCache(key, data) {
   try { localStorage.setItem(key, JSON.stringify({ data, ts: Date.now() })); } catch {}
 }
 
+// ─── GeckoTerminal shared helpers ───
+const getNetworksToFetch = (chain) =>
+  chain === "Solana" ? ["solana"] : chain === "Base" ? ["base"] : ["solana", "base"];
+
+function fetchPoolsIntoList(data, network, out, { volMin, liqMin, h1Min, h24HrMin }) {
+  const chainId = network === "solana" ? "solana" : "base";
+  const tokenMap = new Map();
+  (data.included || []).forEach((item) => {
+    if (item.type === "token") tokenMap.set(item.id, item.attributes);
+  });
+  (data.data || []).forEach((pool) => {
+    const baseTokenId = pool.relationships?.base_token?.data?.id;
+    const tokenAttrs  = tokenMap.get(baseTokenId);
+    if (!tokenAttrs) return;
+    const ca    = baseTokenId?.replace(`${network}_`, "") || "";
+    const vol24 = parseFloat(pool.attributes.volume_usd?.h24 || 0);
+    const liq   = parseFloat(pool.attributes.reserve_in_usd || 0);
+    if (vol24 < volMin || liq < liqMin) return;
+    const h1Buys   = pool.attributes.transactions?.h1?.buys;
+    const h1Sells  = pool.attributes.transactions?.h1?.sells;
+    const h24Buys  = pool.attributes.transactions?.h24?.buys  || 0;
+    const h24Sells = pool.attributes.transactions?.h24?.sells || 0;
+    const h1Present = h1Buys != null && h1Sells != null;
+    const h1Txns    = h1Present ? (h1Buys + h1Sells) : 0;
+    if (h1Present ? h1Txns < h1Min : Math.round((h24Buys + h24Sells) / 24) < h24HrMin) return;
+    out.push({
+      baseToken: { symbol: tokenAttrs.symbol || "???", name: tokenAttrs.name || "Unknown", address: ca },
+      chainId,
+      marketCap:  parseFloat(pool.attributes.market_cap_usd || pool.attributes.fdv_usd || 0),
+      fdv:        parseFloat(pool.attributes.fdv_usd || 0),
+      volume:     { h24: vol24 },
+      liquidity:  { usd: liq },
+      priceChange: {
+        h1: parseFloat(pool.attributes.price_change_percentage?.h1 || 0),
+        h6: parseFloat(pool.attributes.price_change_percentage?.h6 || 0),
+      },
+      txns: {
+        h1:  { buys: h1Buys  || 0, sells: h1Sells  || 0 },
+        h24: { buys: h24Buys || 0, sells: h24Sells || 0 },
+      },
+      pairCreatedAt: pool.attributes.pool_created_at ? new Date(pool.attributes.pool_created_at).getTime() : null,
+      priceUsd:    pool.attributes.base_token_price_usd,
+      icon:        tokenAttrs.image_url || null,
+      pairAddress: pool.attributes.address,
+      boostAmount: 0,
+      url: `https://dexscreener.com/${chainId}/${pool.attributes.address}`,
+    });
+  });
+}
+
+function dedupeAndSlice(tokens, sortByVol = false) {
+  const arr  = sortByVol ? [...tokens].sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0)) : tokens;
+  const seen = new Set();
+  return arr.filter((t) => {
+    if (!t.baseToken.address || seen.has(t.baseToken.address)) return false;
+    seen.add(t.baseToken.address);
+    return true;
+  }).slice(0, 40);
+}
+
 function useTrendingTokens(activeChain) {
   const cacheKey = `gt_trending_${activeChain}`;
   // Seed state from localStorage so page reload shows data immediately
@@ -74,85 +134,14 @@ function useTrendingTokens(activeChain) {
               `https://api.geckoterminal.com/api/v2/networks/${network}/trending_pools?page=${page}&include=base_token`
             );
             if (!res.ok) continue;
-            const data = await res.json();
+            fetchPoolsIntoList(await res.json(), network, allTokens, { volMin: 500, liqMin: 5000, h1Min: 20, h24HrMin: 30 });
             successPages++;
-
-            const tokenMap = new Map();
-            (data.included || []).forEach((item) => {
-              if (item.type === "token") tokenMap.set(item.id, item.attributes);
-            });
-
-            const chainId = network === "solana" ? "solana" : "base";
-
-            (data.data || []).forEach((pool) => {
-              const baseTokenId = pool.relationships?.base_token?.data?.id;
-              const tokenAttrs = tokenMap.get(baseTokenId);
-              if (!tokenAttrs) return;
-
-              const ca = baseTokenId?.replace(`${network}_`, "") || "";
-              const vol24 = parseFloat(pool.attributes.volume_usd?.h24 || 0);
-              const liq = parseFloat(pool.attributes.reserve_in_usd || 0);
-
-              if (vol24 < 500) return;
-              if (liq < 5000) return;
-
-              const h1BuysRaw  = pool.attributes.transactions?.h1?.buys;
-              const h1SellsRaw = pool.attributes.transactions?.h1?.sells;
-              const h24Buys  = pool.attributes.transactions?.h24?.buys  || 0;
-              const h24Sells = pool.attributes.transactions?.h24?.sells || 0;
-              const h24Txns  = h24Buys + h24Sells;
-              const h1DataPresent = h1BuysRaw != null && h1SellsRaw != null;
-              const h1Txns = h1DataPresent ? (h1BuysRaw + h1SellsRaw) : 0;
-              if (h1DataPresent) {
-                if (h1Txns < 20) return;
-              } else {
-                if (Math.round(h24Txns / 24) < 30) return;
-              }
-
-              allTokens.push({
-                baseToken: {
-                  symbol: tokenAttrs.symbol || "???",
-                  name: tokenAttrs.name || "Unknown",
-                  address: ca,
-                },
-                chainId,
-                marketCap: parseFloat(pool.attributes.market_cap_usd || pool.attributes.fdv_usd || 0),
-                fdv: parseFloat(pool.attributes.fdv_usd || 0),
-                volume: { h24: vol24 },
-                liquidity: { usd: liq },
-                priceChange: {
-                  h1: parseFloat(pool.attributes.price_change_percentage?.h1 || 0),
-                  h6: parseFloat(pool.attributes.price_change_percentage?.h6 || 0),
-                },
-                txns: {
-                  h1:  { buys: h1BuysRaw  || 0, sells: h1SellsRaw || 0 },
-                  h24: { buys: h24Buys, sells: h24Sells },
-                },
-                pairCreatedAt: pool.attributes.pool_created_at
-                  ? new Date(pool.attributes.pool_created_at).getTime()
-                  : null,
-                priceUsd: pool.attributes.base_token_price_usd,
-                icon: tokenAttrs.image_url || null,
-                pairAddress: pool.attributes.address,
-                boostAmount: 0,
-                url: `https://dexscreener.com/${chainId}/${pool.attributes.address}`,
-              });
-            });
-          } catch (e) {
-            console.warn(`GeckoTerminal trending ${network} p${page} error:`, e);
-          }
+          } catch {}
         }
       }
 
       if (successPages === 0) throw new Error("GeckoTerminal unreachable — rate limited or offline.");
-
-      const seen = new Set();
-      const deduped = allTokens.filter((t) => {
-        const ca = t.baseToken.address;
-        if (!ca || seen.has(ca)) return false;
-        seen.add(ca);
-        return true;
-      }).slice(0, 40);
+      const deduped = dedupeAndSlice(allTokens);
 
       if (fetchIdRef.current !== myId) return;
       const now = Date.now();
@@ -224,7 +213,7 @@ function usePinnedTokens(pinnedCAs) {
               const pairs = await res.json();
               if (Array.isArray(pairs)) allPairs.push(...pairs);
             }
-          } catch (e) { console.warn("Pinned fetch error:", e); }
+          } catch { }
         }
       }
 
@@ -239,9 +228,7 @@ function usePinnedTokens(pinnedCAs) {
       });
 
       setTokens(pinnedCAs.map(({ ca }) => tokenMap.get(ca)).filter(Boolean));
-    } catch (e) {
-      console.warn("usePinnedTokens error:", e);
-    } finally {
+    } catch { } finally {
       setLoading(false);
     }
   }, [pinnedCAs]);
@@ -276,93 +263,19 @@ function useTopVolumeTokens(activeChain) {
 
       for (const network of networksToFetch) {
         for (const page of [1, 2]) {
-        try {
-          const res = await fetch(
-            `https://api.geckoterminal.com/api/v2/networks/${network}/pools?page=${page}&sort=h24_volume_usd_desc&include=base_token`
-          );
-          if (!res.ok) continue;
-          const data = await res.json();
-          successPages++;
-
-          const tokenMap = new Map();
-          (data.included || []).forEach((item) => {
-            if (item.type === "token") tokenMap.set(item.id, item.attributes);
-          });
-
-          const chainId = network === "solana" ? "solana" : "base";
-
-          (data.data || []).forEach((pool) => {
-            const baseTokenId = pool.relationships?.base_token?.data?.id;
-            const tokenAttrs = tokenMap.get(baseTokenId);
-            if (!tokenAttrs) return;
-
-            const ca = baseTokenId?.replace(`${network}_`, "") || "";
-            const vol24 = parseFloat(pool.attributes.volume_usd?.h24 || 0);
-            const liq = parseFloat(pool.attributes.reserve_in_usd || 0);
-
-            if (vol24 < 1000) return;
-            if (liq < 10000) return;
-
-            const h1BuysRaw  = pool.attributes.transactions?.h1?.buys;
-            const h1SellsRaw = pool.attributes.transactions?.h1?.sells;
-            const h24Buys  = pool.attributes.transactions?.h24?.buys  || 0;
-            const h24Sells = pool.attributes.transactions?.h24?.sells || 0;
-            const h24Txns  = h24Buys + h24Sells;
-            const h1DataPresent = h1BuysRaw != null && h1SellsRaw != null;
-            const h1Txns = h1DataPresent ? (h1BuysRaw + h1SellsRaw) : 0;
-            if (h1DataPresent) {
-              if (h1Txns < 50) return;
-            } else {
-              if (Math.round(h24Txns / 24) < 75) return;
-            }
-
-            allTokens.push({
-              baseToken: {
-                symbol: tokenAttrs.symbol || "???",
-                name: tokenAttrs.name || "Unknown",
-                address: ca,
-              },
-              chainId,
-              marketCap: parseFloat(pool.attributes.market_cap_usd || pool.attributes.fdv_usd || 0),
-              fdv: parseFloat(pool.attributes.fdv_usd || 0),
-              volume: { h24: vol24 },
-              liquidity: { usd: liq },
-              priceChange: {
-                h1: parseFloat(pool.attributes.price_change_percentage?.h1 || 0),
-                h6: parseFloat(pool.attributes.price_change_percentage?.h6 || 0),
-              },
-              txns: {
-                h1:  { buys: h1BuysRaw  || 0, sells: h1SellsRaw || 0 },
-                h24: { buys: h24Buys, sells: h24Sells },
-              },
-              pairCreatedAt: pool.attributes.pool_created_at
-                ? new Date(pool.attributes.pool_created_at).getTime()
-                : null,
-              priceUsd: pool.attributes.base_token_price_usd,
-              icon: tokenAttrs.image_url || null,
-              pairAddress: pool.attributes.address,
-              boostAmount: 0,
-              url: `https://dexscreener.com/${chainId}/${pool.attributes.address}`,
-            });
-          });
-        } catch (e) {
-          console.warn(`GeckoTerminal ${network} p${page} fetch error:`, e);
-        }
+          try {
+            const res = await fetch(
+              `https://api.geckoterminal.com/api/v2/networks/${network}/pools?page=${page}&sort=h24_volume_usd_desc&include=base_token`
+            );
+            if (!res.ok) continue;
+            fetchPoolsIntoList(await res.json(), network, allTokens, { volMin: 1000, liqMin: 10000, h1Min: 50, h24HrMin: 75 });
+            successPages++;
+          } catch {}
         }
       }
 
       if (successPages === 0) throw new Error("GeckoTerminal unreachable — rate limited or offline.");
-
-      const seen = new Set();
-      const deduped = allTokens
-        .sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0))
-        .filter((t) => {
-          const ca = t.baseToken.address;
-          if (!ca || seen.has(ca)) return false;
-          seen.add(ca);
-          return true;
-        })
-        .slice(0, 40);
+      const deduped = dedupeAndSlice(allTokens, true);
 
       if (fetchIdRef.current !== myId) return;
       const now = Date.now();
@@ -429,11 +342,7 @@ async function postRPC(body) {
       if (data.error) throw new Error(data.error.message || "RPC error");
       return data;
     } catch (e) {
-      if (e.message.startsWith("RPC access") || e.message.startsWith("Rate limited") || e.message.startsWith("RPC error") || e.message === "All RPC endpoints failed") {
-        lastErr = e;
-      } else {
-        lastErr = e; // network error, keep trying
-      }
+      lastErr = e;
     }
   }
   throw lastErr;
@@ -480,7 +389,7 @@ function useWalletTokens(address) {
             const pairs = await res.json();
             if (Array.isArray(pairs)) allPairs.push(...pairs);
           }
-        } catch (e) { console.warn("Wallet pair fetch error:", e); }
+        } catch { }
       }
 
       const tokenMap = new Map();
@@ -587,6 +496,12 @@ function formatVolume(num) {
   if (num >= 1e3)  return "$" + (num / 1e3).toFixed(1)  + "K";
   if (num >= 10)   return "$" + Math.round(num);
   return "$" + num.toFixed(2);
+}
+
+function formatTokenAmount(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return n.toFixed(2);
 }
 
 function formatAge(createdAt) {
@@ -877,7 +792,7 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [] }) => {
               <div style={{ textAlign: "right", flexShrink: 0, marginLeft: 8 }}>
                 {h.usdValue >= 0.01 && <div style={{ color: "#f1f5f9", fontSize: 12, fontWeight: 600 }}>{formatVolume(h.usdValue)}</div>}
                 <div style={{ color: "#64748b", fontSize: 11 }}>
-                  {h.amount >= 1e6 ? (h.amount / 1e6).toFixed(2) + "M" : h.amount >= 1e3 ? (h.amount / 1e3).toFixed(1) + "K" : h.amount.toFixed(2)}
+                  {formatTokenAmount(h.amount)}
                 </div>
               </div>
             </div>
@@ -1033,7 +948,7 @@ const WalletHoldingRow = ({ holding }) => {
       </div>
       <div style={{ textAlign: "right", flexShrink: 0 }}>
         <div style={{ color: "#f1f5f9", fontSize: 13, fontWeight: 600 }}>{usdValue >= 0.01 ? formatVolume(usdValue) : "< $0.01"}</div>
-        <div style={{ color: "#64748b", fontSize: 11 }}>{amount >= 1e6 ? (amount / 1e6).toFixed(2) + "M" : amount >= 1e3 ? (amount / 1e3).toFixed(2) + "K" : amount.toFixed(2)}</div>
+        <div style={{ color: "#64748b", fontSize: 11 }}>{formatTokenAmount(amount)}</div>
       </div>
       <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
         <a href={dexUrl} target="_blank" rel="noopener noreferrer" title="DexScreener" style={{ width: 26, height: 26, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", display: "flex", alignItems: "center", justifyContent: "center", textDecoration: "none", fontSize: 12, color: "#94a3b8" }}>↗</a>
@@ -1166,7 +1081,6 @@ const TokenSkeleton = () => (
     </div>
     <div style={{ width: 100, height: 24, borderRadius: 6, background: "#1e293b", marginBottom: 8, animation: "shimmer 1.5s infinite" }} />
     <div style={{ width: "100%", height: 4, borderRadius: 2, background: "#1e293b", animation: "shimmer 1.5s infinite" }} />
-    <style>{`@keyframes shimmer { 0%,100% { opacity: 0.4; } 50% { opacity: 0.8; } }`}</style>
   </div>
 );
 
@@ -1184,7 +1098,6 @@ const PriceSkeleton = () => (
     </div>
     <div style={{ width: 120, height: 28, borderRadius: 6, background: "#1e293b", marginBottom: 8, animation: "shimmer 1.5s infinite" }} />
     <div style={{ width: 50, height: 16, borderRadius: 4, background: "#1e293b", animation: "shimmer 1.5s infinite" }} />
-    <style>{`@keyframes shimmer { 0%,100% { opacity: 0.4; } 50% { opacity: 0.8; } }`}</style>
   </div>
 );
 
@@ -1503,12 +1416,9 @@ export default function App() {
     setWallets((prev) => prev.filter((w) => w.address !== address));
   };
 
-  const chainFilter = (t) => {
-    if (activeChain === "All Chains") return true;
-    if (activeChain === "Solana") return t.chainId === "solana";
-    if (activeChain === "Base") return t.chainId === "base";
-    return true;
-  };
+  const chainFilter = (t) =>
+    activeChain === "Solana" ? t.chainId === "solana" :
+    activeChain === "Base"   ? t.chainId === "base"   : true;
 
   const filteredTokens = applyFilters(tokens.filter(chainFilter));
   const filteredPinned = applyFilters(pinnedTokens.filter(chainFilter));
@@ -1523,7 +1433,7 @@ export default function App() {
 
   return (
     <div style={{ minHeight: "100vh", background: "#0a0e1a", color: "#e2e8f0", fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', padding: "32px 24px", maxWidth: 1120, margin: "0 auto" }}>
-      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } } @keyframes shimmer { 0%,100% { opacity: 0.4; } 50% { opacity: 0.8; } }`}</style>
       {/* Header */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 28 }}>
         <div>
