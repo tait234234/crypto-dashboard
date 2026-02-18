@@ -31,91 +31,115 @@ function useCryptoPrices() {
   return { prices, loading, error, refetch: fetchPrices };
 }
 
-// ─── DexScreener Trending Tokens Hook ───
-function useTrendingTokens() {
+// ─── GeckoTerminal Trending Tokens Hook ───
+function useTrendingTokens(activeChain) {
   const [tokens, setTokens] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
   const fetchTrending = useCallback(async () => {
+    setLoading(true);
+    setError(null);
     try {
-      const boostRes = await fetch("https://api.dexscreener.com/token-boosts/top/v1");
-      if (!boostRes.ok) throw new Error("DexScreener boost API failed (" + boostRes.status + ")");
-      const boostData = await boostRes.json();
+      const networksToFetch =
+        activeChain === "Solana" ? ["solana"]
+        : activeChain === "Base" ? ["base"]
+        : ["solana", "base"];
+
+      const allTokens = [];
+
+      for (const network of networksToFetch) {
+        for (const page of [1, 2]) {
+          try {
+            const res = await fetch(
+              `https://api.geckoterminal.com/api/v2/networks/${network}/trending_pools?page=${page}&include=base_token`
+            );
+            if (!res.ok) continue;
+            const data = await res.json();
+
+            const tokenMap = new Map();
+            (data.included || []).forEach((item) => {
+              if (item.type === "token") tokenMap.set(item.id, item.attributes);
+            });
+
+            const chainId = network === "solana" ? "solana" : "base";
+
+            (data.data || []).forEach((pool) => {
+              const baseTokenId = pool.relationships?.base_token?.data?.id;
+              const tokenAttrs = tokenMap.get(baseTokenId);
+              if (!tokenAttrs) return;
+
+              const ca = baseTokenId?.replace(`${network}_`, "") || "";
+              const vol24 = parseFloat(pool.attributes.volume_usd?.h24 || 0);
+              const liq = parseFloat(pool.attributes.reserve_in_usd || 0);
+
+              if (vol24 < 500) return;
+              if (liq < 5000) return;
+
+              const h1BuysRaw  = pool.attributes.transactions?.h1?.buys;
+              const h1SellsRaw = pool.attributes.transactions?.h1?.sells;
+              const h24Buys  = pool.attributes.transactions?.h24?.buys  || 0;
+              const h24Sells = pool.attributes.transactions?.h24?.sells || 0;
+              const h24Txns  = h24Buys + h24Sells;
+              const h1DataPresent = h1BuysRaw != null && h1SellsRaw != null;
+              const h1Txns = h1DataPresent ? (h1BuysRaw + h1SellsRaw) : 0;
+              if (h1DataPresent) {
+                if (h1Txns < 20) return;
+              } else {
+                if (Math.round(h24Txns / 24) < 30) return;
+              }
+
+              allTokens.push({
+                baseToken: {
+                  symbol: tokenAttrs.symbol || "???",
+                  name: tokenAttrs.name || "Unknown",
+                  address: ca,
+                },
+                chainId,
+                marketCap: parseFloat(pool.attributes.market_cap_usd || pool.attributes.fdv_usd || 0),
+                fdv: parseFloat(pool.attributes.fdv_usd || 0),
+                volume: { h24: vol24 },
+                liquidity: { usd: liq },
+                priceChange: {
+                  h1: parseFloat(pool.attributes.price_change_percentage?.h1 || 0),
+                  h6: parseFloat(pool.attributes.price_change_percentage?.h6 || 0),
+                },
+                txns: {
+                  h1:  { buys: h1BuysRaw  || 0, sells: h1SellsRaw || 0 },
+                  h24: { buys: h24Buys, sells: h24Sells },
+                },
+                pairCreatedAt: pool.attributes.pool_created_at
+                  ? new Date(pool.attributes.pool_created_at).getTime()
+                  : null,
+                priceUsd: pool.attributes.base_token_price_usd,
+                icon: tokenAttrs.image_url || null,
+                pairAddress: pool.attributes.address,
+                boostAmount: 0,
+                url: `https://dexscreener.com/${chainId}/${pool.attributes.address}`,
+              });
+            });
+          } catch (e) {
+            console.warn(`GeckoTerminal trending ${network} p${page} error:`, e);
+          }
+        }
+      }
 
       const seen = new Set();
-      const relevantTokens = (Array.isArray(boostData) ? boostData : [])
-        .filter((t) => t.chainId === "solana" || t.chainId === "base")
-        .filter((t) => {
-          if (seen.has(t.tokenAddress)) return false;
-          seen.add(t.tokenAddress);
-          return true;
-        })
-        .slice(0, 24);
+      const deduped = allTokens.filter((t) => {
+        const ca = t.baseToken.address;
+        if (!ca || seen.has(ca)) return false;
+        seen.add(ca);
+        return true;
+      }).slice(0, 40);
 
-      if (relevantTokens.length === 0) {
-        setTokens([]);
-        setError(null);
-        setLoading(false);
-        return;
-      }
-
-      const byChain = {};
-      relevantTokens.forEach((t) => {
-        if (!byChain[t.chainId]) byChain[t.chainId] = [];
-        byChain[t.chainId].push(t);
-      });
-
-      const allPairs = [];
-      for (const [chainId, chainTokens] of Object.entries(byChain)) {
-        const addresses = chainTokens.map((t) => t.tokenAddress).join(",");
-        try {
-          const res = await fetch(`https://api.dexscreener.com/tokens/v1/${chainId}/${addresses}`);
-          if (res.ok) {
-            const pairs = await res.json();
-            if (Array.isArray(pairs)) allPairs.push(...pairs);
-          }
-        } catch (e) {
-          console.warn(`Failed to fetch ${chainId} tokens:`, e);
-        }
-      }
-
-      const tokenMap = new Map();
-      allPairs.forEach((pair) => {
-        const addr = pair.baseToken?.address;
-        if (!addr) return;
-        const existing = tokenMap.get(addr);
-        if (!existing || (pair.volume?.h24 || 0) > (existing.volume?.h24 || 0)) {
-          tokenMap.set(addr, pair);
-        }
-      });
-
-      const boostMap = new Map();
-      relevantTokens.forEach((t) => boostMap.set(t.tokenAddress, t));
-
-      const enrichedTokens = relevantTokens
-        .map((boost) => {
-          const pair = tokenMap.get(boost.tokenAddress);
-          if (!pair) return null;
-          return {
-            ...pair,
-            boostAmount: boost.totalAmount || 0,
-            icon: boost.icon || pair.info?.imageUrl || null,
-          };
-        })
-        .filter(Boolean)
-        .filter((t) => (t.volume?.h24 || 0) > 500)
-        .sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0))
-        .slice(0, 12);
-
-      setTokens(enrichedTokens);
+      setTokens(deduped);
       setError(null);
     } catch (err) {
       setError(err.message);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [activeChain]);
 
   useEffect(() => {
     fetchTrending();
@@ -196,9 +220,10 @@ function useTopVolumeTokens(activeChain) {
       const allTokens = [];
 
       for (const network of networksToFetch) {
+        for (const page of [1, 2]) {
         try {
           const res = await fetch(
-            `https://api.geckoterminal.com/api/v2/networks/${network}/pools?page=1&sort=h24_volume_usd_desc&include=base_token`
+            `https://api.geckoterminal.com/api/v2/networks/${network}/pools?page=${page}&sort=h24_volume_usd_desc&include=base_token`
           );
           if (!res.ok) continue;
           const data = await res.json();
@@ -276,8 +301,9 @@ function useTopVolumeTokens(activeChain) {
             });
           });
         } catch (e) {
-          console.warn(`GeckoTerminal ${network} fetch error:`, e);
+          console.warn(`GeckoTerminal ${network} p${page} fetch error:`, e);
         }
+        } // end page loop
       }
 
       // Deduplicate by CA, already sorted by volume desc from API
@@ -290,7 +316,7 @@ function useTopVolumeTokens(activeChain) {
           seen.add(ca);
           return true;
         })
-        .slice(0, 24);
+        .slice(0, 40);
 
       setTokens(deduped);
       setError(null);
@@ -976,8 +1002,8 @@ export default function App() {
   const [activeSection, setActiveSection] = useState("discover"); // "discover" | "wallets"
   const chains = ["All Chains", "Solana", "Base"];
 
-  const { prices, loading: priceLoading, error: priceError, refetch: refetchPrices } = useCryptoPrices();
-  const { tokens, loading: tokenLoading, error: tokenError, refetch: refetchTokens } = useTrendingTokens();
+  const { prices, loading: priceLoading, error: priceError } = useCryptoPrices();
+  const { tokens, loading: tokenLoading, error: tokenError } = useTrendingTokens(activeChain);
   const [lastUpdated, setLastUpdated] = useState(null);
 
   // Pinned CAs: [{ca, chainId}]
@@ -986,7 +1012,7 @@ export default function App() {
   });
 
   const { tokens: pinnedTokens, loading: pinnedLoading, refetch: refetchPinned } = usePinnedTokens(pinnedCAs);
-  const { tokens: topVolTokens, loading: topVolLoading, error: topVolError, refetch: refetchTopVol } = useTopVolumeTokens(activeChain);
+  const { tokens: topVolTokens, loading: topVolLoading, error: topVolError } = useTopVolumeTokens(activeChain);
 
   // Wallets: [{address, label}]
   const [wallets, setWallets] = useState(() => {
@@ -1040,8 +1066,6 @@ export default function App() {
     localStorage.setItem("trackedWallets", JSON.stringify(wallets));
   }, [wallets]);
 
-  const handleRefresh = () => { refetchPrices(); refetchTokens(); refetchPinned(); refetchTopVol(); };
-
   const pinToken = (ca, chainId) => {
     setPinnedCAs((prev) => prev.find((p) => p.ca === ca) ? prev : [...prev, { ca, chainId }]);
   };
@@ -1088,7 +1112,6 @@ export default function App() {
           {chains.map((chain) => (
             <button key={chain} onClick={() => setActiveChain(chain)} style={{ padding: "7px 16px", borderRadius: 20, border: "none", fontSize: 13, fontWeight: 600, cursor: "pointer", transition: "all 0.2s", background: activeChain === chain ? "#6366f1" : "transparent", color: activeChain === chain ? "#fff" : "#94a3b8" }}>{chain}</button>
           ))}
-          <button onClick={handleRefresh} style={{ padding: "7px 14px", borderRadius: 20, border: "none", background: "transparent", color: "#94a3b8", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Refresh</button>
         </div>
       </div>
 
@@ -1233,7 +1256,7 @@ export default function App() {
           {/* Trending tokens */}
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 16 }}>
             <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#f1f5f9", margin: 0 }}>Trending</h2>
-            <span style={{ color: "#64748b", fontSize: 12 }}>Powered by DexScreener • Click card to view</span>
+            <span style={{ color: "#64748b", fontSize: 12 }}>Powered by GeckoTerminal • Click card to view</span>
           </div>
 
           {tokenError && (
@@ -1351,7 +1374,7 @@ export default function App() {
       )}
 
       <div style={{ textAlign: "center", color: "#334155", fontSize: 11, marginTop: 40, paddingBottom: 20 }}>
-        Prices from CoinGecko • Tokens from DexScreener • Auto-refreshes every 2 min
+        Prices from CoinGecko • Tokens from GeckoTerminal • Auto-refreshes every 2 min
       </div>
     </div>
   );
