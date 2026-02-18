@@ -417,6 +417,9 @@ function useTokenHolders(ca, chainId, enabled) {
   const [holders, setHolders] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  const refetch = useCallback(() => setRefreshKey((k) => k + 1), []);
 
   useEffect(() => {
     if (!enabled || !ca || chainId !== "solana") return;
@@ -475,9 +478,9 @@ function useTokenHolders(ca, chainId, enabled) {
     };
     run();
     return () => { cancelled = true; };
-  }, [enabled, ca, chainId]);
+  }, [enabled, ca, chainId, refreshKey]);
 
-  return { holders, loading, error };
+  return { holders, loading, error, refetch };
 }
 
 // ─── Helpers ───
@@ -529,7 +532,7 @@ function hashColor(str) {
   for (let i = 0; i < (str || "").length; i++) {
     hash = str.charCodeAt(i) + ((hash << 5) - hash);
   }
-  return `hsl(${Math.abs(hash) % 360}, 40%, 15%)`;
+  return `hsl(${Math.abs(hash) % 360}, 45%, 22%)`;
 }
 
 function getBubbleMapsUrl(chainId, ca) {
@@ -541,6 +544,14 @@ function getBubbleMapsUrl(chainId, ca) {
 function truncateAddr(addr) {
   if (!addr) return "";
   return addr.slice(0, 6) + "…" + addr.slice(-4);
+}
+
+function getGreeting() {
+  const h = new Date().getHours();
+  if (h >= 5  && h < 12) return { title: "Morning",   panel: "Good morning",   sub: "Here's what happened overnight" };
+  if (h >= 12 && h < 17) return { title: "Afternoon", panel: "Good afternoon", sub: "Here's what's happening right now" };
+  if (h >= 17 && h < 21) return { title: "Evening",   panel: "Good evening",   sub: "Here's what's been moving today" };
+  return                         { title: "Night",     panel: "Late night",     sub: "Checking in while the world sleeps" };
 }
 
 function getHolderType(pct) {
@@ -597,29 +608,53 @@ const PriceChangeText = ({ value }) => {
 };
 
 // ─── Holder Panel ───
-const HolderPanel = ({ ca, chainId, holders, loading, error }) => {
+const HolderPanel = ({ ca, chainId, holders, loading, error, onRefresh }) => {
+  const [copiedIdx, setCopiedIdx] = useState(null);
+
+  const copyOwner = (addr, idx) => {
+    navigator.clipboard?.writeText(addr);
+    setCopiedIdx(idx);
+    setTimeout(() => setCopiedIdx(null), 1500);
+  };
+
   if (chainId !== "solana") {
+    const explorerUrl = chainId === "ethereum"
+      ? `https://etherscan.io/token/${ca}#balances`
+      : `https://basescan.org/token/${ca}#balances`;
+    const explorerName = chainId === "ethereum" ? "Etherscan" : "Basescan";
     return (
       <div style={{ marginTop: 12, padding: "10px 14px", background: "#0d1321", borderRadius: 8, border: "1px solid #1e293b" }}>
         <span style={{ color: "#64748b", fontSize: 12 }}>Holder analysis is Solana-only. </span>
-        <a href={`https://basescan.org/token/${ca}#balances`} target="_blank" rel="noopener noreferrer" style={{ color: "#60a5fa", fontSize: 12 }}>View on Basescan ↗</a>
+        <a href={explorerUrl} target="_blank" rel="noopener noreferrer" style={{ color: "#60a5fa", fontSize: 12 }}>View on {explorerName} ↗</a>
       </div>
     );
   }
 
   const top10pct = holders ? holders.slice(0, 10).reduce((s, h) => s + h.pct, 0) : null;
   const concColor = top10pct == null ? "#64748b" : top10pct > 60 ? "#f87171" : top10pct > 40 ? "#f59e0b" : "#4ade80";
+  const concLabel = top10pct == null ? "" : top10pct > 60 ? " ⚠ concentrated" : top10pct > 40 ? " moderate" : " healthy";
 
   return (
     <div style={{ marginTop: 12, padding: "10px 14px", background: "#0d1321", borderRadius: 8, border: "1px solid #1e293b" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
         <span style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700 }}>Top Holders</span>
-        {top10pct != null && (
-          <span style={{ fontSize: 11, color: concColor, fontWeight: 700 }}>
-            Top 10 own {top10pct.toFixed(1)}%
-            {top10pct > 60 ? " ⚠ concentrated" : top10pct > 40 ? " moderate" : " healthy"}
-          </span>
-        )}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {top10pct != null && (
+            <span style={{ fontSize: 11, color: concColor, fontWeight: 700 }}>
+              Top 10: {top10pct.toFixed(1)}%{concLabel}
+            </span>
+          )}
+          {onRefresh && (
+            <button
+              onClick={(e) => { e.stopPropagation(); onRefresh(); }}
+              title="Refresh holders"
+              style={{ background: "none", border: "none", color: loading ? "#334155" : "#475569", cursor: loading ? "default" : "pointer", fontSize: 14, padding: 0, lineHeight: 1 }}
+              disabled={loading}
+            >
+              ↺
+            </button>
+          )}
+        </div>
       </div>
 
       {loading && <div style={{ color: "#475569", fontSize: 12, textAlign: "center", padding: "8px 0" }}>Fetching holders…</div>}
@@ -631,11 +666,18 @@ const HolderPanel = ({ ca, chainId, holders, loading, error }) => {
       {!loading && holders && holders.map((h, i) => {
         const type = getHolderType(h.pct);
         return (
-          <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 0", borderBottom: i < holders.length - 1 ? "1px solid #1e293b22" : "none" }}>
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 0", borderBottom: i < holders.length - 1 ? "1px solid #1e293b44" : "none" }}>
             <span style={{ color: "#334155", fontSize: 11, minWidth: 16 }}>{i + 1}</span>
             <span style={{ flex: 1, color: "#64748b", fontSize: 11, fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
               {truncateAddr(h.owner)}
             </span>
+            <button
+              onClick={(e) => { e.stopPropagation(); copyOwner(h.owner, i); }}
+              title="Copy wallet address"
+              style={{ background: "none", border: "none", color: copiedIdx === i ? "#4ade80" : "#334155", cursor: "pointer", fontSize: 11, padding: "1px 3px", flexShrink: 0 }}
+            >
+              {copiedIdx === i ? "✓" : "⎘"}
+            </button>
             <span style={{ fontSize: 10, color: type.color, border: `1px solid ${type.border}`, borderRadius: 4, padding: "1px 5px", fontWeight: 700, whiteSpace: "nowrap" }}>
               {type.label}
             </span>
@@ -655,7 +697,7 @@ const HolderPanel = ({ ca, chainId, holders, loading, error }) => {
       })}
 
       {!loading && holders && holders.length > 0 && (
-        <div style={{ color: "#334155", fontSize: 10, marginTop: 8 }}>Some entries may be LP pools or program accounts</div>
+        <div style={{ color: "#334155", fontSize: 10, marginTop: 8 }}>Note: some entries may be LP pools or program accounts</div>
       )}
     </div>
   );
@@ -681,7 +723,8 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin }) => {
 
   const [hovered, setHovered] = useState(false);
   const [showHolders, setShowHolders] = useState(false);
-  const { holders, loading: holdersLoading, error: holdersError } = useTokenHolders(ca, pair.chainId, showHolders);
+  const [caCopied, setCaCopied] = useState(false);
+  const { holders, loading: holdersLoading, error: holdersError, refetch: refetchHolders } = useTokenHolders(ca, pair.chainId, showHolders);
 
   return (
     <div
@@ -783,11 +826,11 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin }) => {
           <span style={{ color: "#334155", fontSize: 10, fontFamily: "monospace" }}>CA:</span>
           <span style={{ color: "#475569", fontSize: 10, fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{ca}</span>
           <button
-            onClick={() => navigator.clipboard?.writeText(ca)}
+            onClick={() => { navigator.clipboard?.writeText(ca); setCaCopied(true); setTimeout(() => setCaCopied(false), 1500); }}
             title="Copy CA"
-            style={{ background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 11, padding: "1px 4px" }}
+            style={{ background: "none", border: "none", color: caCopied ? "#4ade80" : "#475569", cursor: "pointer", fontSize: 11, padding: "1px 4px", transition: "color 0.15s" }}
           >
-            copy
+            {caCopied ? "✓ copied" : "copy"}
           </button>
         </div>
       )}
@@ -830,6 +873,7 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin }) => {
           holders={holders}
           loading={holdersLoading}
           error={holdersError}
+          onRefresh={refetchHolders}
         />
       )}
     </div>
@@ -897,7 +941,7 @@ const WalletCard = ({ wallet, onRemove }) => {
             {wallet.label && <div style={{ color: "#f1f5f9", fontWeight: 600, fontSize: 14 }}>{wallet.label}</div>}
             <div style={{ color: "#64748b", fontSize: 12, fontFamily: "monospace" }}>{wallet.address}</div>
           </div>
-          <span style={{ background: "#0052FF22", color: "#60a5fa", border: "1px solid #0052FF44", fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, fontFamily: "monospace" }}>SOL</span>
+          <span style={{ background: "#9945FF22", color: "#c084fc", border: "1px solid #9945FF44", fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, fontFamily: "monospace" }}>SOL</span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           {totalUsd > 0 && <span style={{ color: "#4ade80", fontWeight: 700, fontSize: 14 }}>{formatVolume(totalUsd)}</span>}
@@ -969,7 +1013,7 @@ const AddCAPanel = ({ onAdd, onClose }) => {
         <button
           onClick={handleAdd}
           disabled={!ca.trim() || status === "loading"}
-          style={{ background: "#6366f1", border: "none", borderRadius: 8, color: "#fff", fontSize: 13, fontWeight: 600, padding: "8px 16px", cursor: "pointer", opacity: !ca.trim() ? 0.5 : 1 }}
+          style={{ background: "#6366f1", border: "none", borderRadius: 8, color: "#fff", fontSize: 13, fontWeight: 600, padding: "8px 16px", cursor: !ca.trim() || status === "loading" ? "not-allowed" : "pointer", opacity: !ca.trim() ? 0.5 : 1 }}
         >
           {status === "loading" ? "…" : status === "ok" ? "✓" : "Pin"}
         </button>
@@ -1132,7 +1176,7 @@ const AddWalletPanel = ({ onAdd, onClose }) => {
           <button
             onClick={handleAdd}
             disabled={!address.trim()}
-            style={{ background: "#4ade8022", border: "1px solid #4ade8044", borderRadius: 8, color: "#4ade80", fontSize: 13, fontWeight: 600, padding: "8px 16px", cursor: "pointer", opacity: !address.trim() ? 0.5 : 1 }}
+            style={{ background: "#4ade8022", border: "1px solid #4ade8044", borderRadius: 8, color: "#4ade80", fontSize: 13, fontWeight: 600, padding: "8px 16px", cursor: !address.trim() ? "not-allowed" : "pointer", opacity: !address.trim() ? 0.5 : 1 }}
           >
             Add
           </button>
@@ -1145,6 +1189,7 @@ const AddWalletPanel = ({ onAdd, onClose }) => {
 
 // ─── Main App ───
 export default function App() {
+  const greeting = getGreeting();
   const [activeChain, setActiveChain] = useState("All Chains");
   const [activeSection, setActiveSection] = useState("discover"); // "discover" | "wallets"
   const chains = ["All Chains", "Solana", "Base"];
@@ -1252,8 +1297,8 @@ export default function App() {
       {/* Header */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 28 }}>
         <div>
-          <h1 style={{ fontSize: 32, fontWeight: 800, margin: 0, color: "#f8fafc", fontStyle: "italic", letterSpacing: -0.5 }}>Morning</h1>
-          <p style={{ color: "#64748b", fontSize: 14, margin: "4px 0 0" }}>What happened while you slept</p>
+          <h1 style={{ fontSize: 32, fontWeight: 800, margin: 0, color: "#f8fafc", fontStyle: "italic", letterSpacing: -0.5 }}>{greeting.title}</h1>
+          <p style={{ color: "#64748b", fontSize: 14, margin: "4px 0 0" }}>{greeting.sub}</p>
         </div>
         <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
           {chains.map((chain) => (
@@ -1268,8 +1313,8 @@ export default function App() {
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
             <span style={{ fontSize: 28 }}>☕</span>
             <div>
-              <div style={{ fontWeight: 700, fontSize: 17, color: "#f1f5f9" }}>Good morning</div>
-              <div style={{ color: "#64748b", fontSize: 13 }}>Here's what happened overnight</div>
+              <div style={{ fontWeight: 700, fontSize: 17, color: "#f1f5f9" }}>{greeting.panel}</div>
+              <div style={{ color: "#64748b", fontSize: 13 }}>{greeting.sub}</div>
             </div>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
@@ -1282,7 +1327,7 @@ export default function App() {
           <div style={{ background: "#7f1d1d33", border: "1px solid #991b1b", borderRadius: 8, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 13 }}>⚠ Price fetch failed: {priceError}</div>
         )}
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))", gap: 16 }}>
           {priceLoading
             ? [1, 2, 3].map((i) => <PriceSkeleton key={i} />)
             : coinConfigs.map((coin) => {
@@ -1361,12 +1406,12 @@ export default function App() {
               {showAddCA && <AddCAPanel onAdd={(ca, chainId) => { pinToken(ca, chainId); refetchPinned(); }} onClose={() => setShowAddCA(false)} />}
 
               {pinnedLoading && (
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 14 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 14 }}>
                   {[1, 2].map((i) => <TokenSkeleton key={i} />)}
                 </div>
               )}
               {!pinnedLoading && filteredPinned.length > 0 && (
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 14 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 14 }}>
                   {filteredPinned.map((pair, i) => (
                     <TokenCard
                       key={`pinned-${pair.pairAddress}-${i}`}
@@ -1410,7 +1455,7 @@ export default function App() {
             <div style={{ background: "#7f1d1d33", border: "1px solid #991b1b", borderRadius: 8, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 13 }}>⚠ Token fetch failed: {tokenError}. Will retry…</div>
           )}
 
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 14 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 14 }}>
             {tokenLoading
               ? [1, 2, 3, 4, 5, 6].map((i) => <TokenSkeleton key={i} />)
               : filteredTokens.map((pair, i) => {
@@ -1459,7 +1504,7 @@ export default function App() {
             <div style={{ background: "#7f1d1d33", border: "1px solid #991b1b", borderRadius: 8, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 13 }}>⚠ Fetch failed: {topVolError}</div>
           )}
 
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 14 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 14 }}>
             {topVolLoading
               ? [1, 2, 3, 4, 5, 6].map((i) => <TokenSkeleton key={i} />)
               : filteredTopVol.map((pair, i) => {
