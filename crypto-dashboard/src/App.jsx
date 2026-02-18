@@ -336,6 +336,39 @@ function useTopVolumeTokens(activeChain) {
   return { tokens, loading, error, refetch: fetchTopVol };
 }
 
+// ─── Solana RPC helper — tries endpoints in order, handles 403 / 429 ───
+const SOLANA_RPCS = [
+  "https://api.mainnet-beta.solana.com",
+  "https://rpc.ankr.com/solana",
+];
+
+async function postRPC(body) {
+  let lastErr = new Error("All RPC endpoints failed");
+  for (const rpc of SOLANA_RPCS) {
+    try {
+      const res = await fetch(rpc, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (res.status === 403) { lastErr = new Error("RPC access denied — try again later"); continue; }
+      if (res.status === 429) { lastErr = new Error("Rate limited — try again in a moment"); continue; }
+      if (!res.ok)            { lastErr = new Error(`RPC error HTTP ${res.status}`); continue; }
+      const data = await res.json();
+      // RPC-level error is the same on all nodes, so don't retry
+      if (data.error) throw new Error(data.error.message || "RPC error");
+      return data;
+    } catch (e) {
+      if (e.message.startsWith("RPC access") || e.message.startsWith("Rate limited") || e.message.startsWith("RPC error") || e.message === "All RPC endpoints failed") {
+        lastErr = e;
+      } else {
+        lastErr = e; // network error, keep trying
+      }
+    }
+  }
+  throw lastErr;
+}
+
 // ─── Wallet Tokens Hook (Solana RPC) ───
 function useWalletTokens(address) {
   const [holdings, setHoldings] = useState([]);
@@ -347,17 +380,11 @@ function useWalletTokens(address) {
     setLoading(true);
     setError(null);
     try {
-      const rpcRes = await fetch("https://api.mainnet-beta.solana.com", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0", id: 1,
-          method: "getTokenAccountsByOwner",
-          params: [address, { programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" }, { encoding: "jsonParsed" }],
-        }),
+      const rpcData = await postRPC({
+        jsonrpc: "2.0", id: 1,
+        method: "getTokenAccountsByOwner",
+        params: [address, { programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" }, { encoding: "jsonParsed" }],
       });
-      const rpcData = await rpcRes.json();
-      if (rpcData.error) throw new Error(rpcData.error.message || "RPC error");
 
       const accounts = rpcData.result?.value || [];
       const rawHoldings = accounts
@@ -428,35 +455,18 @@ function useTokenHolders(ca, chainId, enabled) {
       setLoading(true);
       setError(null);
       try {
-        const RPC = "https://api.mainnet-beta.solana.com";
-        const [largestRes, supplyRes] = await Promise.all([
-          fetch(RPC, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getTokenLargestAccounts", params: [ca, { commitment: "confirmed" }] }),
-          }),
-          fetch(RPC, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "getTokenSupply", params: [ca] }),
-          }),
+        const [largestData, supplyData] = await Promise.all([
+          postRPC({ jsonrpc: "2.0", id: 1, method: "getTokenLargestAccounts", params: [ca, { commitment: "confirmed" }] }),
+          postRPC({ jsonrpc: "2.0", id: 2, method: "getTokenSupply", params: [ca] }),
         ]);
-        const largestData = await largestRes.json();
-        const supplyData = await supplyRes.json();
         if (cancelled) return;
-        if (largestData.error) throw new Error(largestData.error.message);
         const accounts = largestData.result?.value || [];
         const totalSupply = parseFloat(supplyData.result?.value?.uiAmount || 0);
         if (accounts.length === 0 || totalSupply === 0) { setHolders([]); return; }
 
         // Resolve token accounts → owner wallet addresses
         const addrs = accounts.map((a) => a.address);
-        const multiRes = await fetch(RPC, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "getMultipleAccounts", params: [addrs, { encoding: "jsonParsed" }] }),
-        });
-        const multiData = await multiRes.json();
+        const multiData = await postRPC({ jsonrpc: "2.0", id: 3, method: "getMultipleAccounts", params: [addrs, { encoding: "jsonParsed" }] });
         if (cancelled) return;
         const infos = multiData.result?.value || [];
 
@@ -709,7 +719,7 @@ const HolderPanel = ({ ca, chainId, holders, loading, error, onRefresh }) => {
 };
 
 // ─── Token Card ───
-const TokenCard = ({ pair, isPinned, onPin, onUnpin }) => {
+const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [] }) => {
   const symbol = pair.baseToken?.symbol || "???";
   const name = pair.baseToken?.name || "Unknown";
   const chain = getChainLabel(pair.chainId);
@@ -728,6 +738,7 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin }) => {
 
   const [hovered, setHovered] = useState(false);
   const [showHolders, setShowHolders] = useState(false);
+  const [showWalletHolders, setShowWalletHolders] = useState(false);
   const [caCopied, setCaCopied] = useState(false);
   const { holders, loading: holdersLoading, error: holdersError, refetch: refetchHolders } = useTokenHolders(ca, pair.chainId, showHolders);
 
@@ -766,7 +777,43 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin }) => {
         >
           {isPinned ? "📌" : "🔖"}
         </button>
+        {/* Tracked wallets badge */}
+        {walletHolders.length > 0 && (
+          <button
+            onClick={(e) => { e.stopPropagation(); setShowWalletHolders((v) => !v); }}
+            title={`${walletHolders.length} tracked wallet${walletHolders.length > 1 ? "s" : ""} hold this`}
+            style={{ position: "relative", width: 28, height: 28, borderRadius: 6, background: showWalletHolders ? "#4ade8033" : "#4ade8018", border: `1px solid ${showWalletHolders ? "#4ade8088" : "#4ade8044"}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, cursor: "pointer", flexShrink: 0 }}
+          >
+            👜
+            <span style={{ position: "absolute", top: -4, right: -4, background: "#4ade80", color: "#0d1321", borderRadius: "50%", fontSize: 9, fontWeight: 800, minWidth: 14, height: 14, display: "flex", alignItems: "center", justifyContent: "center", padding: "0 2px", lineHeight: 1 }}>
+              {walletHolders.length}
+            </span>
+          </button>
+        )}
       </div>
+
+      {/* Wallet holders popover */}
+      {showWalletHolders && walletHolders.length > 0 && (
+        <div
+          style={{ position: "absolute", top: 44, right: 12, zIndex: 20, background: "#1e293b", border: "1px solid #334155", borderRadius: 10, padding: "12px 14px", minWidth: 220, boxShadow: "0 4px 24px #00000088" }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div style={{ color: "#4ade80", fontSize: 12, fontWeight: 700, marginBottom: 8 }}>👜 Your wallets holding this</div>
+          {walletHolders.map((h, i) => (
+            <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "5px 0", borderTop: i > 0 ? "1px solid #334155" : "none" }}>
+              <div style={{ color: "#94a3b8", fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 130 }}>
+                {h.label || truncateAddr(h.address)}
+              </div>
+              <div style={{ textAlign: "right", flexShrink: 0, marginLeft: 8 }}>
+                {h.usdValue >= 0.01 && <div style={{ color: "#f1f5f9", fontSize: 12, fontWeight: 600 }}>{formatVolume(h.usdValue)}</div>}
+                <div style={{ color: "#64748b", fontSize: 11 }}>
+                  {h.amount >= 1e6 ? (h.amount / 1e6).toFixed(2) + "M" : h.amount >= 1e3 ? (h.amount / 1e3).toFixed(1) + "K" : h.amount.toFixed(2)}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Clickable area → DexScreener */}
       <a href={dexUrl} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "none", color: "inherit" }}>
@@ -926,9 +973,16 @@ const WalletHoldingRow = ({ holding }) => {
   );
 };
 
-const WalletCard = ({ wallet, onRemove }) => {
+const WalletCard = ({ wallet, onRemove, onHoldingsLoaded }) => {
   const { holdings, loading, error, refetch } = useWalletTokens(wallet.address);
   const [expanded, setExpanded] = useState(true);
+
+  // Report loaded holdings back to parent so it can build the mint → wallets map
+  useEffect(() => {
+    if (!loading && !error && holdings.length > 0) {
+      onHoldingsLoaded?.(wallet.address, wallet.label || "", holdings);
+    }
+  }, [holdings, loading, error, wallet.address, wallet.label, onHoldingsLoaded]);
 
   const totalUsd = holdings.reduce((sum, h) => {
     const price = h.pair?.priceUsd ? parseFloat(h.pair.priceUsd) : 0;
@@ -1142,51 +1196,130 @@ const FilterBar = ({ sortBy, sortDir, onSort, minVol, onMinVol, minMcap, onMinMc
 );
 
 // ─── Add Wallet Panel ───
+// Parse a bulk import block: one wallet per line, optional label after comma or whitespace
+function parseBulkWallets(raw) {
+  return raw
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"))
+    .map((line) => {
+      // support: "address,label"  or  "address label"
+      const commaIdx = line.indexOf(",");
+      if (commaIdx !== -1) {
+        return { address: line.slice(0, commaIdx).trim(), label: line.slice(commaIdx + 1).trim() };
+      }
+      const spaceIdx = line.search(/\s/);
+      if (spaceIdx !== -1) {
+        return { address: line.slice(0, spaceIdx).trim(), label: line.slice(spaceIdx + 1).trim() };
+      }
+      return { address: line, label: "" };
+    })
+    .filter(({ address }) => address.length >= 32 && address.length <= 44);
+}
+
 const AddWalletPanel = ({ onAdd, onClose }) => {
+  const [mode, setMode] = useState("single"); // "single" | "bulk"
   const [address, setAddress] = useState("");
   const [label, setLabel] = useState("");
+  const [bulk, setBulk] = useState("");
+  const [bulkResult, setBulkResult] = useState(null); // null | number
   const inputRef = useRef(null);
 
   useEffect(() => { inputRef.current?.focus(); }, []);
 
-  const handleAdd = () => {
+  const handleAddSingle = () => {
     const trimmed = address.trim();
     if (!trimmed) return;
     onAdd(trimmed, label.trim());
     onClose();
   };
 
+  const handleBulkImport = () => {
+    const entries = parseBulkWallets(bulk);
+    if (entries.length === 0) return;
+    entries.forEach(({ address, label }) => onAdd(address, label));
+    setBulkResult(entries.length);
+    setTimeout(onClose, 1400);
+  };
+
+  const parsed = mode === "bulk" ? parseBulkWallets(bulk) : [];
+
   return (
     <div style={{ background: "#111827", border: "1px solid #4ade8044", borderRadius: 12, padding: "16px 20px", marginBottom: 16 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-        <span style={{ color: "#4ade80", fontWeight: 700, fontSize: 14 }}>Add a Solana wallet</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ color: "#4ade80", fontWeight: 700, fontSize: 14 }}>Add Solana wallet</span>
+          {/* Mode toggle */}
+          <div style={{ display: "flex", background: "#0d1321", border: "1px solid #334155", borderRadius: 6, overflow: "hidden" }}>
+            {["single", "bulk"].map((m) => (
+              <button
+                key={m}
+                onClick={() => setMode(m)}
+                style={{ padding: "3px 10px", border: "none", background: mode === m ? "#4ade8022" : "transparent", color: mode === m ? "#4ade80" : "#64748b", fontSize: 11, fontWeight: 700, cursor: "pointer", textTransform: "capitalize" }}
+              >
+                {m === "single" ? "Single" : "Bulk import"}
+              </button>
+            ))}
+          </div>
+        </div>
         <button onClick={onClose} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 16 }}>✕</button>
       </div>
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        <input
-          ref={inputRef}
-          value={address}
-          onChange={(e) => setAddress(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && handleAdd()}
-          placeholder="Wallet address (Solana)…"
-          style={{ background: "#0d1321", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 13, padding: "8px 12px", outline: "none" }}
-        />
-        <div style={{ display: "flex", gap: 8 }}>
+
+      {mode === "single" ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           <input
-            value={label}
-            onChange={(e) => setLabel(e.target.value)}
-            placeholder="Label (optional, e.g. 'My wallet')"
-            style={{ flex: 1, background: "#0d1321", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 13, padding: "8px 12px", outline: "none" }}
+            ref={inputRef}
+            value={address}
+            onChange={(e) => setAddress(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleAddSingle()}
+            placeholder="Wallet address (Solana)…"
+            style={{ background: "#0d1321", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 13, padding: "8px 12px", outline: "none" }}
           />
-          <button
-            onClick={handleAdd}
-            disabled={!address.trim()}
-            style={{ background: "#4ade8022", border: "1px solid #4ade8044", borderRadius: 8, color: "#4ade80", fontSize: 13, fontWeight: 600, padding: "8px 16px", cursor: !address.trim() ? "not-allowed" : "pointer", opacity: !address.trim() ? 0.5 : 1 }}
-          >
-            Add
-          </button>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              value={label}
+              onChange={(e) => setLabel(e.target.value)}
+              placeholder="Label (optional)"
+              style={{ flex: 1, background: "#0d1321", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 13, padding: "8px 12px", outline: "none" }}
+            />
+            <button
+              onClick={handleAddSingle}
+              disabled={!address.trim()}
+              style={{ background: "#4ade8022", border: "1px solid #4ade8044", borderRadius: 8, color: "#4ade80", fontSize: 13, fontWeight: 600, padding: "8px 16px", cursor: !address.trim() ? "not-allowed" : "pointer", opacity: !address.trim() ? 0.5 : 1 }}
+            >
+              Add
+            </button>
+          </div>
         </div>
-      </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <textarea
+            ref={inputRef}
+            value={bulk}
+            onChange={(e) => { setBulk(e.target.value); setBulkResult(null); }}
+            placeholder={"Paste one address per line.\nOptional label after comma or space:\n\nABC...XYZ, My main wallet\nDEF...UVW whale"}
+            rows={6}
+            style={{ background: "#0d1321", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 12, fontFamily: "monospace", padding: "10px 12px", outline: "none", resize: "vertical", lineHeight: 1.6 }}
+          />
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <span style={{ color: parsed.length > 0 ? "#94a3b8" : "#475569", fontSize: 12 }}>
+              {parsed.length > 0 ? `${parsed.length} valid address${parsed.length > 1 ? "es" : ""} detected` : "Paste addresses above"}
+            </span>
+            {bulkResult !== null ? (
+              <span style={{ color: "#4ade80", fontSize: 13, fontWeight: 700 }}>✓ Added {bulkResult} wallet{bulkResult > 1 ? "s" : ""}</span>
+            ) : (
+              <button
+                onClick={handleBulkImport}
+                disabled={parsed.length === 0}
+                style={{ background: "#4ade8022", border: "1px solid #4ade8044", borderRadius: 8, color: "#4ade80", fontSize: 13, fontWeight: 600, padding: "8px 16px", cursor: parsed.length === 0 ? "not-allowed" : "pointer", opacity: parsed.length === 0 ? 0.5 : 1 }}
+              >
+                Import {parsed.length > 0 ? parsed.length : ""} wallet{parsed.length !== 1 ? "s" : ""}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       <div style={{ color: "#475569", fontSize: 11, marginTop: 8 }}>Only Solana wallets supported. Shows tokens listed on DexScreener.</div>
     </div>
   );
@@ -1218,6 +1351,27 @@ export default function App() {
 
   const [showAddCA, setShowAddCA] = useState(false);
   const [showAddWallet, setShowAddWallet] = useState(false);
+
+  // mint → [{address, label, amount, usdValue}] across all tracked wallets
+  const [walletMintMap, setWalletMintMap] = useState({});
+  const handleHoldingsLoaded = useCallback((walletAddr, walletLabel, holdings) => {
+    setWalletMintMap((prev) => {
+      const next = { ...prev };
+      // Remove stale entries for this wallet
+      Object.keys(next).forEach((mint) => {
+        next[mint] = next[mint].filter((h) => h.address !== walletAddr);
+        if (next[mint].length === 0) delete next[mint];
+      });
+      // Add fresh entries
+      holdings.forEach((h) => {
+        if (!h.mint) return;
+        const price = h.pair?.priceUsd ? parseFloat(h.pair.priceUsd) : 0;
+        const entry = { address: walletAddr, label: walletLabel, amount: h.amount, usdValue: price * h.amount };
+        next[h.mint] = [...(next[h.mint] || []), entry];
+      });
+      return next;
+    });
+  }, []);
 
   // Filters & sort
   const [sortBy, setSortBy] = useState("vol");
@@ -1424,6 +1578,7 @@ export default function App() {
                       isPinned={true}
                       onPin={pinToken}
                       onUnpin={unpinToken}
+                      walletHolders={walletMintMap[pair.baseToken?.address || ""] || []}
                     />
                   ))}
                 </div>
@@ -1472,6 +1627,7 @@ export default function App() {
                       isPinned={pinnedCAs.some((p) => p.ca === ca)}
                       onPin={pinToken}
                       onUnpin={unpinToken}
+                      walletHolders={walletMintMap[ca] || []}
                     />
                   );
                 })}
@@ -1521,6 +1677,7 @@ export default function App() {
                       isPinned={pinnedCAs.some((p) => p.ca === ca)}
                       onPin={pinToken}
                       onUnpin={unpinToken}
+                      walletHolders={walletMintMap[ca] || []}
                     />
                   );
                 })}
@@ -1559,7 +1716,7 @@ export default function App() {
           )}
 
           {wallets.map((wallet) => (
-            <WalletCard key={wallet.address} wallet={wallet} onRemove={removeWallet} />
+            <WalletCard key={wallet.address} wallet={wallet} onRemove={removeWallet} onHoldingsLoaded={handleHoldingsLoaded} />
           ))}
 
           {wallets.length > 0 && (
