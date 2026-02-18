@@ -321,6 +321,7 @@ function useTopVolumeTokens(activeChain) {
 
 // ─── Solana RPC helper — tries endpoints in order, handles 403 / 429 ───
 const SOLANA_RPCS = [
+  "https://mainnet.helius-rpc.com/?api-key=0dd8f0ec-f2a5-4f9e-b275-379afa3e73cd",
   "https://api.mainnet-beta.solana.com",
   "https://rpc.ankr.com/solana",
 ];
