@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 
 // ─── Live Price Hook (CoinGecko) ───
 function useCryptoPrices() {
@@ -39,12 +39,10 @@ function useTrendingTokens() {
 
   const fetchTrending = useCallback(async () => {
     try {
-      // Step 1: Get top boosted tokens
       const boostRes = await fetch("https://api.dexscreener.com/token-boosts/top/v1");
       if (!boostRes.ok) throw new Error("DexScreener boost API failed (" + boostRes.status + ")");
       const boostData = await boostRes.json();
 
-      // Filter for Solana and Base, deduplicate
       const seen = new Set();
       const relevantTokens = (Array.isArray(boostData) ? boostData : [])
         .filter((t) => t.chainId === "solana" || t.chainId === "base")
@@ -62,33 +60,26 @@ function useTrendingTokens() {
         return;
       }
 
-      // Step 2: Group tokens by chain (API requires chainId in path)
       const byChain = {};
       relevantTokens.forEach((t) => {
         if (!byChain[t.chainId]) byChain[t.chainId] = [];
         byChain[t.chainId].push(t);
       });
 
-      // Step 3: Fetch pair data per chain (max 30 addresses per call)
       const allPairs = [];
       for (const [chainId, chainTokens] of Object.entries(byChain)) {
         const addresses = chainTokens.map((t) => t.tokenAddress).join(",");
         try {
-          const res = await fetch(
-            `https://api.dexscreener.com/tokens/v1/${chainId}/${addresses}`
-          );
+          const res = await fetch(`https://api.dexscreener.com/tokens/v1/${chainId}/${addresses}`);
           if (res.ok) {
             const pairs = await res.json();
-            if (Array.isArray(pairs)) {
-              allPairs.push(...pairs);
-            }
+            if (Array.isArray(pairs)) allPairs.push(...pairs);
           }
         } catch (e) {
           console.warn(`Failed to fetch ${chainId} tokens:`, e);
         }
       }
 
-      // Step 4: Pick highest volume pair per token
       const tokenMap = new Map();
       allPairs.forEach((pair) => {
         const addr = pair.baseToken?.address;
@@ -99,7 +90,6 @@ function useTrendingTokens() {
         }
       });
 
-      // Step 5: Build enriched token list
       const boostMap = new Map();
       relevantTokens.forEach((t) => boostMap.set(t.tokenAddress, t));
 
@@ -134,6 +124,134 @@ function useTrendingTokens() {
   }, [fetchTrending]);
 
   return { tokens, loading, error, refetch: fetchTrending };
+}
+
+// ─── Pinned Tokens Hook ───
+function usePinnedTokens(pinnedCAs) {
+  const [tokens, setTokens] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  const fetchPinned = useCallback(async () => {
+    if (pinnedCAs.length === 0) { setTokens([]); return; }
+    setLoading(true);
+    try {
+      const byChain = {};
+      pinnedCAs.forEach(({ ca, chainId }) => {
+        if (!byChain[chainId]) byChain[chainId] = [];
+        byChain[chainId].push(ca);
+      });
+
+      const allPairs = [];
+      for (const [chainId, addresses] of Object.entries(byChain)) {
+        const chunks = [];
+        for (let i = 0; i < addresses.length; i += 30) chunks.push(addresses.slice(i, i + 30));
+        for (const chunk of chunks) {
+          try {
+            const res = await fetch(`https://api.dexscreener.com/tokens/v1/${chainId}/${chunk.join(",")}`);
+            if (res.ok) {
+              const pairs = await res.json();
+              if (Array.isArray(pairs)) allPairs.push(...pairs);
+            }
+          } catch (e) { console.warn("Pinned fetch error:", e); }
+        }
+      }
+
+      const tokenMap = new Map();
+      allPairs.forEach((pair) => {
+        const addr = pair.baseToken?.address;
+        if (!addr) return;
+        const existing = tokenMap.get(addr);
+        if (!existing || (pair.volume?.h24 || 0) > (existing.volume?.h24 || 0)) {
+          tokenMap.set(addr, { ...pair, icon: pair.icon || pair.info?.imageUrl || null });
+        }
+      });
+
+      setTokens(pinnedCAs.map(({ ca }) => tokenMap.get(ca)).filter(Boolean));
+    } catch (e) {
+      console.warn("usePinnedTokens error:", e);
+    } finally {
+      setLoading(false);
+    }
+  }, [pinnedCAs]);
+
+  useEffect(() => { fetchPinned(); }, [fetchPinned]);
+  return { tokens, loading, refetch: fetchPinned };
+}
+
+// ─── Wallet Tokens Hook (Solana RPC) ───
+function useWalletTokens(address) {
+  const [holdings, setHoldings] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const fetch_ = useCallback(async () => {
+    if (!address) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const rpcRes = await fetch("https://api.mainnet-beta.solana.com", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0", id: 1,
+          method: "getTokenAccountsByOwner",
+          params: [address, { programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" }, { encoding: "jsonParsed" }],
+        }),
+      });
+      const rpcData = await rpcRes.json();
+      if (rpcData.error) throw new Error(rpcData.error.message || "RPC error");
+
+      const accounts = rpcData.result?.value || [];
+      const rawHoldings = accounts
+        .map((a) => ({
+          mint: a.account.data.parsed.info.mint,
+          amount: a.account.data.parsed.info.tokenAmount.uiAmount || 0,
+        }))
+        .filter((t) => t.amount > 0)
+        .sort((a, b) => b.amount - a.amount)
+        .slice(0, 30);
+
+      if (rawHoldings.length === 0) { setHoldings([]); return; }
+
+      const mints = rawHoldings.map((h) => h.mint);
+      const chunks = [];
+      for (let i = 0; i < mints.length; i += 30) chunks.push(mints.slice(i, i + 30));
+
+      const allPairs = [];
+      for (const chunk of chunks) {
+        try {
+          const res = await fetch(`https://api.dexscreener.com/tokens/v1/solana/${chunk.join(",")}`);
+          if (res.ok) {
+            const pairs = await res.json();
+            if (Array.isArray(pairs)) allPairs.push(...pairs);
+          }
+        } catch (e) { console.warn("Wallet pair fetch error:", e); }
+      }
+
+      const tokenMap = new Map();
+      allPairs.forEach((pair) => {
+        const addr = pair.baseToken?.address;
+        if (!addr) return;
+        const existing = tokenMap.get(addr);
+        if (!existing || (pair.volume?.h24 || 0) > (existing.volume?.h24 || 0)) {
+          tokenMap.set(addr, { ...pair, icon: pair.icon || pair.info?.imageUrl || null });
+        }
+      });
+
+      const enriched = rawHoldings
+        .map((h) => ({ ...h, pair: tokenMap.get(h.mint) || null }))
+        .filter((h) => h.pair);
+
+      setHoldings(enriched);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [address]);
+
+  useEffect(() => { fetch_(); }, [fetch_]);
+  return { holdings, loading, error, refetch: fetch_ };
 }
 
 // ─── Helpers ───
@@ -188,6 +306,17 @@ function hashColor(str) {
   return `hsl(${Math.abs(hash) % 360}, 40%, 15%)`;
 }
 
+function getBubbleMapsUrl(chainId, ca) {
+  const chainMap = { solana: "sol", base: "base", ethereum: "eth" };
+  const chain = chainMap[chainId] || chainId;
+  return `https://app.bubblemaps.io/${chain}/token/${ca}`;
+}
+
+function truncateAddr(addr) {
+  if (!addr) return "";
+  return addr.slice(0, 6) + "…" + addr.slice(-4);
+}
+
 // ─── Components ───
 const ChainBadge = ({ chain }) => {
   const colors = {
@@ -224,10 +353,12 @@ const PriceChangeText = ({ value }) => {
   return <span style={{ color: positive ? "#4ade80" : "#f87171", fontSize: 13, fontWeight: 600 }}>{formatChange(value)}</span>;
 };
 
-const TokenCard = ({ pair }) => {
+// ─── Token Card ───
+const TokenCard = ({ pair, isPinned, onPin, onUnpin }) => {
   const symbol = pair.baseToken?.symbol || "???";
   const name = pair.baseToken?.name || "Unknown";
   const chain = getChainLabel(pair.chainId);
+  const ca = pair.baseToken?.address || "";
   const mcap = pair.marketCap || pair.fdv || 0;
   const vol24 = pair.volume?.h24 || 0;
   const liq = pair.liquidity?.usd || 0;
@@ -238,17 +369,58 @@ const TokenCard = ({ pair }) => {
   const age = formatAge(pair.pairCreatedAt);
   const iconUrl = pair.icon || pair.info?.imageUrl || null;
   const dexUrl = pair.url || `https://dexscreener.com/${pair.chainId}/${pair.pairAddress}`;
+  const bubbleMapsUrl = getBubbleMapsUrl(pair.chainId, ca);
+  const holdersUrl = pair.chainId === "solana"
+    ? `https://solscan.io/token/${ca}#holders`
+    : `https://basescan.org/token/${ca}#balances`;
+
+  const [hovered, setHovered] = useState(false);
 
   return (
-    <a href={dexUrl} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "none", color: "inherit" }}>
-      <div
-        style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 14, padding: "18px 20px", display: "flex", flexDirection: "column", gap: 4, transition: "border-color 0.2s", cursor: "pointer", height: "100%" }}
-        onMouseEnter={(e) => (e.currentTarget.style.borderColor = "#334155")}
-        onMouseLeave={(e) => (e.currentTarget.style.borderColor = "#1e293b")}
-      >
-        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
-          <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-            <div style={{ position: "relative", width: 40, height: 40 }}>
+    <div
+      style={{ background: "#111827", border: `1px solid ${hovered ? "#334155" : "#1e293b"}`, borderRadius: 14, padding: "18px 20px", display: "flex", flexDirection: "column", gap: 4, transition: "border-color 0.2s", position: "relative", height: "100%", boxSizing: "border-box" }}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+    >
+      {/* Action buttons — top right */}
+      <div style={{ position: "absolute", top: 12, right: 12, display: "flex", gap: 4, zIndex: 2 }}>
+        {/* BubbleMaps */}
+        <a
+          href={bubbleMapsUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          title="Open in BubbleMaps"
+          style={{ width: 28, height: 28, borderRadius: 6, background: "#1e293b", border: "1px solid #334155", display: "flex", alignItems: "center", justifyContent: "center", textDecoration: "none", fontSize: 14, color: "#60a5fa", cursor: "pointer", flexShrink: 0 }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          🫧
+        </a>
+        {/* Top Holders */}
+        <a
+          href={holdersUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          title="View top holders"
+          style={{ width: 28, height: 28, borderRadius: 6, background: "#1e293b", border: "1px solid #334155", display: "flex", alignItems: "center", justifyContent: "center", textDecoration: "none", fontSize: 14, color: "#94a3b8", cursor: "pointer", flexShrink: 0 }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          👥
+        </a>
+        {/* Bookmark / Pin */}
+        <button
+          onClick={(e) => { e.stopPropagation(); isPinned ? onUnpin(ca, pair.chainId) : onPin(ca, pair.chainId); }}
+          title={isPinned ? "Unpin" : "Pin / Bookmark"}
+          style={{ width: 28, height: 28, borderRadius: 6, background: isPinned ? "#6366f122" : "#1e293b", border: `1px solid ${isPinned ? "#6366f1" : "#334155"}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, color: isPinned ? "#818cf8" : "#64748b", cursor: "pointer", flexShrink: 0 }}
+        >
+          {isPinned ? "📌" : "🔖"}
+        </button>
+      </div>
+
+      {/* Clickable area → DexScreener */}
+      <a href={dexUrl} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "none", color: "inherit" }}>
+        <div style={{ display: "flex", alignItems: "flex-start" }}>
+          <div style={{ display: "flex", gap: 12, alignItems: "center", paddingRight: 100 }}>
+            <div style={{ position: "relative", width: 40, height: 40, flexShrink: 0 }}>
               {iconUrl && (
                 <img src={iconUrl} alt={symbol} style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid #ffffff11", objectFit: "cover", position: "absolute", top: 0, left: 0 }}
                   onError={(e) => { e.target.style.display = "none"; }}
@@ -266,7 +438,7 @@ const TokenCard = ({ pair }) => {
                   <span style={{ fontSize: 10, color: "#f59e0b", fontWeight: 600 }}>🔥 {pair.boostAmount}</span>
                 )}
               </div>
-              <div style={{ color: "#94a3b8", fontSize: 12, marginTop: 2, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</div>
+              <div style={{ color: "#94a3b8", fontSize: 12, marginTop: 2, maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</div>
               <div style={{ color: "#64748b", fontSize: 11, marginTop: 2 }}>
                 Age <span style={{ color: "#94a3b8" }}>{age}</span>
                 {"  "}Price <span style={{ color: "#94a3b8" }}>{pair.priceUsd ? formatPrice(parseFloat(pair.priceUsd)) : "—"}</span>
@@ -297,13 +469,174 @@ const TokenCard = ({ pair }) => {
             {"   "}Liq <span style={{ color: "#94a3b8" }}>{formatVolume(liq)}</span>
           </div>
         </div>
+      </a>
 
-        <BuySellBar buys={buys24} sells={sells24} />
-      </div>
-    </a>
+      <BuySellBar buys={buys24} sells={sells24} />
+
+      {/* CA row */}
+      {ca && (
+        <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ color: "#334155", fontSize: 10, fontFamily: "monospace" }}>CA:</span>
+          <span style={{ color: "#475569", fontSize: 10, fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{ca}</span>
+          <button
+            onClick={() => navigator.clipboard?.writeText(ca)}
+            title="Copy CA"
+            style={{ background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 11, padding: "1px 4px" }}
+          >
+            copy
+          </button>
+        </div>
+      )}
+    </div>
   );
 };
 
+// ─── Wallet Card ───
+const WalletHoldingRow = ({ holding }) => {
+  const { pair, amount, mint } = holding;
+  const symbol = pair.baseToken?.symbol || "???";
+  const name = pair.baseToken?.name || "Unknown";
+  const chain = getChainLabel(pair.chainId);
+  const price = pair.priceUsd ? parseFloat(pair.priceUsd) : 0;
+  const usdValue = price * amount;
+  const iconUrl = pair.icon || pair.info?.imageUrl || null;
+  const dexUrl = pair.url || `https://dexscreener.com/${pair.chainId}/${pair.pairAddress}`;
+  const bubbleMapsUrl = getBubbleMapsUrl(pair.chainId, mint);
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 0", borderBottom: "1px solid #1e293b" }}>
+      <div style={{ position: "relative", width: 32, height: 32, flexShrink: 0 }}>
+        {iconUrl && (
+          <img src={iconUrl} alt={symbol} style={{ width: 32, height: 32, borderRadius: 8, border: "1px solid #ffffff11", objectFit: "cover", position: "absolute", top: 0, left: 0 }} onError={(e) => { e.target.style.display = "none"; }} />
+        )}
+        <div style={{ width: 32, height: 32, borderRadius: 8, background: hashColor(symbol), display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: "#e2e8f0" }}>
+          {symbol.slice(0, 2)}
+        </div>
+      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ color: "#f1f5f9", fontWeight: 700, fontSize: 13 }}>{symbol}</span>
+          <ChainBadge chain={chain} />
+        </div>
+        <div style={{ color: "#64748b", fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</div>
+      </div>
+      <div style={{ textAlign: "right", flexShrink: 0 }}>
+        <div style={{ color: "#f1f5f9", fontSize: 13, fontWeight: 600 }}>{usdValue >= 0.01 ? formatVolume(usdValue) : "< $0.01"}</div>
+        <div style={{ color: "#64748b", fontSize: 11 }}>{amount >= 1e6 ? (amount / 1e6).toFixed(2) + "M" : amount >= 1e3 ? (amount / 1e3).toFixed(2) + "K" : amount.toFixed(2)}</div>
+      </div>
+      <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+        <a href={dexUrl} target="_blank" rel="noopener noreferrer" title="DexScreener" style={{ width: 26, height: 26, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", display: "flex", alignItems: "center", justifyContent: "center", textDecoration: "none", fontSize: 12, color: "#94a3b8" }}>↗</a>
+        <a href={bubbleMapsUrl} target="_blank" rel="noopener noreferrer" title="BubbleMaps" style={{ width: 26, height: 26, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", display: "flex", alignItems: "center", justifyContent: "center", textDecoration: "none", fontSize: 12, color: "#60a5fa" }}>🫧</a>
+      </div>
+    </div>
+  );
+};
+
+const WalletCard = ({ wallet, onRemove }) => {
+  const { holdings, loading, error, refetch } = useWalletTokens(wallet.address);
+  const [expanded, setExpanded] = useState(true);
+
+  const totalUsd = holdings.reduce((sum, h) => {
+    const price = h.pair?.priceUsd ? parseFloat(h.pair.priceUsd) : 0;
+    return sum + price * h.amount;
+  }, 0);
+
+  return (
+    <div style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 14, padding: "16px 20px", marginBottom: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: expanded ? 12 : 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <button onClick={() => setExpanded(!expanded)} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 14, padding: 0 }}>
+            {expanded ? "▾" : "▸"}
+          </button>
+          <div>
+            {wallet.label && <div style={{ color: "#f1f5f9", fontWeight: 600, fontSize: 14 }}>{wallet.label}</div>}
+            <div style={{ color: "#64748b", fontSize: 12, fontFamily: "monospace" }}>{wallet.address}</div>
+          </div>
+          <span style={{ background: "#0052FF22", color: "#60a5fa", border: "1px solid #0052FF44", fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, fontFamily: "monospace" }}>SOL</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          {totalUsd > 0 && <span style={{ color: "#4ade80", fontWeight: 700, fontSize: 14 }}>{formatVolume(totalUsd)}</span>}
+          <button onClick={refetch} title="Refresh" style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 14 }}>↺</button>
+          <button onClick={() => onRemove(wallet.address)} title="Remove wallet" style={{ background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 14 }}>✕</button>
+        </div>
+      </div>
+
+      {expanded && (
+        <>
+          {loading && <div style={{ color: "#475569", fontSize: 13, textAlign: "center", padding: 16 }}>Loading holdings…</div>}
+          {error && <div style={{ color: "#fca5a5", fontSize: 13, padding: 8 }}>⚠ {error}</div>}
+          {!loading && !error && holdings.length === 0 && (
+            <div style={{ color: "#475569", fontSize: 13, textAlign: "center", padding: 16 }}>No tradeable tokens found. Only tokens listed on DexScreener are shown.</div>
+          )}
+          {holdings.map((h, i) => <WalletHoldingRow key={i} holding={h} />)}
+        </>
+      )}
+    </div>
+  );
+};
+
+// ─── Add CA Panel ───
+const AddCAPanel = ({ onAdd, onClose }) => {
+  const [ca, setCa] = useState("");
+  const [chainId, setChainId] = useState("solana");
+  const [status, setStatus] = useState(null);
+  const inputRef = useRef(null);
+
+  useEffect(() => { inputRef.current?.focus(); }, []);
+
+  const handleAdd = async () => {
+    const trimmed = ca.trim();
+    if (!trimmed) return;
+    setStatus("loading");
+    try {
+      const res = await fetch(`https://api.dexscreener.com/tokens/v1/${chainId}/${trimmed}`);
+      if (!res.ok) throw new Error("Not found");
+      const pairs = await res.json();
+      if (!Array.isArray(pairs) || pairs.length === 0) throw new Error("Token not found on DexScreener");
+      onAdd(trimmed, chainId);
+      setStatus("ok");
+      setTimeout(onClose, 800);
+    } catch (e) {
+      setStatus("error:" + e.message);
+    }
+  };
+
+  return (
+    <div style={{ background: "#111827", border: "1px solid #6366f1", borderRadius: 12, padding: "16px 20px", marginBottom: 20 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <span style={{ color: "#818cf8", fontWeight: 700, fontSize: 14 }}>Track a token by CA</span>
+        <button onClick={onClose} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 16 }}>✕</button>
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <select value={chainId} onChange={(e) => setChainId(e.target.value)} style={{ background: "#0d1321", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 13, padding: "8px 10px", cursor: "pointer" }}>
+          <option value="solana">Solana</option>
+          <option value="base">Base</option>
+          <option value="ethereum">Ethereum</option>
+        </select>
+        <input
+          ref={inputRef}
+          value={ca}
+          onChange={(e) => { setCa(e.target.value); setStatus(null); }}
+          onKeyDown={(e) => e.key === "Enter" && handleAdd()}
+          placeholder="Paste contract address…"
+          style={{ flex: 1, background: "#0d1321", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 13, padding: "8px 12px", outline: "none" }}
+        />
+        <button
+          onClick={handleAdd}
+          disabled={!ca.trim() || status === "loading"}
+          style={{ background: "#6366f1", border: "none", borderRadius: 8, color: "#fff", fontSize: 13, fontWeight: 600, padding: "8px 16px", cursor: "pointer", opacity: !ca.trim() ? 0.5 : 1 }}
+        >
+          {status === "loading" ? "…" : status === "ok" ? "✓" : "Pin"}
+        </button>
+      </div>
+      {status && status.startsWith("error:") && (
+        <div style={{ color: "#fca5a5", fontSize: 12, marginTop: 8 }}>⚠ {status.replace("error:", "")}</div>
+      )}
+    </div>
+  );
+};
+
+// ─── Skeletons ───
 const TokenSkeleton = () => (
   <div style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 14, padding: "18px 20px" }}>
     <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 16 }}>
@@ -345,24 +678,120 @@ const LiveIndicator = () => (
   </div>
 );
 
+// ─── Add Wallet Panel ───
+const AddWalletPanel = ({ onAdd, onClose }) => {
+  const [address, setAddress] = useState("");
+  const [label, setLabel] = useState("");
+  const inputRef = useRef(null);
+
+  useEffect(() => { inputRef.current?.focus(); }, []);
+
+  const handleAdd = () => {
+    const trimmed = address.trim();
+    if (!trimmed) return;
+    onAdd(trimmed, label.trim());
+    onClose();
+  };
+
+  return (
+    <div style={{ background: "#111827", border: "1px solid #4ade8044", borderRadius: 12, padding: "16px 20px", marginBottom: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <span style={{ color: "#4ade80", fontWeight: 700, fontSize: 14 }}>Add a Solana wallet</span>
+        <button onClick={onClose} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 16 }}>✕</button>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <input
+          ref={inputRef}
+          value={address}
+          onChange={(e) => setAddress(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && handleAdd()}
+          placeholder="Wallet address (Solana)…"
+          style={{ background: "#0d1321", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 13, padding: "8px 12px", outline: "none" }}
+        />
+        <div style={{ display: "flex", gap: 8 }}>
+          <input
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            placeholder="Label (optional, e.g. 'My wallet')"
+            style={{ flex: 1, background: "#0d1321", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 13, padding: "8px 12px", outline: "none" }}
+          />
+          <button
+            onClick={handleAdd}
+            disabled={!address.trim()}
+            style={{ background: "#4ade8022", border: "1px solid #4ade8044", borderRadius: 8, color: "#4ade80", fontSize: 13, fontWeight: 600, padding: "8px 16px", cursor: "pointer", opacity: !address.trim() ? 0.5 : 1 }}
+          >
+            Add
+          </button>
+        </div>
+      </div>
+      <div style={{ color: "#475569", fontSize: 11, marginTop: 8 }}>Only Solana wallets supported. Shows tokens listed on DexScreener.</div>
+    </div>
+  );
+};
+
 // ─── Main App ───
 export default function App() {
   const [activeChain, setActiveChain] = useState("All Chains");
+  const [activeSection, setActiveSection] = useState("discover"); // "discover" | "wallets"
   const chains = ["All Chains", "Solana", "Base"];
+
   const { prices, loading: priceLoading, error: priceError, refetch: refetchPrices } = useCryptoPrices();
   const { tokens, loading: tokenLoading, error: tokenError, refetch: refetchTokens } = useTrendingTokens();
   const [lastUpdated, setLastUpdated] = useState(null);
+
+  // Pinned CAs: [{ca, chainId}]
+  const [pinnedCAs, setPinnedCAs] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("pinnedCAs") || "[]"); } catch { return []; }
+  });
+
+  const { tokens: pinnedTokens, loading: pinnedLoading, refetch: refetchPinned } = usePinnedTokens(pinnedCAs);
+
+  // Wallets: [{address, label}]
+  const [wallets, setWallets] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("trackedWallets") || "[]"); } catch { return []; }
+  });
+
+  const [showAddCA, setShowAddCA] = useState(false);
+  const [showAddWallet, setShowAddWallet] = useState(false);
 
   useEffect(() => {
     if (prices || tokens.length > 0) setLastUpdated(new Date());
   }, [prices, tokens]);
 
-  const handleRefresh = () => {
-    refetchPrices();
-    refetchTokens();
+  useEffect(() => {
+    localStorage.setItem("pinnedCAs", JSON.stringify(pinnedCAs));
+  }, [pinnedCAs]);
+
+  useEffect(() => {
+    localStorage.setItem("trackedWallets", JSON.stringify(wallets));
+  }, [wallets]);
+
+  const handleRefresh = () => { refetchPrices(); refetchTokens(); refetchPinned(); };
+
+  const pinToken = (ca, chainId) => {
+    setPinnedCAs((prev) => prev.find((p) => p.ca === ca) ? prev : [...prev, { ca, chainId }]);
+  };
+
+  const unpinToken = (ca) => {
+    setPinnedCAs((prev) => prev.filter((p) => p.ca !== ca));
+  };
+
+  const addWallet = (address, label) => {
+    setWallets((prev) => prev.find((w) => w.address === address) ? prev : [...prev, { address, label }]);
+  };
+
+  const removeWallet = (address) => {
+    setWallets((prev) => prev.filter((w) => w.address !== address));
   };
 
   const filteredTokens = tokens.filter((t) => {
+    if (activeChain === "All Chains") return true;
+    if (activeChain === "Solana") return t.chainId === "solana";
+    if (activeChain === "Base") return t.chainId === "base";
+    return true;
+  });
+
+  const filteredPinned = pinnedTokens.filter((t) => {
     if (activeChain === "All Chains") return true;
     if (activeChain === "Solana") return t.chainId === "solana";
     if (activeChain === "Base") return t.chainId === "base";
@@ -383,12 +812,11 @@ export default function App() {
           <h1 style={{ fontSize: 32, fontWeight: 800, margin: 0, color: "#f8fafc", fontStyle: "italic", letterSpacing: -0.5 }}>Morning</h1>
           <p style={{ color: "#64748b", fontSize: 14, margin: "4px 0 0" }}>What happened while you slept</p>
         </div>
-        <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+        <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
           {chains.map((chain) => (
             <button key={chain} onClick={() => setActiveChain(chain)} style={{ padding: "7px 16px", borderRadius: 20, border: "none", fontSize: 13, fontWeight: 600, cursor: "pointer", transition: "all 0.2s", background: activeChain === chain ? "#6366f1" : "transparent", color: activeChain === chain ? "#fff" : "#94a3b8" }}>{chain}</button>
           ))}
           <button onClick={handleRefresh} style={{ padding: "7px 14px", borderRadius: 20, border: "none", background: "transparent", color: "#94a3b8", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Refresh</button>
-          <button style={{ width: 34, height: 34, borderRadius: "50%", border: "1px solid #1e293b", background: "transparent", color: "#94a3b8", fontSize: 16, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>⚙</button>
         </div>
       </div>
 
@@ -440,26 +868,149 @@ export default function App() {
         </div>
       </div>
 
-      {/* Trending Tokens */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 16 }}>
-        <h2 style={{ fontSize: 16, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#f1f5f9", margin: 0 }}>🔥 Trending Tokens</h2>
-        <span style={{ color: "#64748b", fontSize: 12 }}>Powered by DexScreener • Click to view</span>
+      {/* Section Nav */}
+      <div style={{ display: "flex", gap: 4, marginBottom: 24, borderBottom: "1px solid #1e293b", paddingBottom: 0 }}>
+        {[
+          { key: "discover", label: "🔥 Discover" },
+          { key: "wallets", label: `👜 Wallets${wallets.length > 0 ? ` (${wallets.length})` : ""}` },
+        ].map((s) => (
+          <button
+            key={s.key}
+            onClick={() => setActiveSection(s.key)}
+            style={{ padding: "8px 18px", border: "none", background: "none", color: activeSection === s.key ? "#6366f1" : "#64748b", fontWeight: 700, fontSize: 14, cursor: "pointer", borderBottom: `2px solid ${activeSection === s.key ? "#6366f1" : "transparent"}`, marginBottom: -1, transition: "all 0.15s" }}
+          >
+            {s.label}
+          </button>
+        ))}
       </div>
 
-      {tokenError && (
-        <div style={{ background: "#7f1d1d33", border: "1px solid #991b1b", borderRadius: 8, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 13 }}>⚠ Token fetch failed: {tokenError}. Will retry...</div>
+      {/* ─── Discover Section ─── */}
+      {activeSection === "discover" && (
+        <>
+          {/* Pinned tokens */}
+          {(pinnedCAs.length > 0) && (
+            <div style={{ marginBottom: 32 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+                <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#818cf8", margin: 0 }}>📌 Pinned</h2>
+                <button
+                  onClick={() => setShowAddCA(!showAddCA)}
+                  style={{ padding: "5px 12px", borderRadius: 8, border: "1px solid #6366f144", background: showAddCA ? "#6366f122" : "transparent", color: "#818cf8", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+                >
+                  + Track CA
+                </button>
+              </div>
+
+              {showAddCA && <AddCAPanel onAdd={(ca, chainId) => { pinToken(ca, chainId); refetchPinned(); }} onClose={() => setShowAddCA(false)} />}
+
+              {pinnedLoading && (
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 14 }}>
+                  {[1, 2].map((i) => <TokenSkeleton key={i} />)}
+                </div>
+              )}
+              {!pinnedLoading && filteredPinned.length > 0 && (
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 14 }}>
+                  {filteredPinned.map((pair, i) => (
+                    <TokenCard
+                      key={`pinned-${pair.pairAddress}-${i}`}
+                      pair={pair}
+                      isPinned={true}
+                      onPin={pinToken}
+                      onUnpin={unpinToken}
+                    />
+                  ))}
+                </div>
+              )}
+              {!pinnedLoading && filteredPinned.length === 0 && pinnedCAs.length > 0 && (
+                <div style={{ color: "#475569", fontSize: 13, padding: "12px 0" }}>No pinned tokens match this chain filter.</div>
+              )}
+            </div>
+          )}
+
+          {/* Track CA button (when no pinned tokens yet) */}
+          {pinnedCAs.length === 0 && (
+            <div style={{ marginBottom: 24 }}>
+              {showAddCA ? (
+                <AddCAPanel onAdd={(ca, chainId) => { pinToken(ca, chainId); refetchPinned(); }} onClose={() => setShowAddCA(false)} />
+              ) : (
+                <button
+                  onClick={() => setShowAddCA(true)}
+                  style={{ padding: "8px 16px", borderRadius: 8, border: "1px dashed #334155", background: "transparent", color: "#64748b", fontSize: 13, fontWeight: 600, cursor: "pointer", width: "100%" }}
+                >
+                  + Track a token by contract address
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Trending tokens */}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 16 }}>
+            <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#f1f5f9", margin: 0 }}>Trending</h2>
+            <span style={{ color: "#64748b", fontSize: 12 }}>Powered by DexScreener • Click card to view</span>
+          </div>
+
+          {tokenError && (
+            <div style={{ background: "#7f1d1d33", border: "1px solid #991b1b", borderRadius: 8, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 13 }}>⚠ Token fetch failed: {tokenError}. Will retry…</div>
+          )}
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 14 }}>
+            {tokenLoading
+              ? [1, 2, 3, 4, 5, 6].map((i) => <TokenSkeleton key={i} />)
+              : filteredTokens.map((pair, i) => {
+                  const ca = pair.baseToken?.address || "";
+                  return (
+                    <TokenCard
+                      key={`${pair.pairAddress}-${i}`}
+                      pair={pair}
+                      isPinned={pinnedCAs.some((p) => p.ca === ca)}
+                      onPin={pinToken}
+                      onUnpin={unpinToken}
+                    />
+                  );
+                })}
+          </div>
+
+          {!tokenLoading && filteredTokens.length === 0 && !tokenError && (
+            <div style={{ textAlign: "center", color: "#475569", padding: 48, fontSize: 14 }}>No trending tokens found for this chain right now.</div>
+          )}
+        </>
       )}
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 14 }}>
-        {tokenLoading
-          ? [1, 2, 3, 4, 5, 6].map((i) => <TokenSkeleton key={i} />)
-          : filteredTokens.map((pair, i) => (
-              <TokenCard key={`${pair.pairAddress}-${i}`} pair={pair} />
-            ))}
-      </div>
+      {/* ─── Wallets Section ─── */}
+      {activeSection === "wallets" && (
+        <>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+            <div>
+              <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#4ade80", margin: 0 }}>Wallet Tracker</h2>
+              <p style={{ color: "#475569", fontSize: 12, margin: "4px 0 0" }}>Add Solana wallets to track their token positions</p>
+            </div>
+            <button
+              onClick={() => setShowAddWallet(!showAddWallet)}
+              style={{ padding: "8px 16px", borderRadius: 8, border: "1px solid #4ade8044", background: showAddWallet ? "#4ade8022" : "transparent", color: "#4ade80", fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+            >
+              + Add Wallet
+            </button>
+          </div>
 
-      {!tokenLoading && filteredTokens.length === 0 && !tokenError && (
-        <div style={{ textAlign: "center", color: "#475569", padding: 48, fontSize: 14 }}>No trending tokens found for this chain right now.</div>
+          {showAddWallet && <AddWalletPanel onAdd={addWallet} onClose={() => setShowAddWallet(false)} />}
+
+          {wallets.length === 0 && !showAddWallet && (
+            <div style={{ textAlign: "center", color: "#475569", padding: 64, fontSize: 14, border: "1px dashed #1e293b", borderRadius: 14 }}>
+              <div style={{ fontSize: 32, marginBottom: 12 }}>👜</div>
+              <div style={{ fontWeight: 600, marginBottom: 6, color: "#64748b" }}>No wallets tracked yet</div>
+              <div>Add a Solana wallet address to see its token positions</div>
+            </div>
+          )}
+
+          {wallets.map((wallet) => (
+            <WalletCard key={wallet.address} wallet={wallet} onRemove={removeWallet} />
+          ))}
+
+          {wallets.length > 0 && (
+            <div style={{ color: "#334155", fontSize: 11, marginTop: 16, textAlign: "center" }}>
+              Token holdings fetched from Solana RPC • Prices from DexScreener • Only tokens listed on DexScreener shown
+            </div>
+          )}
+        </>
       )}
 
       <div style={{ textAlign: "center", color: "#334155", fontSize: 11, marginTop: 40, paddingBottom: 20 }}>
