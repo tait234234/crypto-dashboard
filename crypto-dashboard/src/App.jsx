@@ -218,7 +218,25 @@ function useTopVolumeTokens(activeChain) {
 
             const ca = baseTokenId?.replace(`${network}_`, "") || "";
             const vol24 = parseFloat(pool.attributes.volume_usd?.h24 || 0);
-            if (vol24 < 1000) return; // skip dust
+            const liq = parseFloat(pool.attributes.reserve_in_usd || 0);
+
+            // ── Dead pool filters ──────────────────────────────
+            if (vol24 < 1000) return; // skip dust volume
+            if (liq < 5000) return;   // no liquidity → skip
+
+            // Require ≥50 trades in the last hour.
+            // Use h1 txns when present; fall back to 24h avg if the API
+            // hasn't returned the shorter bucket yet.
+            const h1Buys  = pool.attributes.transactions?.h1?.buys  || 0;
+            const h1Sells = pool.attributes.transactions?.h1?.sells || 0;
+            const h24Buys  = pool.attributes.transactions?.h24?.buys  || 0;
+            const h24Sells = pool.attributes.transactions?.h24?.sells || 0;
+            const h1Txns = h1Buys + h1Sells;
+            const h24Txns = h24Buys + h24Sells;
+            // Use real h1 count; if not available, estimate from 24h avg
+            const effectiveH1Txns = h1Txns > 0 ? h1Txns : Math.round(h24Txns / 24);
+            if (effectiveH1Txns < 50) return; // no active traders → skip
+            // ──────────────────────────────────────────────────
 
             allTokens.push({
               baseToken: {
@@ -230,16 +248,14 @@ function useTopVolumeTokens(activeChain) {
               marketCap: parseFloat(pool.attributes.market_cap_usd || pool.attributes.fdv_usd || 0),
               fdv: parseFloat(pool.attributes.fdv_usd || 0),
               volume: { h24: vol24 },
-              liquidity: { usd: parseFloat(pool.attributes.reserve_in_usd || 0) },
+              liquidity: { usd: liq },
               priceChange: {
                 h1: parseFloat(pool.attributes.price_change_percentage?.h1 || 0),
                 h6: parseFloat(pool.attributes.price_change_percentage?.h6 || 0),
               },
               txns: {
-                h24: {
-                  buys: pool.attributes.transactions?.h24?.buys || 0,
-                  sells: pool.attributes.transactions?.h24?.sells || 0,
-                },
+                h1:  { buys: h1Buys,  sells: h1Sells  },
+                h24: { buys: h24Buys, sells: h24Sells },
               },
               pairCreatedAt: pool.attributes.pool_created_at
                 ? new Date(pool.attributes.pool_created_at).getTime()
