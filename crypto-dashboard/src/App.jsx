@@ -221,21 +221,29 @@ function useTopVolumeTokens(activeChain) {
             const liq = parseFloat(pool.attributes.reserve_in_usd || 0);
 
             // ── Dead pool filters ──────────────────────────────
-            if (vol24 < 1000) return; // skip dust volume
-            if (liq < 5000) return;   // no liquidity → skip
+            if (vol24 < 1000) return;  // dust volume
+            if (liq < 10000) return;   // no real liquidity → skip
 
             // Require ≥50 trades in the last hour.
-            // Use h1 txns when present; fall back to 24h avg if the API
-            // hasn't returned the shorter bucket yet.
-            const h1Buys  = pool.attributes.transactions?.h1?.buys  || 0;
-            const h1Sells = pool.attributes.transactions?.h1?.sells || 0;
+            // IMPORTANT: distinguish null (h1 not in API response) from 0
+            // (API returned h1 = 0 trades). If the API gives us h1 and it's
+            // 0, the token is dead RIGHT NOW — skip it even if h24 is large
+            // (that just means it pumped hours ago and is now abandoned).
+            const h1BuysRaw  = pool.attributes.transactions?.h1?.buys;
+            const h1SellsRaw = pool.attributes.transactions?.h1?.sells;
             const h24Buys  = pool.attributes.transactions?.h24?.buys  || 0;
             const h24Sells = pool.attributes.transactions?.h24?.sells || 0;
-            const h1Txns = h1Buys + h1Sells;
-            const h24Txns = h24Buys + h24Sells;
-            // Use real h1 count; if not available, estimate from 24h avg
-            const effectiveH1Txns = h1Txns > 0 ? h1Txns : Math.round(h24Txns / 24);
-            if (effectiveH1Txns < 50) return; // no active traders → skip
+            const h24Txns  = h24Buys + h24Sells;
+            const h1DataPresent = h1BuysRaw != null && h1SellsRaw != null;
+            const h1Txns = h1DataPresent ? (h1BuysRaw + h1SellsRaw) : 0;
+            if (h1DataPresent) {
+              // Real h1 data available — enforce strictly
+              if (h1Txns < 50) return;
+            } else {
+              // h1 not in API response — use h24 avg with a higher bar (75/hr)
+              // to compensate for the lack of recency signal
+              if (Math.round(h24Txns / 24) < 75) return;
+            }
             // ──────────────────────────────────────────────────
 
             allTokens.push({
@@ -254,7 +262,7 @@ function useTopVolumeTokens(activeChain) {
                 h6: parseFloat(pool.attributes.price_change_percentage?.h6 || 0),
               },
               txns: {
-                h1:  { buys: h1Buys,  sells: h1Sells  },
+                h1:  { buys: h1BuysRaw  || 0, sells: h1SellsRaw || 0 },
                 h24: { buys: h24Buys, sells: h24Sells },
               },
               pairCreatedAt: pool.attributes.pool_created_at
