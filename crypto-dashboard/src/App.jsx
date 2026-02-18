@@ -32,16 +32,28 @@ function useCryptoPrices() {
 }
 
 // ─── GeckoTerminal Trending Tokens Hook ───
+function readCache(key) {
+  try { return JSON.parse(localStorage.getItem(key) || "null")?.data || []; } catch { return []; }
+}
+function writeCache(key, data) {
+  try { localStorage.setItem(key, JSON.stringify({ data, ts: Date.now() })); } catch {}
+}
+
 function useTrendingTokens(activeChain) {
-  const [tokens, setTokens] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const cacheKey = `gt_trending_${activeChain}`;
+  // Seed state from localStorage so page reload shows data immediately
+  const [tokens, setTokens] = useState(() => readCache(cacheKey));
+  const [loading, setLoading] = useState(() => readCache(cacheKey).length === 0);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
-  const fetchIdRef = useRef(0); // incremented to cancel stale in-flight fetches
+  const fetchIdRef = useRef(0);
+  const hasDataRef = useRef(readCache(cacheKey).length > 0);
 
   const fetchTrending = useCallback(async () => {
     const myId = ++fetchIdRef.current;
-    setLoading(true);
-    setError(null);
+    // First load → show skeletons. Background refresh → keep existing tokens, show spinner.
+    if (!hasDataRef.current) { setLoading(true); setError(null); }
+    else setRefreshing(true);
     try {
       const networksToFetch =
         activeChain === "Solana" ? ["solana"]
@@ -128,8 +140,7 @@ function useTrendingTokens(activeChain) {
         }
       }
 
-      // If every page failed → surface an error instead of showing empty
-      if (successPages === 0) throw new Error("GeckoTerminal unreachable — rate limited or offline. Try refreshing.");
+      if (successPages === 0) throw new Error("GeckoTerminal unreachable — rate limited or offline.");
 
       const seen = new Set();
       const deduped = allTokens.filter((t) => {
@@ -139,29 +150,44 @@ function useTrendingTokens(activeChain) {
         return true;
       }).slice(0, 40);
 
-      // Only update state if this fetch is still the latest one
       if (fetchIdRef.current !== myId) return;
       setTokens(deduped);
       setError(null);
+      hasDataRef.current = true;
+      writeCache(cacheKey, deduped);
     } catch (err) {
       if (fetchIdRef.current !== myId) return;
-      setError(err.message);
+      // If we already have data on screen, keep it — just stop the spinner silently
+      if (!hasDataRef.current) setError(err.message);
     } finally {
       if (fetchIdRef.current !== myId) return;
       setLoading(false);
+      setRefreshing(false);
     }
   }, [activeChain]);
+
+  // When activeChain changes: immediately load that chain's cache (or blank + skeleton)
+  useEffect(() => {
+    const cached = readCache(cacheKey);
+    if (cached.length > 0) {
+      setTokens(cached);
+      hasDataRef.current = true;
+      setLoading(false);
+    } else {
+      setTokens([]);
+      hasDataRef.current = false;
+      setLoading(true);
+    }
+    setError(null);
+  }, [activeChain]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     fetchTrending();
     const interval = setInterval(fetchTrending, 120000);
-    return () => {
-      fetchIdRef.current++; // cancel any in-flight fetch from this effect
-      clearInterval(interval);
-    };
+    return () => { fetchIdRef.current++; clearInterval(interval); };
   }, [fetchTrending]);
 
-  return { tokens, loading, error, refetch: fetchTrending };
+  return { tokens, loading, refreshing, error, refetch: fetchTrending };
 }
 
 // ─── Pinned Tokens Hook ───
@@ -218,15 +244,18 @@ function usePinnedTokens(pinnedCAs) {
 
 // ─── Top Volume Tokens Hook (GeckoTerminal) ───
 function useTopVolumeTokens(activeChain) {
-  const [tokens, setTokens] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const cacheKey = `gt_topvol_${activeChain}`;
+  const [tokens, setTokens] = useState(() => readCache(cacheKey));
+  const [loading, setLoading] = useState(() => readCache(cacheKey).length === 0);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
   const fetchIdRef = useRef(0);
+  const hasDataRef = useRef(readCache(cacheKey).length > 0);
 
   const fetchTopVol = useCallback(async () => {
     const myId = ++fetchIdRef.current;
-    setLoading(true);
-    setError(null);
+    if (!hasDataRef.current) { setLoading(true); setError(null); }
+    else setRefreshing(true);
     try {
       const networksToFetch =
         activeChain === "Solana" ? ["solana"]
@@ -246,7 +275,6 @@ function useTopVolumeTokens(activeChain) {
           const data = await res.json();
           successPages++;
 
-          // Build token lookup from included array
           const tokenMap = new Map();
           (data.included || []).forEach((item) => {
             if (item.type === "token") tokenMap.set(item.id, item.attributes);
@@ -263,15 +291,9 @@ function useTopVolumeTokens(activeChain) {
             const vol24 = parseFloat(pool.attributes.volume_usd?.h24 || 0);
             const liq = parseFloat(pool.attributes.reserve_in_usd || 0);
 
-            // ── Dead pool filters ──────────────────────────────
-            if (vol24 < 1000) return;  // dust volume
-            if (liq < 10000) return;   // no real liquidity → skip
+            if (vol24 < 1000) return;
+            if (liq < 10000) return;
 
-            // Require ≥50 trades in the last hour.
-            // IMPORTANT: distinguish null (h1 not in API response) from 0
-            // (API returned h1 = 0 trades). If the API gives us h1 and it's
-            // 0, the token is dead RIGHT NOW — skip it even if h24 is large
-            // (that just means it pumped hours ago and is now abandoned).
             const h1BuysRaw  = pool.attributes.transactions?.h1?.buys;
             const h1SellsRaw = pool.attributes.transactions?.h1?.sells;
             const h24Buys  = pool.attributes.transactions?.h24?.buys  || 0;
@@ -280,14 +302,10 @@ function useTopVolumeTokens(activeChain) {
             const h1DataPresent = h1BuysRaw != null && h1SellsRaw != null;
             const h1Txns = h1DataPresent ? (h1BuysRaw + h1SellsRaw) : 0;
             if (h1DataPresent) {
-              // Real h1 data available — enforce strictly
               if (h1Txns < 50) return;
             } else {
-              // h1 not in API response — use h24 avg with a higher bar (75/hr)
-              // to compensate for the lack of recency signal
               if (Math.round(h24Txns / 24) < 75) return;
             }
-            // ──────────────────────────────────────────────────
 
             allTokens.push({
               baseToken: {
@@ -321,12 +339,11 @@ function useTopVolumeTokens(activeChain) {
         } catch (e) {
           console.warn(`GeckoTerminal ${network} p${page} fetch error:`, e);
         }
-        } // end page loop
+        }
       }
 
-      if (successPages === 0) throw new Error("GeckoTerminal unreachable — rate limited or offline. Try refreshing.");
+      if (successPages === 0) throw new Error("GeckoTerminal unreachable — rate limited or offline.");
 
-      // Deduplicate by CA, already sorted by volume desc from API
       const seen = new Set();
       const deduped = allTokens
         .sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0))
@@ -341,25 +358,39 @@ function useTopVolumeTokens(activeChain) {
       if (fetchIdRef.current !== myId) return;
       setTokens(deduped);
       setError(null);
+      hasDataRef.current = true;
+      writeCache(cacheKey, deduped);
     } catch (err) {
       if (fetchIdRef.current !== myId) return;
-      setError(err.message);
+      if (!hasDataRef.current) setError(err.message);
     } finally {
       if (fetchIdRef.current !== myId) return;
       setLoading(false);
+      setRefreshing(false);
     }
   }, [activeChain]);
 
   useEffect(() => {
+    const cached = readCache(cacheKey);
+    if (cached.length > 0) {
+      setTokens(cached);
+      hasDataRef.current = true;
+      setLoading(false);
+    } else {
+      setTokens([]);
+      hasDataRef.current = false;
+      setLoading(true);
+    }
+    setError(null);
+  }, [activeChain]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
     fetchTopVol();
     const interval = setInterval(fetchTopVol, 120000);
-    return () => {
-      fetchIdRef.current++;
-      clearInterval(interval);
-    };
+    return () => { fetchIdRef.current++; clearInterval(interval); };
   }, [fetchTopVol]);
 
-  return { tokens, loading, error, refetch: fetchTopVol };
+  return { tokens, loading, refreshing, error, refetch: fetchTopVol };
 }
 
 // ─── Solana RPC helper — tries endpoints in order, handles 403 / 429 ───
@@ -1359,7 +1390,7 @@ export default function App() {
   const chains = ["All Chains", "Solana", "Base"];
 
   const { prices, loading: priceLoading, error: priceError } = useCryptoPrices();
-  const { tokens, loading: tokenLoading, error: tokenError } = useTrendingTokens(activeChain);
+  const { tokens, loading: tokenLoading, refreshing: tokenRefreshing, error: tokenError } = useTrendingTokens(activeChain);
   const [lastUpdated, setLastUpdated] = useState(null);
 
   // Pinned CAs: [{ca, chainId}]
@@ -1368,7 +1399,7 @@ export default function App() {
   });
 
   const { tokens: pinnedTokens, loading: pinnedLoading, refetch: refetchPinned } = usePinnedTokens(pinnedCAs);
-  const { tokens: topVolTokens, loading: topVolLoading, error: topVolError } = useTopVolumeTokens(activeChain);
+  const { tokens: topVolTokens, loading: topVolLoading, refreshing: topVolRefreshing, error: topVolError } = useTopVolumeTokens(activeChain);
 
   // Wallets: [{address, label}]
   const [wallets, setWallets] = useState(() => {
@@ -1479,6 +1510,7 @@ export default function App() {
 
   return (
     <div style={{ minHeight: "100vh", background: "#0a0e1a", color: "#e2e8f0", fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', padding: "32px 24px", maxWidth: 1120, margin: "0 auto" }}>
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
       {/* Header */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 28 }}>
         <div>
@@ -1504,7 +1536,14 @@ export default function App() {
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
             <LiveIndicator />
-            {lastUpdated && <span style={{ color: "#475569", fontSize: 11 }}>Updated {lastUpdated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>}
+            {(tokenRefreshing || topVolRefreshing) && (
+              <span style={{ color: "#475569", fontSize: 11, display: "flex", alignItems: "center", gap: 4 }}>
+                <span style={{ display: "inline-block", animation: "spin 1s linear infinite" }}>↺</span> Refreshing…
+              </span>
+            )}
+            {lastUpdated && !tokenRefreshing && !topVolRefreshing && (
+              <span style={{ color: "#475569", fontSize: 11 }}>Updated {lastUpdated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+            )}
           </div>
         </div>
 
