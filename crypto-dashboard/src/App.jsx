@@ -35,6 +35,9 @@ function useCryptoPrices() {
 function readCache(key) {
   try { return JSON.parse(localStorage.getItem(key) || "null")?.data || []; } catch { return []; }
 }
+function readCacheTs(key) {
+  try { return JSON.parse(localStorage.getItem(key) || "null")?.ts || null; } catch { return null; }
+}
 function writeCache(key, data) {
   try { localStorage.setItem(key, JSON.stringify({ data, ts: Date.now() })); } catch {}
 }
@@ -45,6 +48,7 @@ function useTrendingTokens(activeChain) {
   const [tokens, setTokens] = useState(() => readCache(cacheKey));
   const [loading, setLoading] = useState(() => readCache(cacheKey).length === 0);
   const [refreshing, setRefreshing] = useState(false);
+  const [fetchedAt, setFetchedAt] = useState(() => readCacheTs(cacheKey)); // epoch ms of last successful fetch
   const [error, setError] = useState(null);
   const fetchIdRef = useRef(0);
   const hasDataRef = useRef(readCache(cacheKey).length > 0);
@@ -151,7 +155,9 @@ function useTrendingTokens(activeChain) {
       }).slice(0, 40);
 
       if (fetchIdRef.current !== myId) return;
+      const now = Date.now();
       setTokens(deduped);
+      setFetchedAt(now);
       setError(null);
       hasDataRef.current = true;
       writeCache(cacheKey, deduped);
@@ -171,10 +177,12 @@ function useTrendingTokens(activeChain) {
     const cached = readCache(cacheKey);
     if (cached.length > 0) {
       setTokens(cached);
+      setFetchedAt(readCacheTs(cacheKey));
       hasDataRef.current = true;
       setLoading(false);
     } else {
       setTokens([]);
+      setFetchedAt(null);
       hasDataRef.current = false;
       setLoading(true);
     }
@@ -187,7 +195,7 @@ function useTrendingTokens(activeChain) {
     return () => { fetchIdRef.current++; clearInterval(interval); };
   }, [fetchTrending]);
 
-  return { tokens, loading, refreshing, error, refetch: fetchTrending };
+  return { tokens, loading, refreshing, fetchedAt, error, refetch: fetchTrending };
 }
 
 // ─── Pinned Tokens Hook ───
@@ -248,6 +256,7 @@ function useTopVolumeTokens(activeChain) {
   const [tokens, setTokens] = useState(() => readCache(cacheKey));
   const [loading, setLoading] = useState(() => readCache(cacheKey).length === 0);
   const [refreshing, setRefreshing] = useState(false);
+  const [fetchedAt, setFetchedAt] = useState(() => readCacheTs(cacheKey));
   const [error, setError] = useState(null);
   const fetchIdRef = useRef(0);
   const hasDataRef = useRef(readCache(cacheKey).length > 0);
@@ -356,7 +365,9 @@ function useTopVolumeTokens(activeChain) {
         .slice(0, 40);
 
       if (fetchIdRef.current !== myId) return;
+      const now = Date.now();
       setTokens(deduped);
+      setFetchedAt(now);
       setError(null);
       hasDataRef.current = true;
       writeCache(cacheKey, deduped);
@@ -374,10 +385,12 @@ function useTopVolumeTokens(activeChain) {
     const cached = readCache(cacheKey);
     if (cached.length > 0) {
       setTokens(cached);
+      setFetchedAt(readCacheTs(cacheKey));
       hasDataRef.current = true;
       setLoading(false);
     } else {
       setTokens([]);
+      setFetchedAt(null);
       hasDataRef.current = false;
       setLoading(true);
     }
@@ -390,7 +403,7 @@ function useTopVolumeTokens(activeChain) {
     return () => { fetchIdRef.current++; clearInterval(interval); };
   }, [fetchTopVol]);
 
-  return { tokens, loading, refreshing, error, refetch: fetchTopVol };
+  return { tokens, loading, refreshing, fetchedAt, error, refetch: fetchTopVol };
 }
 
 // ─── Solana RPC helper — tries endpoints in order, handles 403 / 429 ───
@@ -1390,8 +1403,7 @@ export default function App() {
   const chains = ["All Chains", "Solana", "Base"];
 
   const { prices, loading: priceLoading, error: priceError } = useCryptoPrices();
-  const { tokens, loading: tokenLoading, refreshing: tokenRefreshing, error: tokenError } = useTrendingTokens(activeChain);
-  const [lastUpdated, setLastUpdated] = useState(null);
+  const { tokens, loading: tokenLoading, refreshing: tokenRefreshing, fetchedAt: tokenFetchedAt, error: tokenError } = useTrendingTokens(activeChain);
 
   // Pinned CAs: [{ca, chainId}]
   const [pinnedCAs, setPinnedCAs] = useState(() => {
@@ -1399,7 +1411,7 @@ export default function App() {
   });
 
   const { tokens: pinnedTokens, loading: pinnedLoading, refetch: refetchPinned } = usePinnedTokens(pinnedCAs);
-  const { tokens: topVolTokens, loading: topVolLoading, refreshing: topVolRefreshing, error: topVolError } = useTopVolumeTokens(activeChain);
+  const { tokens: topVolTokens, loading: topVolLoading, refreshing: topVolRefreshing, fetchedAt: topVolFetchedAt, error: topVolError } = useTopVolumeTokens(activeChain);
 
   // Wallets: [{address, label}]
   const [wallets, setWallets] = useState(() => {
@@ -1462,9 +1474,10 @@ export default function App() {
       });
   };
 
-  useEffect(() => {
-    if (prices || tokens.length > 0) setLastUpdated(new Date());
-  }, [prices, tokens]);
+  // Most recent successful API fetch across both data sources
+  const lastFetchedAt = tokenFetchedAt || topVolFetchedAt
+    ? new Date(Math.max(tokenFetchedAt || 0, topVolFetchedAt || 0))
+    : null;
 
   useEffect(() => {
     localStorage.setItem("pinnedCAs", JSON.stringify(pinnedCAs));
@@ -1541,8 +1554,8 @@ export default function App() {
                 <span style={{ display: "inline-block", animation: "spin 1s linear infinite" }}>↺</span> Refreshing…
               </span>
             )}
-            {lastUpdated && !tokenRefreshing && !topVolRefreshing && (
-              <span style={{ color: "#475569", fontSize: 11 }}>Updated {lastUpdated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+            {lastFetchedAt && !tokenRefreshing && !topVolRefreshing && (
+              <span style={{ color: "#475569", fontSize: 11 }}>Data from {lastFetchedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
             )}
           </div>
         </div>
