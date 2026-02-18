@@ -877,7 +877,7 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [] }) => {
         <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
           {pair.chainId === "solana" && (
             <a
-              href={`https://jup.ag/swap/SOL-${ca}`}
+              href={`https://jup.ag/token/${ca}`}
               target="_blank"
               rel="noopener noreferrer"
               title="Trade on Jupiter"
