@@ -317,6 +317,16 @@ function truncateAddr(addr) {
   return addr.slice(0, 6) + "…" + addr.slice(-4);
 }
 
+// Parses filter inputs like "50K", "1.5M", "200" into a raw number
+function parseVolInput(str) {
+  if (!str) return 0;
+  const s = str.trim().toUpperCase();
+  if (s.endsWith("B")) return parseFloat(s) * 1e9;
+  if (s.endsWith("M")) return parseFloat(s) * 1e6;
+  if (s.endsWith("K")) return parseFloat(s) * 1e3;
+  return parseFloat(s) || 0;
+}
+
 // ─── Components ───
 const ChainBadge = ({ chain }) => {
   const colors = {
@@ -485,6 +495,36 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin }) => {
           >
             copy
           </button>
+        </div>
+      )}
+
+      {/* Trade buttons */}
+      {ca && (
+        <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
+          {pair.chainId === "solana" && (
+            <a
+              href={`https://jup.ag/swap/SOL-${ca}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              title="Trade on Jupiter"
+              onClick={(e) => e.stopPropagation()}
+              style={{ flex: 1, textAlign: "center", padding: "6px 0", borderRadius: 8, background: "#9945FF22", border: "1px solid #9945FF55", color: "#c084fc", fontSize: 12, fontWeight: 700, textDecoration: "none", letterSpacing: 0.3 }}
+            >
+              ⚡ Jupiter
+            </a>
+          )}
+          {pair.chainId === "base" && (
+            <a
+              href={`https://gmgn.ai/base/token/${ca}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              title="Trade on GMGN"
+              onClick={(e) => e.stopPropagation()}
+              style={{ flex: 1, textAlign: "center", padding: "6px 0", borderRadius: 8, background: "#0052FF22", border: "1px solid #0052FF55", color: "#60a5fa", fontSize: 12, fontWeight: 700, textDecoration: "none", letterSpacing: 0.3 }}
+            >
+              🔵 GMGN
+            </a>
+          )}
         </div>
       )}
     </div>
@@ -678,6 +718,75 @@ const LiveIndicator = () => (
   </div>
 );
 
+// ─── Filter / Sort Bar ───
+const SORT_OPTIONS = [
+  { key: "vol",      label: "Vol" },
+  { key: "mcap",     label: "MCap" },
+  { key: "change1h", label: "1h %" },
+  { key: "change6h", label: "6h %" },
+  { key: "age",      label: "Age" },
+];
+
+const FilterBar = ({ sortBy, sortDir, onSort, minVol, onMinVol, minMcap, onMinMcap, minChange1h, onMinChange1h, count, total }) => (
+  <div style={{ background: "#0d1321", border: "1px solid #1e293b", borderRadius: 10, padding: "10px 14px", marginBottom: 16, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+    {/* Sort pills */}
+    <span style={{ color: "#475569", fontSize: 11, fontWeight: 600, letterSpacing: 0.5 }}>SORT</span>
+    {SORT_OPTIONS.map((s) => {
+      const active = sortBy === s.key;
+      return (
+        <button
+          key={s.key}
+          onClick={() => onSort(s.key)}
+          style={{ padding: "4px 10px", borderRadius: 6, border: `1px solid ${active ? "#6366f1" : "#1e293b"}`, background: active ? "#6366f122" : "transparent", color: active ? "#818cf8" : "#64748b", fontSize: 12, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 3 }}
+        >
+          {s.label}
+          {active && <span style={{ fontSize: 10 }}>{sortDir === "desc" ? " ↓" : " ↑"}</span>}
+        </button>
+      );
+    })}
+
+    {/* Divider */}
+    <div style={{ width: 1, height: 18, background: "#1e293b", margin: "0 2px", flexShrink: 0 }} />
+
+    {/* Filter inputs */}
+    <span style={{ color: "#475569", fontSize: 11, fontWeight: 600, letterSpacing: 0.5 }}>FILTER</span>
+
+    <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+      <span style={{ color: "#475569", fontSize: 11 }}>Vol≥</span>
+      <input
+        value={minVol}
+        onChange={(e) => onMinVol(e.target.value)}
+        placeholder="10K"
+        style={{ width: 56, background: "#111827", border: "1px solid #1e293b", borderRadius: 5, color: "#e2e8f0", fontSize: 12, padding: "3px 7px", outline: "none" }}
+      />
+    </label>
+
+    <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+      <span style={{ color: "#475569", fontSize: 11 }}>MCap≥</span>
+      <input
+        value={minMcap}
+        onChange={(e) => onMinMcap(e.target.value)}
+        placeholder="100K"
+        style={{ width: 56, background: "#111827", border: "1px solid #1e293b", borderRadius: 5, color: "#e2e8f0", fontSize: 12, padding: "3px 7px", outline: "none" }}
+      />
+    </label>
+
+    <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+      <span style={{ color: "#475569", fontSize: 11 }}>1h≥</span>
+      <input
+        value={minChange1h}
+        onChange={(e) => onMinChange1h(e.target.value)}
+        placeholder="5"
+        style={{ width: 42, background: "#111827", border: "1px solid #1e293b", borderRadius: 5, color: "#e2e8f0", fontSize: 12, padding: "3px 7px", outline: "none" }}
+      />
+      <span style={{ color: "#475569", fontSize: 11 }}>%</span>
+    </label>
+
+    {/* Token count */}
+    <span style={{ marginLeft: "auto", color: "#334155", fontSize: 11 }}>{count}{total !== count ? `/${total}` : ""} tokens</span>
+  </div>
+);
+
 // ─── Add Wallet Panel ───
 const AddWalletPanel = ({ onAdd, onClose }) => {
   const [address, setAddress] = useState("");
@@ -754,6 +863,38 @@ export default function App() {
   const [showAddCA, setShowAddCA] = useState(false);
   const [showAddWallet, setShowAddWallet] = useState(false);
 
+  // Filters & sort
+  const [sortBy, setSortBy] = useState("vol");
+  const [sortDir, setSortDir] = useState("desc");
+  const [minVol, setMinVol] = useState("");
+  const [minMcap, setMinMcap] = useState("");
+  const [minChange1h, setMinChange1h] = useState("");
+
+  const handleSort = (key) => {
+    if (sortBy === key) setSortDir((d) => (d === "desc" ? "asc" : "desc"));
+    else { setSortBy(key); setSortDir("desc"); }
+  };
+
+  const applyFilters = (list) => {
+    const volMin = parseVolInput(minVol);
+    const mcapMin = parseVolInput(minMcap);
+    const change1hMin = minChange1h !== "" ? parseFloat(minChange1h) : null;
+    return list
+      .filter((t) => !volMin || (t.volume?.h24 || 0) >= volMin)
+      .filter((t) => !mcapMin || (t.marketCap || t.fdv || 0) >= mcapMin)
+      .filter((t) => change1hMin === null || (t.priceChange?.h1 ?? -Infinity) >= change1hMin)
+      .sort((a, b) => {
+        let aVal, bVal;
+        if (sortBy === "vol")      { aVal = a.volume?.h24 || 0;          bVal = b.volume?.h24 || 0; }
+        else if (sortBy === "mcap") { aVal = a.marketCap || a.fdv || 0;   bVal = b.marketCap || b.fdv || 0; }
+        else if (sortBy === "change1h") { aVal = a.priceChange?.h1 ?? -999; bVal = b.priceChange?.h1 ?? -999; }
+        else if (sortBy === "change6h") { aVal = a.priceChange?.h6 ?? -999; bVal = b.priceChange?.h6 ?? -999; }
+        else if (sortBy === "age") { aVal = a.pairCreatedAt || 0;         bVal = b.pairCreatedAt || 0; }
+        else { aVal = 0; bVal = 0; }
+        return sortDir === "desc" ? bVal - aVal : aVal - bVal;
+      });
+  };
+
   useEffect(() => {
     if (prices || tokens.length > 0) setLastUpdated(new Date());
   }, [prices, tokens]);
@@ -784,19 +925,15 @@ export default function App() {
     setWallets((prev) => prev.filter((w) => w.address !== address));
   };
 
-  const filteredTokens = tokens.filter((t) => {
+  const chainFilter = (t) => {
     if (activeChain === "All Chains") return true;
     if (activeChain === "Solana") return t.chainId === "solana";
     if (activeChain === "Base") return t.chainId === "base";
     return true;
-  });
+  };
 
-  const filteredPinned = pinnedTokens.filter((t) => {
-    if (activeChain === "All Chains") return true;
-    if (activeChain === "Solana") return t.chainId === "solana";
-    if (activeChain === "Base") return t.chainId === "base";
-    return true;
-  });
+  const filteredTokens = applyFilters(tokens.filter(chainFilter));
+  const filteredPinned = applyFilters(pinnedTokens.filter(chainFilter));
 
   const coinConfigs = [
     { id: "bitcoin", symbol: "BTC", color: "#F7931A" },
@@ -887,6 +1024,21 @@ export default function App() {
       {/* ─── Discover Section ─── */}
       {activeSection === "discover" && (
         <>
+          {/* Filter / Sort bar */}
+          <FilterBar
+            sortBy={sortBy}
+            sortDir={sortDir}
+            onSort={handleSort}
+            minVol={minVol}
+            onMinVol={setMinVol}
+            minMcap={minMcap}
+            onMinMcap={setMinMcap}
+            minChange1h={minChange1h}
+            onMinChange1h={setMinChange1h}
+            count={filteredTokens.length}
+            total={tokens.filter(chainFilter).length}
+          />
+
           {/* Pinned tokens */}
           {(pinnedCAs.length > 0) && (
             <div style={{ marginBottom: 32 }}>
