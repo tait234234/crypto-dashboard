@@ -36,8 +36,10 @@ function useTrendingTokens(activeChain) {
   const [tokens, setTokens] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const fetchIdRef = useRef(0); // incremented to cancel stale in-flight fetches
 
   const fetchTrending = useCallback(async () => {
+    const myId = ++fetchIdRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -47,6 +49,7 @@ function useTrendingTokens(activeChain) {
         : ["solana", "base"];
 
       const allTokens = [];
+      let successPages = 0;
 
       for (const network of networksToFetch) {
         for (const page of [1, 2]) {
@@ -56,6 +59,7 @@ function useTrendingTokens(activeChain) {
             );
             if (!res.ok) continue;
             const data = await res.json();
+            successPages++;
 
             const tokenMap = new Map();
             (data.included || []).forEach((item) => {
@@ -124,6 +128,9 @@ function useTrendingTokens(activeChain) {
         }
       }
 
+      // If every page failed → surface an error instead of showing empty
+      if (successPages === 0) throw new Error("GeckoTerminal unreachable — rate limited or offline. Try refreshing.");
+
       const seen = new Set();
       const deduped = allTokens.filter((t) => {
         const ca = t.baseToken.address;
@@ -132,11 +139,15 @@ function useTrendingTokens(activeChain) {
         return true;
       }).slice(0, 40);
 
+      // Only update state if this fetch is still the latest one
+      if (fetchIdRef.current !== myId) return;
       setTokens(deduped);
       setError(null);
     } catch (err) {
+      if (fetchIdRef.current !== myId) return;
       setError(err.message);
     } finally {
+      if (fetchIdRef.current !== myId) return;
       setLoading(false);
     }
   }, [activeChain]);
@@ -144,7 +155,10 @@ function useTrendingTokens(activeChain) {
   useEffect(() => {
     fetchTrending();
     const interval = setInterval(fetchTrending, 120000);
-    return () => clearInterval(interval);
+    return () => {
+      fetchIdRef.current++; // cancel any in-flight fetch from this effect
+      clearInterval(interval);
+    };
   }, [fetchTrending]);
 
   return { tokens, loading, error, refetch: fetchTrending };
@@ -207,8 +221,10 @@ function useTopVolumeTokens(activeChain) {
   const [tokens, setTokens] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const fetchIdRef = useRef(0);
 
   const fetchTopVol = useCallback(async () => {
+    const myId = ++fetchIdRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -218,6 +234,7 @@ function useTopVolumeTokens(activeChain) {
         : ["solana", "base"];
 
       const allTokens = [];
+      let successPages = 0;
 
       for (const network of networksToFetch) {
         for (const page of [1, 2]) {
@@ -227,6 +244,7 @@ function useTopVolumeTokens(activeChain) {
           );
           if (!res.ok) continue;
           const data = await res.json();
+          successPages++;
 
           // Build token lookup from included array
           const tokenMap = new Map();
@@ -306,6 +324,8 @@ function useTopVolumeTokens(activeChain) {
         } // end page loop
       }
 
+      if (successPages === 0) throw new Error("GeckoTerminal unreachable — rate limited or offline. Try refreshing.");
+
       // Deduplicate by CA, already sorted by volume desc from API
       const seen = new Set();
       const deduped = allTokens
@@ -318,11 +338,14 @@ function useTopVolumeTokens(activeChain) {
         })
         .slice(0, 40);
 
+      if (fetchIdRef.current !== myId) return;
       setTokens(deduped);
       setError(null);
     } catch (err) {
+      if (fetchIdRef.current !== myId) return;
       setError(err.message);
     } finally {
+      if (fetchIdRef.current !== myId) return;
       setLoading(false);
     }
   }, [activeChain]);
@@ -330,7 +353,10 @@ function useTopVolumeTokens(activeChain) {
   useEffect(() => {
     fetchTopVol();
     const interval = setInterval(fetchTopVol, 120000);
-    return () => clearInterval(interval);
+    return () => {
+      fetchIdRef.current++;
+      clearInterval(interval);
+    };
   }, [fetchTopVol]);
 
   return { tokens, loading, error, refetch: fetchTopVol };
