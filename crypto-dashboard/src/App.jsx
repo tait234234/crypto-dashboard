@@ -412,6 +412,74 @@ function useWalletTokens(address) {
   return { holdings, loading, error, refetch: fetch_ };
 }
 
+// ─── Token Holders Hook (Solana RPC) ───
+function useTokenHolders(ca, chainId, enabled) {
+  const [holders, setHolders] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    if (!enabled || !ca || chainId !== "solana") return;
+    let cancelled = false;
+    const run = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const RPC = "https://api.mainnet-beta.solana.com";
+        const [largestRes, supplyRes] = await Promise.all([
+          fetch(RPC, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getTokenLargestAccounts", params: [ca, { commitment: "confirmed" }] }),
+          }),
+          fetch(RPC, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "getTokenSupply", params: [ca] }),
+          }),
+        ]);
+        const largestData = await largestRes.json();
+        const supplyData = await supplyRes.json();
+        if (cancelled) return;
+        if (largestData.error) throw new Error(largestData.error.message);
+        const accounts = largestData.result?.value || [];
+        const totalSupply = parseFloat(supplyData.result?.value?.uiAmount || 0);
+        if (accounts.length === 0 || totalSupply === 0) { setHolders([]); return; }
+
+        // Resolve token accounts → owner wallet addresses
+        const addrs = accounts.map((a) => a.address);
+        const multiRes = await fetch(RPC, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "getMultipleAccounts", params: [addrs, { encoding: "jsonParsed" }] }),
+        });
+        const multiData = await multiRes.json();
+        if (cancelled) return;
+        const infos = multiData.result?.value || [];
+
+        const enriched = accounts
+          .map((acc, i) => {
+            const owner = infos[i]?.data?.parsed?.info?.owner || acc.address;
+            const amount = parseFloat(acc.uiAmount || 0);
+            const pct = totalSupply > 0 ? (amount / totalSupply) * 100 : 0;
+            return { tokenAccount: acc.address, owner, amount, pct };
+          })
+          .filter((h) => h.amount > 0);
+
+        setHolders(enriched);
+      } catch (e) {
+        if (!cancelled) setError(e.message);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    run();
+    return () => { cancelled = true; };
+  }, [enabled, ca, chainId]);
+
+  return { holders, loading, error };
+}
+
 // ─── Helpers ───
 function formatPrice(num) {
   if (!num || num === 0) return "$0";
@@ -475,6 +543,13 @@ function truncateAddr(addr) {
   return addr.slice(0, 6) + "…" + addr.slice(-4);
 }
 
+function getHolderType(pct) {
+  if (pct >= 10) return { label: "🐋 Whale",  color: "#60a5fa", border: "#1d4ed888" };
+  if (pct >= 5)  return { label: "🦈 Large",  color: "#818cf8", border: "#4f46e588" };
+  if (pct >= 1)  return { label: "🐬 Mid",    color: "#34d399", border: "#05966988" };
+  return               { label: "🐟 Small",  color: "#64748b", border: "#1e293b"   };
+}
+
 // Parses filter inputs like "50K", "1.5M", "200" into a raw number
 function parseVolInput(str) {
   if (!str) return 0;
@@ -521,6 +596,71 @@ const PriceChangeText = ({ value }) => {
   return <span style={{ color: positive ? "#4ade80" : "#f87171", fontSize: 13, fontWeight: 600 }}>{formatChange(value)}</span>;
 };
 
+// ─── Holder Panel ───
+const HolderPanel = ({ ca, chainId, holders, loading, error }) => {
+  if (chainId !== "solana") {
+    return (
+      <div style={{ marginTop: 12, padding: "10px 14px", background: "#0d1321", borderRadius: 8, border: "1px solid #1e293b" }}>
+        <span style={{ color: "#64748b", fontSize: 12 }}>Holder analysis is Solana-only. </span>
+        <a href={`https://basescan.org/token/${ca}#balances`} target="_blank" rel="noopener noreferrer" style={{ color: "#60a5fa", fontSize: 12 }}>View on Basescan ↗</a>
+      </div>
+    );
+  }
+
+  const top10pct = holders ? holders.slice(0, 10).reduce((s, h) => s + h.pct, 0) : null;
+  const concColor = top10pct == null ? "#64748b" : top10pct > 60 ? "#f87171" : top10pct > 40 ? "#f59e0b" : "#4ade80";
+
+  return (
+    <div style={{ marginTop: 12, padding: "10px 14px", background: "#0d1321", borderRadius: 8, border: "1px solid #1e293b" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+        <span style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700 }}>Top Holders</span>
+        {top10pct != null && (
+          <span style={{ fontSize: 11, color: concColor, fontWeight: 700 }}>
+            Top 10 own {top10pct.toFixed(1)}%
+            {top10pct > 60 ? " ⚠ concentrated" : top10pct > 40 ? " moderate" : " healthy"}
+          </span>
+        )}
+      </div>
+
+      {loading && <div style={{ color: "#475569", fontSize: 12, textAlign: "center", padding: "8px 0" }}>Fetching holders…</div>}
+      {error && <div style={{ color: "#fca5a5", fontSize: 12 }}>⚠ {error}</div>}
+      {!loading && holders && holders.length === 0 && (
+        <div style={{ color: "#475569", fontSize: 12 }}>No holder data found.</div>
+      )}
+
+      {!loading && holders && holders.map((h, i) => {
+        const type = getHolderType(h.pct);
+        return (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 0", borderBottom: i < holders.length - 1 ? "1px solid #1e293b22" : "none" }}>
+            <span style={{ color: "#334155", fontSize: 11, minWidth: 16 }}>{i + 1}</span>
+            <span style={{ flex: 1, color: "#64748b", fontSize: 11, fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {truncateAddr(h.owner)}
+            </span>
+            <span style={{ fontSize: 10, color: type.color, border: `1px solid ${type.border}`, borderRadius: 4, padding: "1px 5px", fontWeight: 700, whiteSpace: "nowrap" }}>
+              {type.label}
+            </span>
+            <span style={{ color: "#475569", fontSize: 11, minWidth: 44, textAlign: "right" }}>{h.pct.toFixed(2)}%</span>
+            <a
+              href={`https://gmgn.ai/sol/address/${h.owner}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => e.stopPropagation()}
+              title="Check PnL on GMGN"
+              style={{ color: "#818cf8", fontSize: 10, textDecoration: "none", whiteSpace: "nowrap", flexShrink: 0 }}
+            >
+              PnL ↗
+            </a>
+          </div>
+        );
+      })}
+
+      {!loading && holders && holders.length > 0 && (
+        <div style={{ color: "#334155", fontSize: 10, marginTop: 8 }}>Some entries may be LP pools or program accounts</div>
+      )}
+    </div>
+  );
+};
+
 // ─── Token Card ───
 const TokenCard = ({ pair, isPinned, onPin, onUnpin }) => {
   const symbol = pair.baseToken?.symbol || "???";
@@ -538,11 +678,10 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin }) => {
   const iconUrl = pair.icon || pair.info?.imageUrl || null;
   const dexUrl = pair.url || `https://dexscreener.com/${pair.chainId}/${pair.pairAddress}`;
   const bubbleMapsUrl = getBubbleMapsUrl(pair.chainId, ca);
-  const holdersUrl = pair.chainId === "solana"
-    ? `https://solscan.io/token/${ca}#holders`
-    : `https://basescan.org/token/${ca}#balances`;
 
   const [hovered, setHovered] = useState(false);
+  const [showHolders, setShowHolders] = useState(false);
+  const { holders, loading: holdersLoading, error: holdersError } = useTokenHolders(ca, pair.chainId, showHolders);
 
   return (
     <div
@@ -563,17 +702,14 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin }) => {
         >
           🫧
         </a>
-        {/* Top Holders */}
-        <a
-          href={holdersUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-          title="View top holders"
-          style={{ width: 28, height: 28, borderRadius: 6, background: "#1e293b", border: "1px solid #334155", display: "flex", alignItems: "center", justifyContent: "center", textDecoration: "none", fontSize: 14, color: "#94a3b8", cursor: "pointer", flexShrink: 0 }}
-          onClick={(e) => e.stopPropagation()}
+        {/* Top Holders toggle */}
+        <button
+          onClick={(e) => { e.stopPropagation(); setShowHolders((v) => !v); }}
+          title={showHolders ? "Hide holder analysis" : "Analyze holders"}
+          style={{ width: 28, height: 28, borderRadius: 6, background: showHolders ? "#1e40af33" : "#1e293b", border: `1px solid ${showHolders ? "#1d4ed888" : "#334155"}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, color: showHolders ? "#60a5fa" : "#94a3b8", cursor: "pointer", flexShrink: 0 }}
         >
           👥
-        </a>
+        </button>
         {/* Bookmark / Pin */}
         <button
           onClick={(e) => { e.stopPropagation(); isPinned ? onUnpin(ca, pair.chainId) : onPin(ca, pair.chainId); }}
@@ -684,6 +820,17 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin }) => {
             </a>
           )}
         </div>
+      )}
+
+      {/* Holder analysis panel */}
+      {showHolders && (
+        <HolderPanel
+          ca={ca}
+          chainId={pair.chainId}
+          holders={holders}
+          loading={holdersLoading}
+          error={holdersError}
+        />
       )}
     </div>
   );
