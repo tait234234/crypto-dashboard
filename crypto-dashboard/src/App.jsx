@@ -57,31 +57,34 @@ function useCryptoPrices() {
   return { prices, sparklines, loading, error, refetch: fetchPrices };
 }
 
-// ─── Crypto News Hook (CryptoCompare) ───
+// ─── Crypto News Hook (cryptocurrency.cv free API) ───
 function useCryptoNews() {
   const [articles, setArticles] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
   const fetchNews = useCallback(async () => {
     try {
-      const res = await fetch("https://min-api.cryptocompare.com/data/v2/news/?categories=BTC,ETH,SOL&lang=EN&sortOrder=latest");
-      if (!res.ok) throw new Error("News API failed");
+      const res = await fetch("https://cryptocurrency.cv/api/news?limit=12");
+      if (!res.ok) throw new Error(`News ${res.status}`);
       const json = await res.json();
-      const items = (json.Data || []).slice(0, 12).map((a) => ({
-        id: a.id,
+      const items = (json.articles || []).map((a, i) => ({
+        id: i,
         title: a.title,
-        url: a.url,
+        url: a.link,
         source: a.source,
-        image: a.imageurl,
-        time: a.published_on * 1000,
-        categories: a.categories,
+        timeAgo: a.timeAgo || "",
+        time: a.pubDate ? new Date(a.pubDate).getTime() : 0,
       }));
-      setArticles(items);
+      if (items.length) { setArticles(items); setError(null); }
+      else throw new Error("Empty");
     } catch {
+      // Only set error if we have no articles yet (keep stale data on refresh failure)
+      if (articles.length === 0) setError("News unavailable");
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [articles.length]);
 
   useEffect(() => {
     fetchNews();
@@ -89,7 +92,7 @@ function useCryptoNews() {
     return () => clearInterval(iv);
   }, [fetchNews]);
 
-  return { articles, loading };
+  return { articles, loading, error };
 }
 
 // ─── GeckoTerminal Trending Tokens Hook ───
@@ -1668,7 +1671,7 @@ export default function App() {
   const chains = ["All Chains", "Solana", "Base"];
 
   const { prices, sparklines, loading: priceLoading, error: priceError } = useCryptoPrices();
-  const { articles: newsArticles, loading: newsLoading } = useCryptoNews();
+  const { articles: newsArticles, loading: newsLoading, error: newsError } = useCryptoNews();
   const { tokens, loading: tokenLoading, refreshing: tokenRefreshing, fetchedAt: tokenFetchedAt, error: tokenError } = useTrendingTokens(activeChain);
 
   // Pinned CAs: [{ca, chainId}]
@@ -1889,12 +1892,14 @@ export default function App() {
               </div>
             ))}
           </div>
+        ) : newsError && newsArticles.length === 0 ? (
+          <div style={{ color: "#64748b", fontSize: 13, textAlign: "center", padding: "18px 0" }}>
+            Unable to load news — will retry automatically
+          </div>
         ) : (
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 10 }}>
             {newsArticles.map((a) => {
-              const ago = Date.now() - a.time;
-              const mins = Math.floor(ago / 60000);
-              const timeLabel = mins < 60 ? `${mins}m ago` : mins < 1440 ? `${Math.floor(mins / 60)}h ago` : `${Math.floor(mins / 1440)}d ago`;
+              const timeLabel = a.timeAgo || (() => { const m = Math.floor((Date.now() - a.time) / 60000); return m < 60 ? `${m}m ago` : m < 1440 ? `${Math.floor(m / 60)}h ago` : `${Math.floor(m / 1440)}d ago`; })();
               return (
                 <a
                   key={a.id}
@@ -1905,9 +1910,6 @@ export default function App() {
                   onMouseEnter={(e) => e.currentTarget.style.borderColor = "#334155"}
                   onMouseLeave={(e) => e.currentTarget.style.borderColor = "#1e293b"}
                 >
-                  {a.image && (
-                    <img src={a.image} alt="" style={{ width: 48, height: 48, borderRadius: 8, objectFit: "cover", flexShrink: 0, background: "#1e293b" }} onError={(e) => e.target.style.display = "none"} />
-                  )}
                   <div style={{ minWidth: 0 }}>
                     <div style={{ fontSize: 13, fontWeight: 600, color: "#cbd5e1", lineHeight: 1.35, marginBottom: 4, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>{a.title}</div>
                     <div style={{ fontSize: 11, color: "#475569" }}>{a.source} · {timeLabel}</div>
