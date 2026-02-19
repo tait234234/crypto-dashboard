@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ─── Live Price Hook (CoinGecko) ───
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -58,71 +58,65 @@ function useCryptoPrices() {
 }
 
 // ─── Crypto News Hook (cryptocurrency.cv free API) ───
+// Fetches a large batch once; articles are shared/filtered client-side for per-card news.
+function parseNewsItems(json) {
+  // Handle both {articles:[]} and {Data:[]} shapes defensively
+  const raw = json.articles || json.Data || json.data || [];
+  return raw.map((a, i) => ({
+    id: i,
+    title: a.title || a.headline || "",
+    url: a.link || a.url || "",
+    source: a.source || a.sourceName || "",
+    timeAgo: a.timeAgo || "",
+    time: a.pubDate ? new Date(a.pubDate).getTime() : (a.published_on ? a.published_on * 1000 : 0),
+  })).filter((a) => a.title && a.url);
+}
+
 function useCryptoNews() {
   const [articles, setArticles] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const prevRef = useRef([]);
 
   const fetchNews = useCallback(async () => {
     try {
-      const res = await fetch("https://cryptocurrency.cv/api/news?limit=12");
+      const res = await fetch("https://cryptocurrency.cv/api/news?limit=50");
       if (!res.ok) throw new Error(`News ${res.status}`);
       const json = await res.json();
-      const items = (json.articles || []).map((a, i) => ({
-        id: i,
-        title: a.title,
-        url: a.link,
-        source: a.source,
-        timeAgo: a.timeAgo || "",
-        time: a.pubDate ? new Date(a.pubDate).getTime() : 0,
-      }));
-      if (items.length) { setArticles(items); setError(null); }
-      else throw new Error("Empty");
+      const items = parseNewsItems(json);
+      if (items.length) {
+        prevRef.current = items;
+        setArticles(items);
+        setError(null);
+      } else {
+        throw new Error("Empty response");
+      }
     } catch {
-      // Only set error if we have no articles yet (keep stale data on refresh failure)
-      if (articles.length === 0) setError("News unavailable");
+      // Keep stale data on failure; only surface error if we have nothing at all
+      if (prevRef.current.length === 0) setError("News unavailable");
+      else setArticles(prevRef.current);
     } finally {
       setLoading(false);
     }
-  }, [articles.length]);
+  }, []);
 
   useEffect(() => {
     fetchNews();
-    const iv = setInterval(fetchNews, 300000); // refresh every 5 min
+    const iv = setInterval(fetchNews, 300000);
     return () => clearInterval(iv);
   }, [fetchNews]);
 
   return { articles, loading, error };
 }
 
-// ─── Per-Coin News Hook (cryptocurrency.cv search) ───
-function useCoinNews(keyword) {
-  const [articles, setArticles] = useState(null); // null = not yet loaded
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    setArticles(null);
-    fetch(`https://cryptocurrency.cv/api/search?q=${encodeURIComponent(keyword)}&limit=3`)
-      .then((r) => r.ok ? r.json() : Promise.reject(r.status))
-      .then((json) => {
-        if (cancelled) return;
-        const items = (json.articles || []).slice(0, 3).map((a, i) => ({
-          id: i,
-          title: a.title,
-          url: a.link,
-          source: a.source,
-          timeAgo: a.timeAgo || "",
-        }));
-        setArticles(items);
-      })
-      .catch(() => { if (!cancelled) setArticles([]); })
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
-  }, [keyword]);
-
-  return { articles, loading };
+// Filter a list of news articles by one or more keywords (case-insensitive, checks title)
+function filterNewsByKeywords(articles, keywords) {
+  if (!articles.length || !keywords.length) return [];
+  const lc = keywords.map((k) => k.toLowerCase()).filter(Boolean);
+  return articles.filter((a) => {
+    const t = a.title.toLowerCase();
+    return lc.some((k) => t.includes(k));
+  });
 }
 
 // ─── GeckoTerminal Trending Tokens Hook ───
@@ -848,7 +842,7 @@ const HolderPanel = ({ ca, chainId, holders, loading, error, onRefresh }) => {
 };
 
 // ─── Token Card ───
-const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank }) => {
+const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank, allNews = [], newsLoading = false }) => {
   const symbol = pair.baseToken?.symbol || "???";
   const name = pair.baseToken?.name || "Unknown";
   const chain = getChainLabel(pair.chainId);
@@ -1159,6 +1153,20 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
           onRefresh={refetchHolders}
         />
       )}
+
+      {/* Token news */}
+      {(() => {
+        const tokenArticles = filterNewsByKeywords(allNews, [symbol, name]).slice(0, 3);
+        if (!newsLoading && tokenArticles.length === 0) return null; // hide section entirely if no news & not loading
+        return (
+          <div style={{ borderTop: "1px solid #1e293b", marginTop: 10, paddingTop: 10 }}>
+            <div style={{ fontSize: 10, fontWeight: 700, color: "#475569", letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 6 }}>
+              {symbol} News
+            </div>
+            <NewsSnippet articles={tokenArticles} loading={newsLoading} label={symbol} />
+          </div>
+        );
+      })()}
     </div>
   );
 };
@@ -1347,13 +1355,43 @@ const PriceSkeleton = () => (
   </div>
 );
 
-function CoinCard({ coin, data, sparkline }) {
+// Reusable mini news list used in CoinCard and TokenCard
+function NewsSnippet({ articles, loading, label }) {
+  if (loading) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+        {[1, 2].map((i) => (
+          <div key={i} style={{ height: 10, background: "#1e293b", borderRadius: 3, width: i === 1 ? "90%" : "70%", animation: "shimmer 1.5s infinite" }} />
+        ))}
+      </div>
+    );
+  }
+  if (!articles || articles.length === 0) {
+    return <div style={{ fontSize: 11, color: "#334155", fontStyle: "italic" }}>No news for {label}</div>;
+  }
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      {articles.map((a) => (
+        <a key={a.id} href={a.url} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "none", display: "block" }}>
+          <div style={{ fontSize: 11, color: "#94a3b8", lineHeight: 1.35, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>{a.title}</div>
+          <div style={{ fontSize: 10, color: "#475569", marginTop: 1 }}>{a.source}{a.timeAgo ? ` · ${a.timeAgo}` : ""}</div>
+        </a>
+      ))}
+    </div>
+  );
+}
+
+function CoinCard({ coin, data, sparkline, allNews, newsLoading }) {
   const price = data?.usd || 0;
   const change = data?.usd_24h_change || 0;
   const vol = data?.usd_24h_vol || 0;
   const mcap = data?.usd_market_cap || 0;
   const positive = change >= 0;
-  const { articles, loading: newsLoading } = useCoinNews(coin.newsKey);
+  // Filter from the shared news pool — use full coin name + symbol as keywords
+  const coinArticles = useMemo(
+    () => filterNewsByKeywords(allNews || [], [coin.newsKey, coin.symbol]).slice(0, 3),
+    [allNews, coin.newsKey, coin.symbol]
+  );
 
   return (
     <div style={{ background: "#0d1321", border: "1px solid #1e293b", borderLeft: `3px solid ${coin.color}`, borderRadius: 12, padding: "16px 18px", boxShadow: `0 0 24px ${coin.color}0a` }}>
@@ -1373,23 +1411,7 @@ function CoinCard({ coin, data, sparkline }) {
       {/* Per-coin news */}
       <div style={{ borderTop: "1px solid #1e293b", marginTop: 10, paddingTop: 10 }}>
         <div style={{ fontSize: 10, fontWeight: 700, color: "#475569", letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 6 }}>{coin.symbol} News</div>
-        {newsLoading ? (
-          <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-            {[1,2].map((i) => <div key={i} style={{ height: 10, background: "#1e293b", borderRadius: 3, width: i === 1 ? "90%" : "70%", animation: "shimmer 1.5s infinite" }} />)}
-          </div>
-        ) : !articles || articles.length === 0 ? (
-          <div style={{ fontSize: 11, color: "#334155", fontStyle: "italic" }}>No news found</div>
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            {articles.map((a) => (
-              <a key={a.id} href={a.url} target="_blank" rel="noopener noreferrer"
-                style={{ textDecoration: "none", display: "block" }}>
-                <div style={{ fontSize: 11, color: "#94a3b8", lineHeight: 1.35, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>{a.title}</div>
-                <div style={{ fontSize: 10, color: "#334155", marginTop: 1 }}>{a.source}{a.timeAgo ? ` · ${a.timeAgo}` : ""}</div>
-              </a>
-            ))}
-          </div>
-        )}
+        <NewsSnippet articles={coinArticles} loading={newsLoading} label={coin.symbol} />
       </div>
     </div>
   );
@@ -1927,7 +1949,7 @@ export default function App() {
           {priceLoading
             ? [1, 2, 3].map((i) => <PriceSkeleton key={i} />)
             : coinConfigs.map((coin) => (
-                <CoinCard key={coin.symbol} coin={coin} data={prices?.[coin.id]} sparkline={sparklines?.[coin.id]} />
+                <CoinCard key={coin.symbol} coin={coin} data={prices?.[coin.id]} sparkline={sparklines?.[coin.id]} allNews={newsArticles} newsLoading={newsLoading} />
               ))}
         </div>
       </div>
@@ -1953,7 +1975,7 @@ export default function App() {
           </div>
         ) : (
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 10 }}>
-            {newsArticles.map((a) => {
+            {newsArticles.slice(0, 12).map((a) => {
               const timeLabel = a.timeAgo || (() => { const m = Math.floor((Date.now() - a.time) / 60000); return m < 60 ? `${m}m ago` : m < 1440 ? `${Math.floor(m / 60)}h ago` : `${Math.floor(m / 1440)}d ago`; })();
               return (
                 <a
@@ -2043,6 +2065,8 @@ export default function App() {
                       onPin={pinToken}
                       onUnpin={unpinToken}
                       walletHolders={(pair.baseToken?.address && walletMintMap[pair.baseToken.address]) || []}
+                      allNews={newsArticles}
+                      newsLoading={newsLoading}
                     />
                   ))}
                 </div>
@@ -2093,6 +2117,8 @@ export default function App() {
                       onPin={pinToken}
                       onUnpin={unpinToken}
                       walletHolders={(ca && walletMintMap[ca]) || []}
+                      allNews={newsArticles}
+                      newsLoading={newsLoading}
                     />
                   );
                 })}
