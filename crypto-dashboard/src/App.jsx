@@ -445,46 +445,70 @@ function useTokenHolders(ca, chainId, enabled) {
 }
 
 // ─── Pool Chart Hook (GeckoTerminal OHLCV for token cards) ───
-// Returns { priceData, volumeData, loading } — priceData: [[ts, close]], volumeData: [[ts, vol]]
-function usePoolChart(chainId, poolAddress, enabled) {
+// Maps DexScreener chainId → GeckoTerminal network slug
+const CHAIN_TO_GT_NETWORK = {
+  solana: "solana", base: "base", ethereum: "eth", bsc: "bsc",
+  arbitrum: "arbitrum", polygon: "polygon", avalanche: "avax",
+  optimism: "optimism", blast: "blast", sui: "sui",
+};
+
+// Timeframe definitions: label → { timespan, aggregate, limit }
+const TF_CONFIG = {
+  "5m":  { timespan: "minute", aggregate: 1,  limit: 60  }, // 1h of 1min candles
+  "1h":  { timespan: "minute", aggregate: 5,  limit: 60  }, // 5h of 5min candles
+  "12h": { timespan: "hour",   aggregate: 1,  limit: 12  }, // 12 x 1h
+  "24h": { timespan: "hour",   aggregate: 1,  limit: 24  }, // 24 x 1h
+};
+
+// Cache: cacheKey → { priceData, volumeData } so switching TF re-fetches but revisiting works
+const chartCache = {};
+
+function usePoolChart(chainId, poolAddress, enabled, timeframe = "24h") {
   const [priceData, setPriceData] = useState(null);
   const [volumeData, setVolumeData] = useState(null);
   const [loading, setLoading] = useState(false);
-  const fetchedRef = useRef(null);
 
   useEffect(() => {
     if (!enabled || !poolAddress || !chainId) return;
-    const cacheKey = `${chainId}:${poolAddress}`;
-    if (fetchedRef.current === cacheKey) return;
+    const network = CHAIN_TO_GT_NETWORK[chainId] ?? chainId;
+    const { timespan, aggregate, limit } = TF_CONFIG[timeframe] || TF_CONFIG["24h"];
+    const cacheKey = `${network}:${poolAddress}:${timeframe}`;
+
+    // Serve from cache immediately if available
+    if (chartCache[cacheKey]) {
+      const { priceData: pd, volumeData: vd } = chartCache[cacheKey];
+      setPriceData(pd); setVolumeData(vd);
+      return;
+    }
+
     let cancelled = false;
     const run = async () => {
       setLoading(true);
       try {
-        const network = chainId === "base" ? "base" : "solana";
-        const url = `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/ohlcv/hour?aggregate=1&limit=24`;
+        const url = `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/ohlcv/${timespan}?aggregate=${aggregate}&limit=${limit}`;
         let res = await fetch(url);
         if (res.status === 429) { await delay(2000); res = await fetch(url); }
-        if (!res.ok) throw new Error("OHLCV fetch failed");
+        if (!res.ok) throw new Error(`OHLCV ${res.status}`);
         const json = await res.json();
         const candles = json.data?.attributes?.ohlcv_list || [];
-        // candles: [[timestamp, open, high, low, close, volume], ...] newest first
+        // GeckoTerminal: [[timestamp, open, high, low, close, volume], ...] newest first
         const sorted = candles.slice().reverse();
-        const prices = sorted.map((c) => [c[0] * 1000, c[4]]);   // [ts, close]
-        const volumes = sorted.map((c) => [c[0] * 1000, c[5]]);  // [ts, volume]
-        if (!cancelled) {
-          setPriceData(prices.length >= 2 ? prices : null);
-          setVolumeData(volumes.length >= 2 ? volumes : null);
-          fetchedRef.current = cacheKey;
-        }
+        const prices  = sorted.map((c) => [c[0] * 1000, c[4]]); // [ts, close]
+        const volumes = sorted.map((c) => [c[0] * 1000, c[5]]); // [ts, vol]
+        const pd = prices.length >= 2 ? prices : null;
+        const vd = volumes.length >= 2 ? volumes : null;
+        chartCache[cacheKey] = { priceData: pd, volumeData: vd }; // cache success
+        if (!cancelled) { setPriceData(pd); setVolumeData(vd); }
       } catch {
-        if (!cancelled) { setPriceData(null); setVolumeData(null); fetchedRef.current = cacheKey; }
+        // Don't cache failures — allow retry on next open
+        if (!cancelled) { setPriceData(null); setVolumeData(null); }
       } finally {
         if (!cancelled) setLoading(false);
       }
     };
     run();
     return () => { cancelled = true; };
-  }, [enabled, chainId, poolAddress]);
+  }, [enabled, chainId, poolAddress, timeframe]);
 
   return { priceData, volumeData, loading };
 }
@@ -743,19 +767,21 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
   const [showHolders, setShowHolders] = useState(false);
   const [showWalletHolders, setShowWalletHolders] = useState(false);
   const [showChart, setShowChart] = useState(false);
-  const [chartMode, setChartMode] = useState("price"); // "price" | "mcap"
+  const [chartMode, setChartMode] = useState("price"); // "price" | "mcap" | "vol"
+  const [chartTf, setChartTf] = useState("24h");       // "5m" | "1h" | "12h" | "24h"
   const [caCopied, setCaCopied] = useState(false);
   const { holders, loading: holdersLoading, error: holdersError, refetch: refetchHolders } = useTokenHolders(ca, pair.chainId, showHolders);
-  const { priceData: chartData, volumeData, loading: chartLoading } = usePoolChart(pair.chainId, pair.pairAddress, showChart);
+  const { priceData: chartData, volumeData, loading: chartLoading } = usePoolChart(pair.chainId, pair.pairAddress, showChart, chartTf);
 
-  // Derive mcap chart: mcap = price * supply, supply = currentMcap / currentPrice
+  // Derive mcap chart: supply = currentMcap / currentPrice (constant, so mcap chart mirrors price shape scaled)
   const currentPrice = pair.priceUsd ? parseFloat(pair.priceUsd) : 0;
   const supply = currentPrice > 0 && mcap > 0 ? mcap / currentPrice : 0;
   const mcapChartData = chartData && supply > 0
     ? chartData.map(([ts, price]) => [ts, price * supply])
     : null;
 
-  const activeChartData = chartMode === "mcap" ? mcapChartData : chartData;
+  const activeChartData = chartMode === "mcap" ? mcapChartData : chartMode === "vol" ? volumeData : chartData;
+  const chartFormatter = chartMode === "price" ? formatPrice : formatVolume;
 
   const glowClass = change1h === null ? "token-card-flat" : change1h >= 0 ? "token-card-up" : "token-card-down";
 
@@ -898,38 +924,48 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
 
       <BuySellBar buys={buys24} sells={sells24} />
 
-      {/* Mini chart with Price / MCap toggle */}
+      {/* Mini chart */}
       {showChart && (
-        <div style={{ marginTop: 8, padding: "8px 0 4px", borderTop: "1px solid #1e293b" }}>
-          {/* Toggle buttons */}
-          <div style={{ display: "flex", gap: 4, marginBottom: 6, justifyContent: "center" }}>
-            {["price", "mcap"].map((mode) => {
-              const active = chartMode === mode;
-              return (
-                <button
-                  key={mode}
-                  onClick={(e) => { e.stopPropagation(); setChartMode(mode); }}
-                  style={{
-                    padding: "3px 10px", fontSize: 10, fontWeight: 600, letterSpacing: 0.3,
-                    borderRadius: 5, border: `1px solid ${active ? "#6366f1" : "#334155"}`,
-                    background: active ? "#6366f122" : "transparent",
-                    color: active ? "#a5b4fc" : "#64748b",
-                    cursor: "pointer", textTransform: "uppercase",
-                  }}
-                >
-                  {mode === "price" ? "Price" : "MCap"}
-                </button>
-              );
-            })}
+        <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid #1e293b" }}>
+          {/* Controls row */}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+            {/* Timeframe pills */}
+            <div style={{ display: "flex", gap: 3 }}>
+              {["5m", "1h", "12h", "24h"].map((tf) => {
+                const active = chartTf === tf;
+                return (
+                  <button key={tf} onClick={(e) => { e.stopPropagation(); setChartTf(tf); }}
+                    style={{ padding: "2px 7px", fontSize: 9, fontWeight: 700, borderRadius: 4,
+                      border: `1px solid ${active ? "#38bdf8" : "#1e293b"}`,
+                      background: active ? "#38bdf822" : "transparent",
+                      color: active ? "#7dd3fc" : "#475569", cursor: "pointer" }}>
+                    {tf}
+                  </button>
+                );
+              })}
+            </div>
+            {/* Mode pills */}
+            <div style={{ display: "flex", gap: 3 }}>
+              {[["price", "Price"], ["mcap", "MCap"], ["vol", "Vol"]].map(([mode, label]) => {
+                const active = chartMode === mode;
+                return (
+                  <button key={mode} onClick={(e) => { e.stopPropagation(); setChartMode(mode); }}
+                    style={{ padding: "2px 7px", fontSize: 9, fontWeight: 700, borderRadius: 4,
+                      border: `1px solid ${active ? "#6366f1" : "#1e293b"}`,
+                      background: active ? "#6366f122" : "transparent",
+                      color: active ? "#a5b4fc" : "#475569", cursor: "pointer" }}>
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
           </div>
-          {chartLoading && <div style={{ color: "#475569", fontSize: 11, textAlign: "center" }}>Loading chart…</div>}
+          {chartLoading && <div style={{ color: "#475569", fontSize: 11, textAlign: "center", paddingBottom: 4 }}>Loading…</div>}
           {!chartLoading && activeChartData && activeChartData.length >= 2 && (
-            <Sparkline data={activeChartData} width={260} height={48} interactive formatter={chartMode === "mcap" ? formatVolume : formatPrice} />
+            <Sparkline data={activeChartData} width={260} height={52} interactive formatter={chartFormatter} />
           )}
           {!chartLoading && (!activeChartData || activeChartData.length < 2) && (
-            <div style={{ color: "#334155", fontSize: 11, textAlign: "center" }}>
-              {chartMode === "mcap" && (!mcapChartData) ? "No MCap data (missing supply)" : "No chart data"}
-            </div>
+            <div style={{ color: "#334155", fontSize: 11, textAlign: "center", paddingBottom: 4 }}>No chart data</div>
           )}
         </div>
       )}
