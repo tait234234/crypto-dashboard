@@ -112,6 +112,7 @@ function fetchPoolsIntoList(data, network, out, { volMin, liqMin, h1Min, h24HrMi
       priceUsd:    pool.attributes.base_token_price_usd,
       icon:        tokenAttrs.image_url || null,
       pairAddress: pool.attributes.address,
+      source: "gt",
       boostAmount: 0,
       url: `https://dexscreener.com/${chainId}/${pool.attributes.address}`,
     });
@@ -465,26 +466,35 @@ const chartCache = {};
 
 // Cache: "network:ca" → GT pool address (only caches successes)
 const gtPoolCache = {};
+const gtPoolPending = {}; // dedup concurrent lookups for same token
 async function findGTPool(network, tokenCA) {
   const key = `${network}:${tokenCA}`;
   if (gtPoolCache[key]) return gtPoolCache[key];
-  try {
-    const url = `https://api.geckoterminal.com/api/v2/networks/${network}/tokens/${tokenCA}/pools?page=1`;
-    let res = await fetch(url);
-    if (res.status === 429) { await delay(2000); res = await fetch(url); }
-    if (!res.ok) return null;
-    const json = await res.json();
-    const pools = json.data || [];
-    if (!pools.length) return null;
-    const addr = pools[0].attributes?.address;
-    if (addr) gtPoolCache[key] = addr;
-    return addr || null;
-  } catch {
-    return null;
-  }
+  if (gtPoolPending[key]) return gtPoolPending[key];
+  const promise = (async () => {
+    try {
+      const url = `https://api.geckoterminal.com/api/v2/networks/${network}/tokens/${tokenCA}/pools?page=1`;
+      let res = await fetch(url);
+      if (res.status === 429) { await delay(2000); res = await fetch(url); }
+      if (!res.ok) return null;
+      const json = await res.json();
+      const pools = json.data || [];
+      if (!pools.length) return null;
+      const addr = pools[0].attributes?.address;
+      if (addr) gtPoolCache[key] = addr;
+      return addr || null;
+    } catch {
+      return null;
+    } finally {
+      delete gtPoolPending[key];
+    }
+  })();
+  gtPoolPending[key] = promise;
+  return promise;
 }
 
-function usePoolChart(chainId, tokenCA, enabled, timeframe = "1D") {
+// gtPoolAddr: if the token came from GeckoTerminal, pass its pool address directly to skip the lookup
+function usePoolChart(chainId, tokenCA, gtPoolAddr, enabled, timeframe = "1D") {
   const [priceData, setPriceData] = useState(null);
   const [volumeData, setVolumeData] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -508,8 +518,8 @@ function usePoolChart(chainId, tokenCA, enabled, timeframe = "1D") {
       setPriceData(null); // clear stale data from previous timeframe
       setVolumeData(null);
       try {
-        // Resolve the correct GeckoTerminal pool address from the token CA
-        const poolAddress = await findGTPool(network, tokenCA);
+        // Use known GT pool address if available, otherwise look it up from token CA
+        const poolAddress = gtPoolAddr || await findGTPool(network, tokenCA);
         if (!poolAddress) throw new Error("No GT pool found for token");
         if (cancelled) return;
         const url = `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/ohlcv/${timespan}?aggregate=${aggregate}&limit=${limit}`;
@@ -533,7 +543,7 @@ function usePoolChart(chainId, tokenCA, enabled, timeframe = "1D") {
     };
     run();
     return () => { cancelled = true; };
-  }, [enabled, chainId, tokenCA, timeframe]);
+  }, [enabled, chainId, tokenCA, gtPoolAddr, timeframe]);
 
   return { priceData, volumeData, loading };
 }
@@ -797,7 +807,8 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
   const [chartTf, setChartTf] = useState("1D");        // "1H" | "4H" | "12H" | "1D"
   const [caCopied, setCaCopied] = useState(false);
   const { holders, loading: holdersLoading, error: holdersError, refetch: refetchHolders } = useTokenHolders(ca, pair.chainId, showHolders);
-  const { priceData: chartData, volumeData, loading: chartLoading } = usePoolChart(pair.chainId, ca, showChart, chartTf);
+  const gtPoolAddr = pair.source === "gt" ? pair.pairAddress : null;
+  const { priceData: chartData, volumeData, loading: chartLoading } = usePoolChart(pair.chainId, ca, gtPoolAddr, showChart, chartTf);
 
   // Derive mcap series by scaling price by fixed supply ratio
   const currentPrice = pair.priceUsd ? parseFloat(pair.priceUsd) : 0;
@@ -1436,7 +1447,7 @@ const FilterBar = ({ sortBy, sortDir, onSort, minVol, onMinVol, minMcap, onMinMc
     <span style={{ color: "#475569", fontSize: 11, fontWeight: 600, letterSpacing: 0.5 }}>FILTER</span>
 
     <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
-      <span style={{ color: "#475569", fontSize: 11 }}>Vol≥</span>
+      <span style={{ color: "#475569", fontSize: 11 }}>{sortBy === "vol1h" ? "Vol1h≥" : sortBy === "vol6h" ? "Vol6h≥" : "Vol≥"}</span>
       <input
         value={minVol}
         onChange={(e) => onMinVol(e.target.value)}
@@ -1677,7 +1688,11 @@ export default function App() {
     const mcapMin = parseVolInput(minMcap);
     const change1hMin = minChange1h !== "" ? parseFloat(minChange1h) : null;
     return list
-      .filter((t) => !volMin || (t.volume?.h24 || 0) >= volMin)
+      .filter((t) => {
+        if (!volMin) return true;
+        const v = sortBy === "vol1h" ? (t.volume?.h1 || 0) : sortBy === "vol6h" ? (t.volume?.h6 || 0) : (t.volume?.h24 || 0);
+        return v >= volMin;
+      })
       .filter((t) => !mcapMin || (t.marketCap || t.fdv || 0) >= mcapMin)
       .filter((t) => change1hMin === null || (t.priceChange?.h1 ?? -Infinity) >= change1hMin)
       .sort((a, b) => {
