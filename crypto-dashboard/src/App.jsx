@@ -119,11 +119,7 @@ function useTrendingTokens(activeChain) {
     if (!hasDataRef.current) { setLoading(true); setError(null); }
     else setRefreshing(true);
     try {
-      const networksToFetch =
-        activeChain === "Solana" ? ["solana"]
-        : activeChain === "Base" ? ["base"]
-        : ["solana", "base"];
-
+      const networksToFetch = getNetworksToFetch(activeChain);
       const allTokens = [];
       let successPages = 0;
 
@@ -253,11 +249,7 @@ function useTopVolumeTokens(activeChain) {
     if (!hasDataRef.current) { setLoading(true); setError(null); }
     else setRefreshing(true);
     try {
-      const networksToFetch =
-        activeChain === "Solana" ? ["solana"]
-        : activeChain === "Base" ? ["base"]
-        : ["solana", "base"];
-
+      const networksToFetch = getNetworksToFetch(activeChain);
       const allTokens = [];
       let successPages = 0;
 
@@ -705,7 +697,7 @@ const HolderPanel = ({ ca, chainId, holders, loading, error, onRefresh }) => {
 };
 
 // ─── Token Card ───
-const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [] }) => {
+const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank }) => {
   const symbol = pair.baseToken?.symbol || "???";
   const name = pair.baseToken?.name || "Unknown";
   const chain = getChainLabel(pair.chainId);
@@ -722,17 +714,17 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [] }) => {
   const dexUrl = pair.url || `https://dexscreener.com/${pair.chainId}/${pair.pairAddress}`;
   const bubbleMapsUrl = getBubbleMapsUrl(pair.chainId, ca);
 
-  const [hovered, setHovered] = useState(false);
   const [showHolders, setShowHolders] = useState(false);
   const [showWalletHolders, setShowWalletHolders] = useState(false);
   const [caCopied, setCaCopied] = useState(false);
   const { holders, loading: holdersLoading, error: holdersError, refetch: refetchHolders } = useTokenHolders(ca, pair.chainId, showHolders);
 
+  const glowClass = change1h === null ? "token-card-flat" : change1h >= 0 ? "token-card-up" : "token-card-down";
+
   return (
     <div
-      style={{ background: "#111827", border: `1px solid ${hovered ? "#334155" : "#1e293b"}`, borderRadius: 14, padding: "18px 20px", display: "flex", flexDirection: "column", gap: 4, transition: "border-color 0.2s", position: "relative", height: "100%", boxSizing: "border-box" }}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
+      className={glowClass}
+      style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 14, padding: "18px 20px", display: "flex", flexDirection: "column", gap: 4, transition: "border-color 0.25s, box-shadow 0.25s", position: "relative", height: "100%", boxSizing: "border-box" }}
     >
       {/* Action buttons — top right */}
       <div style={{ position: "absolute", top: 12, right: 12, display: "flex", gap: 4, zIndex: 2 }}>
@@ -814,6 +806,7 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [] }) => {
               <div style={{ width: 40, height: 40, borderRadius: 10, background: hashColor(symbol), display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 700, color: "#e2e8f0", border: "1px solid #ffffff11" }}>
                 {symbol.slice(0, 2)}
               </div>
+              {rank && <span className="rank-badge">#{rank}</span>}
             </div>
             <div>
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -1104,9 +1097,13 @@ const PriceSkeleton = () => (
 
 const LiveIndicator = () => (
   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-    <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#4ade80", boxShadow: "0 0 8px #4ade8088", animation: "pulse 2s ease-in-out infinite" }} />
-    <span style={{ color: "#4ade80", fontSize: 11, fontWeight: 600, letterSpacing: 0.5 }}>LIVE</span>
-    <style>{`@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }`}</style>
+    <div style={{ position: "relative", width: 10, height: 10, flexShrink: 0 }}>
+      {/* Ring pulse */}
+      <div style={{ position: "absolute", inset: 0, borderRadius: "50%", border: "1.5px solid #4ade80", animation: "ring-expand 2s ease-out infinite" }} />
+      {/* Dot */}
+      <div style={{ position: "absolute", inset: 1, borderRadius: "50%", background: "#4ade80", animation: "pulse-dot 2s ease-in-out infinite" }} />
+    </div>
+    <span style={{ color: "#4ade80", fontSize: 11, fontWeight: 700, letterSpacing: 0.8 }}>LIVE</span>
   </div>
 );
 
@@ -1433,31 +1430,38 @@ export default function App() {
   ];
 
   return (
-    <div style={{ minHeight: "100vh", background: "#0a0e1a", color: "#e2e8f0", fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', padding: "32px 24px", maxWidth: 1120, margin: "0 auto" }}>
-      <style>{`@keyframes spin { to { transform: rotate(360deg); } } @keyframes shimmer { 0%,100% { opacity: 0.4; } 50% { opacity: 0.8; } }`}</style>
+    <div className="app-bg" style={{ minHeight: "100vh", padding: "32px 24px", maxWidth: 1120, margin: "0 auto" }}>
       {/* Header */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 28 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 32, flexWrap: "wrap", gap: 16 }}>
         <div>
-          <h1 style={{ fontSize: 32, fontWeight: 800, margin: 0, color: "#f8fafc", fontStyle: "italic", letterSpacing: -0.5 }}>{greeting.title}</h1>
-          <p style={{ color: "#64748b", fontSize: 14, margin: "4px 0 0" }}>{greeting.sub}</p>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 2 }}>
+            <span style={{ fontSize: 26, animation: "float 3s ease-in-out infinite", display: "inline-block" }}>{greeting.emoji}</span>
+            <h1 style={{ fontSize: 28, fontWeight: 900, margin: 0, letterSpacing: -0.5 }}>
+              <span className="logo-text">CryptoDawn</span>
+            </h1>
+            <span style={{ fontSize: 12, fontWeight: 700, color: "#334155", border: "1px solid #1e293b", borderRadius: 5, padding: "2px 7px", letterSpacing: 1 }}>
+              {greeting.title.toUpperCase()}
+            </span>
+          </div>
+          <p style={{ color: "#475569", fontSize: 13, margin: 0, paddingLeft: 36 }}>{greeting.sub}</p>
         </div>
-        <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
+        <div className="chain-group">
           {chains.map((chain) => (
-            <button key={chain} onClick={() => setActiveChain(chain)} style={{ padding: "7px 16px", borderRadius: 20, border: "none", fontSize: 13, fontWeight: 600, cursor: "pointer", transition: "all 0.2s", background: activeChain === chain ? "#6366f1" : "transparent", color: activeChain === chain ? "#fff" : "#94a3b8" }}>{chain}</button>
+            <button
+              key={chain}
+              onClick={() => setActiveChain(chain)}
+              className={`chain-btn ${activeChain === chain ? "active" : "inactive"}`}
+            >
+              {chain}
+            </button>
           ))}
         </div>
       </div>
 
-      {/* Good Morning Panel */}
+      {/* Market Overview Panel */}
       <div style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 16, padding: 24, marginBottom: 32 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-            <span style={{ fontSize: 28 }}>{greeting.emoji}</span>
-            <div>
-              <div style={{ fontWeight: 700, fontSize: 17, color: "#f1f5f9" }}>{greeting.panel}</div>
-              <div style={{ color: "#64748b", fontSize: 13 }}>{greeting.sub}</div>
-            </div>
-          </div>
+          <span style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase" }}>Market Overview</span>
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
             <LiveIndicator />
             {(tokenRefreshing || topVolRefreshing) && (
@@ -1466,7 +1470,7 @@ export default function App() {
               </span>
             )}
             {lastFetchedAt && !tokenRefreshing && !topVolRefreshing && (
-              <span style={{ color: "#475569", fontSize: 11 }}>Data from {lastFetchedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+              <span style={{ color: "#334155", fontSize: 11 }}>Updated {lastFetchedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
             )}
           </div>
         </div>
@@ -1486,16 +1490,18 @@ export default function App() {
                 const mcap = data?.usd_market_cap || 0;
                 const positive = change >= 0;
                 return (
-                  <div key={coin.symbol} style={{ background: "#0d1321", border: "1px solid #1e293b", borderRadius: 12, padding: "16px 18px" }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                      <CryptoIcon symbol={coin.symbol} color={coin.color} />
-                      <span style={{ fontWeight: 700, fontSize: 14, color: "#e2e8f0" }}>{coin.symbol}</span>
+                  <div key={coin.symbol} style={{ background: "#0d1321", border: "1px solid #1e293b", borderLeft: `3px solid ${coin.color}`, borderRadius: 12, padding: "16px 18px", boxShadow: `0 0 24px ${coin.color}0a` }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                      <div style={{ width: 28, height: 28, borderRadius: "50%", background: coin.color, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 800, color: "#fff", flexShrink: 0, boxShadow: `0 0 10px ${coin.color}66` }}>
+                        {coin.symbol === "BTC" ? "₿" : coin.symbol === "ETH" ? "Ξ" : "◎"}
+                      </div>
+                      <span style={{ fontWeight: 700, fontSize: 13, color: "#94a3b8", letterSpacing: 0.5 }}>{coin.symbol}</span>
                     </div>
-                    <div style={{ fontSize: 26, fontWeight: 800, color: "#f8fafc", marginBottom: 4 }}>{formatPrice(price)}</div>
-                    <div style={{ fontSize: 14, fontWeight: 600, color: positive ? "#4ade80" : "#f87171", marginBottom: 12 }}>{formatChange(change)}</div>
-                    <div style={{ color: "#64748b", fontSize: 12, lineHeight: 1.6, borderTop: "1px solid #1e293b", paddingTop: 10, display: "flex", flexDirection: "column", gap: 2 }}>
-                      <span>Vol 24h: <span style={{ color: "#94a3b8" }}>{formatVolume(vol)}</span></span>
-                      <span>MCap: <span style={{ color: "#94a3b8" }}>{formatVolume(mcap)}</span></span>
+                    <div style={{ fontSize: 24, fontWeight: 800, color: "#f8fafc", marginBottom: 2, letterSpacing: -0.5 }}>{formatPrice(price)}</div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: positive ? "#4ade80" : "#f87171", marginBottom: 12 }}>{formatChange(change)}</div>
+                    <div style={{ color: "#475569", fontSize: 11, lineHeight: 1.8, borderTop: "1px solid #1e293b", paddingTop: 8, display: "flex", flexDirection: "column", gap: 1 }}>
+                      <span>Vol 24h <span style={{ color: "#64748b" }}>{formatVolume(vol)}</span></span>
+                      <span>MCap <span style={{ color: "#64748b" }}>{formatVolume(mcap)}</span></span>
                     </div>
                   </div>
                 );
@@ -1504,20 +1510,23 @@ export default function App() {
       </div>
 
       {/* Section Nav */}
-      <div style={{ display: "flex", gap: 4, marginBottom: 24, borderBottom: "1px solid #1e293b", paddingBottom: 0 }}>
-        {[
-          { key: "discover", label: "🔥 Discover" },
-          { key: "topvol",   label: "📊 Top Vol" },
-          { key: "wallets",  label: `👜 Wallets${wallets.length > 0 ? ` (${wallets.length})` : ""}` },
-        ].map((s) => (
-          <button
-            key={s.key}
-            onClick={() => setActiveSection(s.key)}
-            style={{ padding: "8px 18px", border: "none", background: "none", color: activeSection === s.key ? "#6366f1" : "#64748b", fontWeight: 700, fontSize: 14, cursor: "pointer", borderBottom: `2px solid ${activeSection === s.key ? "#6366f1" : "transparent"}`, marginBottom: -1, transition: "all 0.15s" }}
-          >
-            {s.label}
-          </button>
-        ))}
+      <div className="gradient-divider" />
+      <div style={{ display: "flex", marginBottom: 28 }}>
+        <div className="tab-group">
+          {[
+            { key: "discover", label: "🔥 Discover" },
+            { key: "topvol",   label: "📊 Top Vol" },
+            { key: "wallets",  label: `👜 Wallets${wallets.length > 0 ? ` (${wallets.length})` : ""}` },
+          ].map((s) => (
+            <button
+              key={s.key}
+              onClick={() => setActiveSection(s.key)}
+              className={`tab-btn ${activeSection === s.key ? "active" : "inactive"}`}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* ─── Discover Section ─── */}
@@ -1613,6 +1622,7 @@ export default function App() {
                     <TokenCard
                       key={`${pair.pairAddress}-${i}`}
                       pair={pair}
+                      rank={i + 1}
                       isPinned={pinnedCAs.some((p) => p.ca === ca)}
                       onPin={pinToken}
                       onUnpin={unpinToken}
@@ -1663,6 +1673,7 @@ export default function App() {
                     <TokenCard
                       key={`topvol-${pair.pairAddress}-${i}`}
                       pair={pair}
+                      rank={i + 1}
                       isPinned={pinnedCAs.some((p) => p.ca === ca)}
                       onPin={pinToken}
                       onUnpin={unpinToken}
@@ -1716,8 +1727,9 @@ export default function App() {
         </>
       )}
 
-      <div style={{ textAlign: "center", color: "#334155", fontSize: 11, marginTop: 40, paddingBottom: 20 }}>
-        Prices from CoinGecko • Tokens from GeckoTerminal • Auto-refreshes every 2 min
+      <div className="gradient-divider" style={{ marginTop: 40, marginBottom: 16 }} />
+      <div style={{ textAlign: "center", color: "#1e293b", fontSize: 11, paddingBottom: 24, letterSpacing: 0.5 }}>
+        CryptoDawn • Prices via CoinGecko • Tokens via GeckoTerminal • Auto-refreshes every 2 min
       </div>
     </div>
   );
