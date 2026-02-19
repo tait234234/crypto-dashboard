@@ -57,6 +57,41 @@ function useCryptoPrices() {
   return { prices, sparklines, loading, error, refetch: fetchPrices };
 }
 
+// ─── Crypto News Hook (CryptoCompare) ───
+function useCryptoNews() {
+  const [articles, setArticles] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const fetchNews = useCallback(async () => {
+    try {
+      const res = await fetch("https://min-api.cryptocompare.com/data/v2/news/?categories=BTC,ETH,SOL&lang=EN&sortOrder=latest");
+      if (!res.ok) throw new Error("News API failed");
+      const json = await res.json();
+      const items = (json.Data || []).slice(0, 12).map((a) => ({
+        id: a.id,
+        title: a.title,
+        url: a.url,
+        source: a.source,
+        image: a.imageurl,
+        time: a.published_on * 1000,
+        categories: a.categories,
+      }));
+      setArticles(items);
+    } catch {
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchNews();
+    const iv = setInterval(fetchNews, 300000); // refresh every 5 min
+    return () => clearInterval(iv);
+  }, [fetchNews]);
+
+  return { articles, loading };
+}
+
 // ─── GeckoTerminal Trending Tokens Hook ───
 function readCache(key) {
   try { return JSON.parse(localStorage.getItem(key) || "null")?.data || []; } catch { return []; }
@@ -1633,6 +1668,7 @@ export default function App() {
   const chains = ["All Chains", "Solana", "Base"];
 
   const { prices, sparklines, loading: priceLoading, error: priceError } = useCryptoPrices();
+  const { articles: newsArticles, loading: newsLoading } = useCryptoNews();
   const { tokens, loading: tokenLoading, refreshing: tokenRefreshing, fetchedAt: tokenFetchedAt, error: tokenError } = useTrendingTokens(activeChain);
 
   // Pinned CAs: [{ca, chainId}]
@@ -1836,6 +1872,51 @@ export default function App() {
                 );
               })}
         </div>
+      </div>
+
+      {/* News Feed */}
+      <div style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 16, padding: "20px 24px", marginBottom: 32 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+          <h2 style={{ fontSize: 16, fontWeight: 800, color: "#e2e8f0", margin: 0, letterSpacing: 0.3 }}>Crypto News</h2>
+          <span style={{ fontSize: 11, color: "#475569" }}>Updates every 5m</span>
+        </div>
+        {newsLoading && newsArticles.length === 0 ? (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 10 }}>
+            {[1,2,3,4].map((i) => (
+              <div key={i} style={{ background: "#0d1321", borderRadius: 10, padding: 14, height: 72 }}>
+                <div style={{ width: "80%", height: 12, background: "#1e293b", borderRadius: 4, marginBottom: 8 }} />
+                <div style={{ width: "50%", height: 10, background: "#1e293b", borderRadius: 4 }} />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 10 }}>
+            {newsArticles.map((a) => {
+              const ago = Date.now() - a.time;
+              const mins = Math.floor(ago / 60000);
+              const timeLabel = mins < 60 ? `${mins}m ago` : mins < 1440 ? `${Math.floor(mins / 60)}h ago` : `${Math.floor(mins / 1440)}d ago`;
+              return (
+                <a
+                  key={a.id}
+                  href={a.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ background: "#0d1321", border: "1px solid #1e293b", borderRadius: 10, padding: "12px 14px", textDecoration: "none", display: "flex", gap: 12, alignItems: "flex-start", transition: "border-color 0.15s" }}
+                  onMouseEnter={(e) => e.currentTarget.style.borderColor = "#334155"}
+                  onMouseLeave={(e) => e.currentTarget.style.borderColor = "#1e293b"}
+                >
+                  {a.image && (
+                    <img src={a.image} alt="" style={{ width: 48, height: 48, borderRadius: 8, objectFit: "cover", flexShrink: 0, background: "#1e293b" }} onError={(e) => e.target.style.display = "none"} />
+                  )}
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: "#cbd5e1", lineHeight: 1.35, marginBottom: 4, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>{a.title}</div>
+                    <div style={{ fontSize: 11, color: "#475569" }}>{a.source} · {timeLabel}</div>
+                  </div>
+                </a>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Section Nav */}
