@@ -1171,6 +1171,359 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank, a
   );
 };
 
+// ─── Wallet Link Graph ───
+const HELIUS_KEY = "0dd8f0ec-f2a5-4f9e-b275-379afa3e73cd";
+
+// Fetch last N transaction signatures for a wallet via Helius enhanced API
+async function fetchWalletTxs(address, limit = 40) {
+  try {
+    const res = await fetch(
+      `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_KEY}&limit=${limit}&type=TRANSFER`
+    );
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+// Extract all counterparty addresses from a Helius enhanced transaction
+function extractCounterparties(tx, ownAddress) {
+  const addrs = new Set();
+  // Native SOL transfers
+  (tx.nativeTransfers || []).forEach((t) => {
+    if (t.fromUserAccount && t.fromUserAccount !== ownAddress) addrs.add(t.fromUserAccount);
+    if (t.toUserAccount && t.toUserAccount !== ownAddress) addrs.add(t.toUserAccount);
+  });
+  // SPL token transfers
+  (tx.tokenTransfers || []).forEach((t) => {
+    if (t.fromUserAccount && t.fromUserAccount !== ownAddress) addrs.add(t.fromUserAccount);
+    if (t.toUserAccount && t.toUserAccount !== ownAddress) addrs.add(t.toUserAccount);
+  });
+  return [...addrs];
+}
+
+// Hook: given walletMintMap + wallets, compute all link edges between wallets
+function useWalletLinks(wallets, walletMintMap) {
+  const [links, setLinks] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const addrs = wallets.map((w) => w.address);
+
+  useEffect(() => {
+    if (wallets.length < 2) { setLinks([]); return; }
+    const addrSet = new Set(addrs);
+    let cancelled = false;
+
+    const run = async () => {
+      setLoading(true);
+      const edgeMap = new Map(); // key: "addrA:addrB" (sorted) → {types, sharedTokens, directTxCount}
+
+      const ensureEdge = (a, b) => {
+        const key = [a, b].sort().join(":");
+        if (!edgeMap.has(key)) edgeMap.set(key, { a: key.split(":")[0], b: key.split(":")[1], types: new Set(), sharedTokens: [], directTxCount: 0 });
+        return edgeMap.get(key);
+      };
+
+      // ── Signal 1: shared token holdings ──
+      Object.entries(walletMintMap).forEach(([, holders]) => {
+        const holdingAddrs = holders.map((h) => h.address).filter((a) => addrSet.has(a));
+        for (let i = 0; i < holdingAddrs.length; i++) {
+          for (let j = i + 1; j < holdingAddrs.length; j++) {
+            const edge = ensureEdge(holdingAddrs[i], holdingAddrs[j]);
+            edge.types.add("shared_token");
+            const mintEntry = holders[0]; // get symbol from first holder's pair data
+            if (mintEntry?.pair?.baseToken?.symbol) edge.sharedTokens.push(mintEntry.pair.baseToken.symbol);
+          }
+        }
+      });
+
+      // ── Signal 2: transaction-level links (direct transfers + common funder) ──
+      const txsByWallet = new Map();
+      await Promise.all(
+        addrs.map(async (addr) => {
+          const txs = await fetchWalletTxs(addr, 50);
+          if (!cancelled) txsByWallet.set(addr, txs);
+        })
+      );
+      if (cancelled) return;
+
+      // Direct transfers between tracked wallets
+      addrs.forEach((addr) => {
+        const txs = txsByWallet.get(addr) || [];
+        txs.forEach((tx) => {
+          const counterparties = extractCounterparties(tx, addr);
+          counterparties.forEach((cp) => {
+            if (addrSet.has(cp) && cp !== addr) {
+              const edge = ensureEdge(addr, cp);
+              edge.types.add("direct_transfer");
+              edge.directTxCount++;
+            }
+          });
+        });
+      });
+
+      // Common funder: wallets that share a counterparty NOT in the tracked set
+      // Build: externalAddr → Set<trackedWallet>
+      const externalMap = new Map();
+      addrs.forEach((addr) => {
+        const txs = txsByWallet.get(addr) || [];
+        const seen = new Set();
+        txs.forEach((tx) => {
+          extractCounterparties(tx, addr).forEach((cp) => {
+            if (!addrSet.has(cp) && !seen.has(cp)) {
+              seen.add(cp);
+              if (!externalMap.has(cp)) externalMap.set(cp, new Set());
+              externalMap.get(cp).add(addr);
+            }
+          });
+        });
+      });
+      externalMap.forEach((walletSet, funder) => {
+        if (walletSet.size < 2) return;
+        const arr = [...walletSet];
+        for (let i = 0; i < arr.length; i++) {
+          for (let j = i + 1; j < arr.length; j++) {
+            const edge = ensureEdge(arr[i], arr[j]);
+            edge.types.add("common_funder");
+            if (!edge.commonFunders) edge.commonFunders = [];
+            edge.commonFunders.push(funder);
+          }
+        }
+      });
+
+      if (!cancelled) {
+        // Deduplicate sharedTokens and commonFunders per edge
+        const result = [];
+        edgeMap.forEach((edge) => {
+          result.push({
+            ...edge,
+            types: [...edge.types],
+            sharedTokens: [...new Set(edge.sharedTokens)].slice(0, 5),
+            commonFunders: (edge.commonFunders || []).slice(0, 3),
+          });
+        });
+        setLinks(result);
+        setLoading(false);
+      }
+    };
+
+    run();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wallets.length, JSON.stringify(addrs), Object.keys(walletMintMap).length]);
+
+  return { links, loading };
+}
+
+// Tiny force-layout: push nodes apart, pull linked nodes together
+function useForceLayout(nodeCount, edges, width, height) {
+  const [positions, setPositions] = useState(() => {
+    const pos = [];
+    for (let i = 0; i < nodeCount; i++) {
+      const angle = (2 * Math.PI * i) / Math.max(nodeCount, 1);
+      const r = Math.min(width, height) * 0.3;
+      pos.push({ x: width / 2 + r * Math.cos(angle), y: height / 2 + r * Math.sin(angle) });
+    }
+    return pos;
+  });
+
+  useEffect(() => {
+    if (nodeCount === 0) return;
+    let pos = [];
+    for (let i = 0; i < nodeCount; i++) {
+      const angle = (2 * Math.PI * i) / Math.max(nodeCount, 1);
+      const r = Math.min(width, height) * 0.3;
+      pos.push({ x: width / 2 + r * Math.cos(angle), y: height / 2 + r * Math.sin(angle) });
+    }
+
+    const ITERATIONS = 120;
+    const REPULSE = 4000;
+    const ATTRACT = 0.04;
+    const pad = 60;
+
+    for (let iter = 0; iter < ITERATIONS; iter++) {
+      const forces = pos.map(() => ({ fx: 0, fy: 0 }));
+      // Repulsion between all pairs
+      for (let i = 0; i < nodeCount; i++) {
+        for (let j = i + 1; j < nodeCount; j++) {
+          const dx = pos[i].x - pos[j].x;
+          const dy = pos[i].y - pos[j].y;
+          const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+          const f = REPULSE / (dist * dist);
+          forces[i].fx += (dx / dist) * f;
+          forces[i].fy += (dy / dist) * f;
+          forces[j].fx -= (dx / dist) * f;
+          forces[j].fy -= (dy / dist) * f;
+        }
+      }
+      // Attraction along edges
+      edges.forEach(({ idxA, idxB }) => {
+        const dx = pos[idxB].x - pos[idxA].x;
+        const dy = pos[idxB].y - pos[idxA].y;
+        forces[idxA].fx += dx * ATTRACT;
+        forces[idxA].fy += dy * ATTRACT;
+        forces[idxB].fx -= dx * ATTRACT;
+        forces[idxB].fy -= dy * ATTRACT;
+      });
+      // Apply, clamped to canvas
+      pos = pos.map((p, i) => ({
+        x: Math.max(pad, Math.min(width - pad, p.x + forces[i].fx)),
+        y: Math.max(pad, Math.min(height - pad, p.y + forces[i].fy)),
+      }));
+    }
+    setPositions(pos);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeCount, edges.length, width, height]);
+
+  return positions;
+}
+
+const LINK_COLORS = {
+  direct_transfer: "#4ade80",
+  shared_token:    "#38bdf8",
+  common_funder:   "#f59e0b",
+};
+const LINK_LABELS = {
+  direct_transfer: "Direct tx",
+  shared_token:    "Shared token",
+  common_funder:   "Common funder",
+};
+
+function WalletGraph({ wallets, links, loading }) {
+  const W = 640, H = 320;
+  const [tooltip, setTooltip] = useState(null); // {x,y,edge}
+
+  const addrToIdx = useMemo(() => {
+    const m = new Map();
+    wallets.forEach((w, i) => m.set(w.address, i));
+    return m;
+  }, [wallets]);
+
+  const edgesWithIdx = useMemo(() =>
+    links
+      .map((l) => ({ ...l, idxA: addrToIdx.get(l.a), idxB: addrToIdx.get(l.b) }))
+      .filter((l) => l.idxA !== undefined && l.idxB !== undefined),
+    [links, addrToIdx]
+  );
+
+  const positions = useForceLayout(wallets.length, edgesWithIdx, W, H);
+
+  const truncAddr = (a) => `${a.slice(0, 4)}…${a.slice(-4)}`;
+
+  if (wallets.length < 2) return null;
+
+  return (
+    <div style={{ background: "#0d1321", border: "1px solid #1e293b", borderRadius: 14, padding: "18px 20px", marginBottom: 24, position: "relative" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <div>
+          <h3 style={{ margin: 0, fontSize: 13, fontWeight: 800, color: "#e2e8f0", letterSpacing: 0.5 }}>Wallet Connection Graph</h3>
+          <div style={{ fontSize: 11, color: "#475569", marginTop: 2 }}>Links between tracked wallets — based on shared tokens, direct transfers &amp; common funders</div>
+        </div>
+        {loading && <div style={{ fontSize: 11, color: "#38bdf8", animation: "pulse-dot 1.5s infinite" }}>Analysing…</div>}
+      </div>
+
+      {/* Legend */}
+      <div style={{ display: "flex", gap: 14, marginBottom: 10, flexWrap: "wrap" }}>
+        {Object.entries(LINK_LABELS).map(([type, label]) => (
+          <div key={type} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: "#64748b" }}>
+            <div style={{ width: 18, height: 2, background: LINK_COLORS[type], borderRadius: 1 }} />
+            {label}
+          </div>
+        ))}
+      </div>
+
+      <div style={{ position: "relative" }}>
+        <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: "block", overflow: "visible" }}>
+          <defs>
+            {Object.entries(LINK_COLORS).map(([type, color]) => (
+              <marker key={type} id={`arrow-${type}`} markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+                <path d="M0,0 L0,6 L6,3 z" fill={color} opacity="0.7" />
+              </marker>
+            ))}
+          </defs>
+
+          {/* Edges */}
+          {edgesWithIdx.map((edge, ei) => {
+            const pa = positions[edge.idxA];
+            const pb = positions[edge.idxB];
+            if (!pa || !pb) return null;
+            // One line per link type
+            return edge.types.map((type, ti) => {
+              const offset = (ti - (edge.types.length - 1) / 2) * 5;
+              const dx = pb.x - pa.x, dy = pb.y - pa.y;
+              const len = Math.sqrt(dx * dx + dy * dy) || 1;
+              const nx = -dy / len * offset, ny = dx / len * offset;
+              const mx = (pa.x + pb.x) / 2 + nx, my = (pa.y + pb.y) / 2 + ny;
+              const color = LINK_COLORS[type] || "#64748b";
+              return (
+                <g key={`${ei}-${type}`}
+                  style={{ cursor: "pointer" }}
+                  onMouseEnter={(e) => setTooltip({ x: mx, y: my, edge })}
+                  onMouseLeave={() => setTooltip(null)}
+                >
+                  <line x1={pa.x + nx} y1={pa.y + ny} x2={pb.x + nx} y2={pb.y + ny}
+                    stroke={color} strokeWidth="2" strokeOpacity="0.7"
+                    markerEnd={`url(#arrow-${type})`} />
+                  {/* Invisible thick hit area */}
+                  <line x1={pa.x + nx} y1={pa.y + ny} x2={pb.x + nx} y2={pb.y + ny}
+                    stroke="transparent" strokeWidth="12" />
+                </g>
+              );
+            });
+          })}
+
+          {/* Nodes */}
+          {wallets.map((w, i) => {
+            const p = positions[i];
+            if (!p) return null;
+            const hasLinks = edgesWithIdx.some((e) => e.idxA === i || e.idxB === i);
+            const label = w.label || truncAddr(w.address);
+            return (
+              <g key={w.address}>
+                <circle cx={p.x} cy={p.y} r={20} fill="#111827" stroke={hasLinks ? "#6366f1" : "#334155"} strokeWidth={hasLinks ? 2 : 1} />
+                <text x={p.x} y={p.y + 1} textAnchor="middle" dominantBaseline="middle" fontSize="9" fill="#94a3b8" fontWeight="700">
+                  {label.length > 10 ? label.slice(0, 9) + "…" : label}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
+
+        {/* Edge tooltip */}
+        {tooltip && (() => {
+          const { edge } = tooltip;
+          const wa = wallets.find((w) => w.address === edge.a);
+          const wb = wallets.find((w) => w.address === edge.b);
+          return (
+            <div style={{ position: "absolute", top: tooltip.y, left: Math.min(tooltip.x, W - 220), transform: "translate(-50%, -110%)", background: "#1e293b", border: "1px solid #334155", borderRadius: 8, padding: "10px 12px", minWidth: 200, pointerEvents: "none", zIndex: 10, fontSize: 11, color: "#cbd5e1" }}>
+              <div style={{ fontWeight: 700, marginBottom: 6, fontSize: 12 }}>
+                {wa?.label || truncAddr(edge.a)} ↔ {wb?.label || truncAddr(edge.b)}
+              </div>
+              {edge.types.map((type) => (
+                <div key={type} style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 3 }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: LINK_COLORS[type], flexShrink: 0 }} />
+                  <span style={{ color: LINK_COLORS[type] }}>{LINK_LABELS[type]}</span>
+                  {type === "direct_transfer" && edge.directTxCount > 0 && <span style={{ color: "#64748b" }}>({edge.directTxCount} txs)</span>}
+                </div>
+              ))}
+              {edge.sharedTokens.length > 0 && (
+                <div style={{ marginTop: 5, color: "#64748b" }}>Tokens: <span style={{ color: "#38bdf8" }}>{edge.sharedTokens.join(", ")}</span></div>
+              )}
+              {edge.commonFunders?.length > 0 && (
+                <div style={{ marginTop: 4, color: "#64748b" }}>Via: <span style={{ color: "#f59e0b", fontFamily: "monospace", fontSize: 10 }}>{edge.commonFunders[0].slice(0, 8)}…</span></div>
+              )}
+            </div>
+          );
+        })()}
+      </div>
+
+      {!loading && links.length === 0 && (
+        <div style={{ textAlign: "center", color: "#334155", fontSize: 12, padding: "18px 0" }}>No connections found between these wallets</div>
+      )}
+    </div>
+  );
+}
+
 // ─── Wallet Card ───
 const WalletHoldingRow = ({ holding }) => {
   const { pair, amount, mint } = holding;
@@ -1790,6 +2143,7 @@ export default function App() {
 
   // mint → [{address, label, amount, usdValue}] across all tracked wallets
   const [walletMintMap, setWalletMintMap] = useState({});
+  const { links: walletLinks, loading: walletLinksLoading } = useWalletLinks(wallets, walletMintMap);
   const handleHoldingsLoaded = useCallback((walletAddr, walletLabel, holdings) => {
     setWalletMintMap((prev) => {
       const next = { ...prev };
@@ -2171,6 +2525,8 @@ export default function App() {
               <div>Add a Solana wallet address to see its token positions</div>
             </div>
           )}
+
+          <WalletGraph wallets={wallets} links={walletLinks} loading={walletLinksLoading} />
 
           {wallets.map((wallet) => (
             <WalletCard key={wallet.address} wallet={wallet} onRemove={removeWallet} onHoldingsLoaded={handleHoldingsLoaded} />
