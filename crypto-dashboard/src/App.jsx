@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 
 // ─── Live Price Hook (CoinGecko) ───
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
 function useCryptoPrices() {
   const [prices, setPrices] = useState(null);
   const [sparklines, setSparklines] = useState({});
@@ -26,17 +28,18 @@ function useCryptoPrices() {
   const fetchSparklines = useCallback(async () => {
     const ids = ["bitcoin", "ethereum", "solana"];
     const result = {};
-    for (const id of ids) {
+    for (let i = 0; i < ids.length; i++) {
+      if (i > 0) await delay(1500); // CoinGecko free tier rate limit
       try {
         const res = await fetch(
-          `https://api.coingecko.com/api/v3/coins/${id}/market_chart?vs_currency=usd&days=1`
+          `https://api.coingecko.com/api/v3/coins/${ids[i]}/market_chart?vs_currency=usd&days=1`
         );
+        if (res.status === 429) { await delay(3000); continue; } // back off on 429
         if (!res.ok) continue;
         const data = await res.json();
         const raw = data.prices || []; // [[timestamp, price], ...]
-        // Downsample to ~50 points for a clean sparkline
         const step = Math.max(1, Math.floor(raw.length / 50));
-        result[id] = raw.filter((_, i) => i % step === 0);
+        result[ids[i]] = raw.filter((_, j) => j % step === 0);
       } catch {}
     }
     if (Object.keys(result).length > 0) setSparklines(result);
@@ -44,10 +47,11 @@ function useCryptoPrices() {
 
   useEffect(() => {
     fetchPrices();
-    fetchSparklines();
+    // Delay sparkline fetch to avoid competing with price fetch for rate limit
+    const sparkTimeout = setTimeout(fetchSparklines, 2000);
     const priceInterval = setInterval(fetchPrices, 60000);
-    const sparklineInterval = setInterval(fetchSparklines, 300000); // every 5 min
-    return () => { clearInterval(priceInterval); clearInterval(sparklineInterval); };
+    const sparklineInterval = setInterval(fetchSparklines, 300000);
+    return () => { clearTimeout(sparkTimeout); clearInterval(priceInterval); clearInterval(sparklineInterval); };
   }, [fetchPrices, fetchSparklines]);
 
   return { prices, sparklines, loading, error, refetch: fetchPrices };
@@ -265,7 +269,9 @@ function usePinnedTokens(pinnedCAs) {
 const SOLANA_RPCS = [
   "https://mainnet.helius-rpc.com/?api-key=0dd8f0ec-f2a5-4f9e-b275-379afa3e73cd",
   "https://api.mainnet-beta.solana.com",
+  "https://solana-mainnet.g.alchemy.com/v2/demo",
   "https://rpc.ankr.com/solana",
+  "https://solana.public-rpc.com",
 ];
 
 async function postRPC(body) {
@@ -277,14 +283,19 @@ async function postRPC(body) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      if (res.status === 403) { lastErr = new Error("RPC access denied — try again later"); continue; }
-      if (res.status === 429) { lastErr = new Error("Rate limited — try again in a moment"); continue; }
+      if (res.status === 403) { lastErr = new Error("RPC access denied"); continue; }
+      if (res.status === 429) { lastErr = new Error("Rate limited"); await delay(1000); continue; }
       if (!res.ok)            { lastErr = new Error(`RPC error HTTP ${res.status}`); continue; }
       const data = await res.json();
-      // RPC-level error is the same on all nodes, so don't retry
-      if (data.error) throw new Error(data.error.message || "RPC error");
+      if (data.error) {
+        // Some errors (like method not found) won't be different on other nodes
+        if (data.error.code === -32601) throw new Error(data.error.message || "RPC error");
+        lastErr = new Error(data.error.message || "RPC error");
+        continue; // try next endpoint for transient RPC errors
+      }
       return data;
     } catch (e) {
+      if (e.message?.includes("RPC error")) throw e; // non-retryable
       lastErr = e;
     }
   }
@@ -422,17 +433,17 @@ function usePoolChart(chainId, poolAddress, enabled) {
   const fetchedRef = useRef(null);
 
   useEffect(() => {
-    if (!enabled || !poolAddress || !chainId) { setData(null); return; }
+    if (!enabled || !poolAddress || !chainId) return; // don't clear data on disable so it persists if re-toggled
     const cacheKey = `${chainId}:${poolAddress}`;
-    if (fetchedRef.current === cacheKey && data) return; // already fetched this pool
+    if (fetchedRef.current === cacheKey) return; // already fetched this pool
     let cancelled = false;
     const run = async () => {
       setLoading(true);
       try {
         const network = chainId === "base" ? "base" : "solana";
-        const res = await fetch(
-          `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/ohlcv/hour?aggregate=1&limit=24`
-        );
+        const url = `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/ohlcv/hour?aggregate=1&limit=24`;
+        let res = await fetch(url);
+        if (res.status === 429) { await delay(2000); res = await fetch(url); } // one retry on rate limit
         if (!res.ok) throw new Error("OHLCV fetch failed");
         const json = await res.json();
         const candles = json.data?.attributes?.ohlcv_list || [];
@@ -441,9 +452,12 @@ function usePoolChart(chainId, poolAddress, enabled) {
           .slice()
           .reverse()
           .map((c) => [c[0] * 1000, c[4]]); // [timestamp_ms, close_price]
-        if (!cancelled) { setData(points); fetchedRef.current = cacheKey; }
+        if (!cancelled) {
+          setData(points.length >= 2 ? points : null);
+          fetchedRef.current = cacheKey;
+        }
       } catch {
-        if (!cancelled) setData(null);
+        if (!cancelled) { setData(null); fetchedRef.current = cacheKey; }
       } finally {
         if (!cancelled) setLoading(false);
       }
