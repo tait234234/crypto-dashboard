@@ -1203,9 +1203,10 @@ function extractCounterparties(tx, ownAddress) {
   return [...addrs];
 }
 
-// Hook: given walletMintMap + wallets, compute all link edges between wallets
+// Hook: given walletMintMap + wallets, compute all link edges + discover related untracked wallets
 function useWalletLinks(wallets, walletMintMap) {
   const [links, setLinks] = useState([]);
+  const [relatedWallets, setRelatedWallets] = useState([]); // [{address, sharedWith: [addr], txCount, reason}]
   const [loading, setLoading] = useState(false);
   const addrs = wallets.map((w) => w.address);
 
@@ -1262,23 +1263,24 @@ function useWalletLinks(wallets, walletMintMap) {
         });
       });
 
-      // Common funder: wallets that share a counterparty NOT in the tracked set
-      // Build: externalAddr → Set<trackedWallet>
-      const externalMap = new Map();
+      // Common funder + related wallet discovery:
+      // Build: externalAddr → { wallets: Set<trackedAddr>, txCount: number }
+      const externalMap = new Map(); // externalAddr → { wallets: Set, txCount }
       addrs.forEach((addr) => {
         const txs = txsByWallet.get(addr) || [];
-        const seen = new Set();
         txs.forEach((tx) => {
           extractCounterparties(tx, addr).forEach((cp) => {
-            if (!addrSet.has(cp) && !seen.has(cp)) {
-              seen.add(cp);
-              if (!externalMap.has(cp)) externalMap.set(cp, new Set());
-              externalMap.get(cp).add(addr);
+            if (!addrSet.has(cp)) {
+              if (!externalMap.has(cp)) externalMap.set(cp, { wallets: new Set(), txCount: 0 });
+              externalMap.get(cp).wallets.add(addr);
+              externalMap.get(cp).txCount++;
             }
           });
         });
       });
-      externalMap.forEach((walletSet, funder) => {
+
+      // Common funder edges (external addr appeared in 2+ tracked wallets)
+      externalMap.forEach(({ wallets: walletSet, txCount }, funder) => {
         if (walletSet.size < 2) return;
         const arr = [...walletSet];
         for (let i = 0; i < arr.length; i++) {
@@ -1290,6 +1292,23 @@ function useWalletLinks(wallets, walletMintMap) {
           }
         }
       });
+
+      // Related wallet discovery: external addresses that interacted with ANY tracked wallet
+      // Sort by: (number of distinct tracked wallets it touched) desc, then txCount desc
+      const related = [];
+      externalMap.forEach(({ wallets: walletSet, txCount }, extAddr) => {
+        related.push({
+          address: extAddr,
+          sharedWith: [...walletSet],
+          txCount,
+          // Label wallets by their names
+          sharedWithLabels: [...walletSet].map((a) => {
+            const w = wallets.find((x) => x.address === a);
+            return w?.label || `${a.slice(0, 4)}…${a.slice(-4)}`;
+          }),
+        });
+      });
+      related.sort((a, b) => b.sharedWith.length - a.sharedWith.length || b.txCount - a.txCount);
 
       if (!cancelled) {
         // Deduplicate sharedTokens and commonFunders per edge
@@ -1303,6 +1322,7 @@ function useWalletLinks(wallets, walletMintMap) {
           });
         });
         setLinks(result);
+        setRelatedWallets(related.slice(0, 20)); // top 20 related wallets
         setLoading(false);
       }
     };
@@ -1312,7 +1332,7 @@ function useWalletLinks(wallets, walletMintMap) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wallets.length, JSON.stringify(addrs), Object.keys(walletMintMap).length]);
 
-  return { links, loading };
+  return { links, relatedWallets, loading };
 }
 
 // Tiny force-layout: push nodes apart, pull linked nodes together
@@ -1432,8 +1452,8 @@ function WalletGraph({ wallets, links, loading }) {
         ))}
       </div>
 
-      <div style={{ position: "relative" }}>
-        <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: "block", overflow: "visible" }}>
+      <div style={{ position: "relative", overflow: "hidden", borderRadius: 8 }}>
+        <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: "block" }}>
           <defs>
             {Object.entries(LINK_COLORS).map(([type, color]) => (
               <marker key={type} id={`arrow-${type}`} markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
@@ -1487,39 +1507,139 @@ function WalletGraph({ wallets, links, loading }) {
               </g>
             );
           })}
+          {/* Tooltip inside SVG */}
+          {tooltip && (() => {
+            const { edge } = tooltip;
+            const wa = wallets.find((w) => w.address === edge.a);
+            const wb = wallets.find((w) => w.address === edge.b);
+            const TW = 210, TH = 20 + edge.types.length * 16 + (edge.sharedTokens.length > 0 ? 18 : 0) + (edge.commonFunders?.length > 0 ? 16 : 0);
+            const tx = Math.max(4, Math.min(tooltip.x - TW / 2, W - TW - 4));
+            const ty = Math.max(4, tooltip.y - TH - 10);
+            return (
+              <g style={{ pointerEvents: "none" }}>
+                <rect x={tx} y={ty} width={TW} height={TH} rx="6" fill="#1e293b" stroke="#334155" strokeWidth="1" />
+                <text x={tx + 10} y={ty + 14} fontSize="10" fontWeight="700" fill="#e2e8f0">{(wa?.label || truncAddr(edge.a))} ↔ {(wb?.label || truncAddr(edge.b))}</text>
+                {edge.types.map((type, ti) => (
+                  <g key={type}>
+                    <circle cx={tx + 14} cy={ty + 26 + ti * 16} r="4" fill={LINK_COLORS[type]} />
+                    <text x={tx + 24} y={ty + 30 + ti * 16} fontSize="9" fill={LINK_COLORS[type]}>{LINK_LABELS[type]}{type === "direct_transfer" && edge.directTxCount > 0 ? ` (${edge.directTxCount})` : ""}</text>
+                  </g>
+                ))}
+                {edge.sharedTokens.length > 0 && (
+                  <text x={tx + 10} y={ty + 26 + edge.types.length * 16 + 10} fontSize="9" fill="#38bdf8">Tokens: {edge.sharedTokens.slice(0, 4).join(", ")}</text>
+                )}
+                {edge.commonFunders?.length > 0 && (
+                  <text x={tx + 10} y={ty + 26 + edge.types.length * 16 + (edge.sharedTokens.length > 0 ? 26 : 10)} fontSize="9" fill="#f59e0b">Via: {edge.commonFunders[0].slice(0, 12)}…</text>
+                )}
+              </g>
+            );
+          })()}
         </svg>
-
-        {/* Edge tooltip */}
-        {tooltip && (() => {
-          const { edge } = tooltip;
-          const wa = wallets.find((w) => w.address === edge.a);
-          const wb = wallets.find((w) => w.address === edge.b);
-          return (
-            <div style={{ position: "absolute", top: tooltip.y, left: Math.min(tooltip.x, W - 220), transform: "translate(-50%, -110%)", background: "#1e293b", border: "1px solid #334155", borderRadius: 8, padding: "10px 12px", minWidth: 200, pointerEvents: "none", zIndex: 10, fontSize: 11, color: "#cbd5e1" }}>
-              <div style={{ fontWeight: 700, marginBottom: 6, fontSize: 12 }}>
-                {wa?.label || truncAddr(edge.a)} ↔ {wb?.label || truncAddr(edge.b)}
-              </div>
-              {edge.types.map((type) => (
-                <div key={type} style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 3 }}>
-                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: LINK_COLORS[type], flexShrink: 0 }} />
-                  <span style={{ color: LINK_COLORS[type] }}>{LINK_LABELS[type]}</span>
-                  {type === "direct_transfer" && edge.directTxCount > 0 && <span style={{ color: "#64748b" }}>({edge.directTxCount} txs)</span>}
-                </div>
-              ))}
-              {edge.sharedTokens.length > 0 && (
-                <div style={{ marginTop: 5, color: "#64748b" }}>Tokens: <span style={{ color: "#38bdf8" }}>{edge.sharedTokens.join(", ")}</span></div>
-              )}
-              {edge.commonFunders?.length > 0 && (
-                <div style={{ marginTop: 4, color: "#64748b" }}>Via: <span style={{ color: "#f59e0b", fontFamily: "monospace", fontSize: 10 }}>{edge.commonFunders[0].slice(0, 8)}…</span></div>
-              )}
-            </div>
-          );
-        })()}
       </div>
 
       {!loading && links.length === 0 && (
         <div style={{ textAlign: "center", color: "#334155", fontSize: 12, padding: "18px 0" }}>No connections found between these wallets</div>
       )}
+    </div>
+  );
+}
+
+// ─── Related Wallets Panel ───
+function RelatedWallets({ relatedWallets, trackedAddrs, loading, onTrack }) {
+  const [expanded, setExpanded] = useState(false);
+  const [tracked, setTracked] = useState(new Set()); // locally tracked within this session
+
+  if (loading) return null; // don't flash empty while analysing
+  if (!relatedWallets.length) return null;
+
+  // Partition into "linked to 2+ wallets" (strong signal) vs "linked to 1 wallet" (weak)
+  const strong = relatedWallets.filter((r) => r.sharedWith.length >= 2);
+  const weak   = relatedWallets.filter((r) => r.sharedWith.length < 2);
+  const shown  = expanded ? relatedWallets : strong.length > 0 ? strong : weak.slice(0, 5);
+
+  const truncAddr = (a) => `${a.slice(0, 6)}…${a.slice(-6)}`;
+
+  return (
+    <div style={{ background: "#0d1321", border: "1px solid #1e293b", borderRadius: 14, padding: "16px 20px", marginBottom: 20 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+        <div>
+          <h3 style={{ margin: 0, fontSize: 13, fontWeight: 800, color: "#e2e8f0", letterSpacing: 0.5 }}>
+            Potentially Related Wallets
+            <span style={{ marginLeft: 8, background: "#f59e0b22", color: "#f59e0b", border: "1px solid #f59e0b44", borderRadius: 4, fontSize: 10, fontWeight: 700, padding: "1px 6px" }}>{relatedWallets.length}</span>
+          </h3>
+          <div style={{ fontSize: 11, color: "#475569", marginTop: 2 }}>
+            Addresses that transacted with your tracked wallets — not yet added to tracker
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {shown.map((r) => {
+          const isAlreadyTracked = trackedAddrs.has(r.address) || tracked.has(r.address);
+          const isStrong = r.sharedWith.length >= 2;
+          return (
+            <div key={r.address} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", background: "#111827", borderRadius: 8, border: `1px solid ${isStrong ? "#f59e0b33" : "#1e293b"}` }}>
+              {/* Signal badge */}
+              <div style={{ flexShrink: 0, width: 6, height: 6, borderRadius: "50%", background: isStrong ? "#f59e0b" : "#334155" }} title={isStrong ? "Linked to multiple tracked wallets" : "Linked to 1 tracked wallet"} />
+
+              {/* Address */}
+              <span style={{ fontFamily: "monospace", fontSize: 11, color: "#94a3b8", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {r.address}
+              </span>
+
+              {/* Tags */}
+              <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                {isStrong && (
+                  <span style={{ background: "#f59e0b22", color: "#f59e0b", border: "1px solid #f59e0b44", borderRadius: 4, fontSize: 9, fontWeight: 700, padding: "1px 5px", whiteSpace: "nowrap" }}>
+                    {r.sharedWith.length} wallets
+                  </span>
+                )}
+                <span style={{ background: "#1e293b", color: "#475569", borderRadius: 4, fontSize: 9, padding: "1px 5px", whiteSpace: "nowrap" }}>
+                  {r.txCount} tx{r.txCount !== 1 ? "s" : ""}
+                </span>
+                {r.sharedWithLabels.slice(0, 2).map((lbl, i) => (
+                  <span key={i} style={{ background: "#6366f122", color: "#818cf8", border: "1px solid #6366f133", borderRadius: 4, fontSize: 9, padding: "1px 5px", whiteSpace: "nowrap" }}>
+                    {lbl}
+                  </span>
+                ))}
+              </div>
+
+              {/* Copy + Track */}
+              <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                <button
+                  onClick={() => navigator.clipboard?.writeText(r.address)}
+                  title="Copy address"
+                  style={{ width: 24, height: 24, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", color: "#64748b", fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+                >
+                  ⎘
+                </button>
+                <button
+                  onClick={() => { onTrack(r.address, ""); setTracked((prev) => new Set([...prev, r.address])); }}
+                  disabled={isAlreadyTracked}
+                  title={isAlreadyTracked ? "Already tracked" : "Add to tracker"}
+                  style={{ padding: "2px 8px", height: 24, borderRadius: 5, background: isAlreadyTracked ? "#1e293b" : "#4ade8022", border: `1px solid ${isAlreadyTracked ? "#334155" : "#4ade8044"}`, color: isAlreadyTracked ? "#334155" : "#4ade80", fontSize: 10, fontWeight: 700, cursor: isAlreadyTracked ? "default" : "pointer", whiteSpace: "nowrap" }}
+                >
+                  {isAlreadyTracked ? "✓ tracked" : "+ Track"}
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Show more / less toggle */}
+      {(weak.length > 0 || (strong.length === 0 && weak.length > 5)) && (
+        <button
+          onClick={() => setExpanded((v) => !v)}
+          style={{ marginTop: 10, width: "100%", padding: "6px 0", background: "transparent", border: "1px dashed #1e293b", borderRadius: 6, color: "#475569", fontSize: 11, cursor: "pointer" }}
+        >
+          {expanded ? `Show less` : `Show ${weak.length} more (weaker signal)`}
+        </button>
+      )}
+
+      <div style={{ fontSize: 10, color: "#1e293b", marginTop: 8 }}>
+        Based on last 50 transactions per wallet via Helius • Amber dot = linked to 2+ of your wallets
+      </div>
     </div>
   );
 }
@@ -2143,7 +2263,7 @@ export default function App() {
 
   // mint → [{address, label, amount, usdValue}] across all tracked wallets
   const [walletMintMap, setWalletMintMap] = useState({});
-  const { links: walletLinks, loading: walletLinksLoading } = useWalletLinks(wallets, walletMintMap);
+  const { links: walletLinks, relatedWallets: relatedWalletList, loading: walletLinksLoading } = useWalletLinks(wallets, walletMintMap);
   const handleHoldingsLoaded = useCallback((walletAddr, walletLabel, holdings) => {
     setWalletMintMap((prev) => {
       const next = { ...prev };
@@ -2527,6 +2647,13 @@ export default function App() {
           )}
 
           <WalletGraph wallets={wallets} links={walletLinks} loading={walletLinksLoading} />
+
+          <RelatedWallets
+            relatedWallets={relatedWalletList}
+            trackedAddrs={new Set(wallets.map((w) => w.address))}
+            loading={walletLinksLoading}
+            onTrack={addWallet}
+          />
 
           {wallets.map((wallet) => (
             <WalletCard key={wallet.address} wallet={wallet} onRemove={removeWallet} onHoldingsLoaded={handleHoldingsLoaded} />
