@@ -95,6 +95,36 @@ function useCryptoNews() {
   return { articles, loading, error };
 }
 
+// ─── Per-Coin News Hook (cryptocurrency.cv search) ───
+function useCoinNews(keyword) {
+  const [articles, setArticles] = useState(null); // null = not yet loaded
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setArticles(null);
+    fetch(`https://cryptocurrency.cv/api/search?q=${encodeURIComponent(keyword)}&limit=3`)
+      .then((r) => r.ok ? r.json() : Promise.reject(r.status))
+      .then((json) => {
+        if (cancelled) return;
+        const items = (json.articles || []).slice(0, 3).map((a, i) => ({
+          id: i,
+          title: a.title,
+          url: a.link,
+          source: a.source,
+          timeAgo: a.timeAgo || "",
+        }));
+        setArticles(items);
+      })
+      .catch(() => { if (!cancelled) setArticles([]); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [keyword]);
+
+  return { articles, loading };
+}
+
 // ─── GeckoTerminal Trending Tokens Hook ───
 function readCache(key) {
   try { return JSON.parse(localStorage.getItem(key) || "null")?.data || []; } catch { return []; }
@@ -494,7 +524,6 @@ const CHAIN_TO_GT_NETWORK = {
 // Timeframe → { timespan, aggregate, limit } for GeckoTerminal OHLCV API
 const TF_CONFIG = {
   "1H":  { timespan: "hour", aggregate: 1, limit: 6  }, // last 6h at 1h res, shows recent movement
-  "4H":  { timespan: "hour", aggregate: 1, limit: 12 }, // last 12h at 1h res
   "12H": { timespan: "hour", aggregate: 1, limit: 12 },
   "1D":  { timespan: "hour", aggregate: 1, limit: 24 },
 };
@@ -842,7 +871,7 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
   const [showWalletHolders, setShowWalletHolders] = useState(false);
   const [showChart, setShowChart] = useState(false);
   const [chartMode, setChartMode] = useState("price"); // "price" | "mcap"
-  const [chartTf, setChartTf] = useState("1D");        // "1H" | "4H" | "12H" | "1D"
+  const [chartTf, setChartTf] = useState("1D");        // "1H" | "12H" | "1D"
   const [caCopied, setCaCopied] = useState(false);
   const { holders, loading: holdersLoading, error: holdersError, refetch: refetchHolders } = useTokenHolders(ca, pair.chainId, showHolders);
   const gtPoolAddr = pair.source === "gt" ? pair.pairAddress : null;
@@ -1006,7 +1035,7 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
             {/* Timeframe pills */}
             <div style={{ display: "flex", gap: 3 }}>
-              {["1H", "4H", "12H", "1D"].map((tf) => {
+              {["1H", "12H", "1D"].map((tf) => {
                 const active = chartTf === tf;
                 return (
                   <button key={tf}
@@ -1317,6 +1346,54 @@ const PriceSkeleton = () => (
     <div style={{ width: 50, height: 16, borderRadius: 4, background: "#1e293b", animation: "shimmer 1.5s infinite" }} />
   </div>
 );
+
+function CoinCard({ coin, data, sparkline }) {
+  const price = data?.usd || 0;
+  const change = data?.usd_24h_change || 0;
+  const vol = data?.usd_24h_vol || 0;
+  const mcap = data?.usd_market_cap || 0;
+  const positive = change >= 0;
+  const { articles, loading: newsLoading } = useCoinNews(coin.newsKey);
+
+  return (
+    <div style={{ background: "#0d1321", border: "1px solid #1e293b", borderLeft: `3px solid ${coin.color}`, borderRadius: 12, padding: "16px 18px", boxShadow: `0 0 24px ${coin.color}0a` }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+        <div style={{ width: 28, height: 28, borderRadius: "50%", background: coin.color, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 800, color: "#fff", flexShrink: 0, boxShadow: `0 0 10px ${coin.color}66` }}>
+          {coin.symbol === "BTC" ? "₿" : coin.symbol === "ETH" ? "Ξ" : "◎"}
+        </div>
+        <span style={{ fontWeight: 700, fontSize: 13, color: "#94a3b8", letterSpacing: 0.5 }}>{coin.symbol}</span>
+      </div>
+      <div style={{ fontSize: 24, fontWeight: 800, color: "#f8fafc", marginBottom: 2, letterSpacing: -0.5 }}>{formatPrice(price)}</div>
+      <div style={{ fontSize: 13, fontWeight: 700, color: positive ? "#4ade80" : "#f87171", marginBottom: 4 }}>{formatChange(change)}</div>
+      <Sparkline data={sparkline} width={160} height={40} color={positive ? "#4ade80" : "#f87171"} interactive />
+      <div style={{ color: "#475569", fontSize: 11, lineHeight: 1.8, borderTop: "1px solid #1e293b", paddingTop: 8, marginTop: 4, display: "flex", flexDirection: "column", gap: 1 }}>
+        <span>Vol 24h <span style={{ color: "#64748b" }}>{formatVolume(vol)}</span></span>
+        <span>MCap <span style={{ color: "#64748b" }}>{formatVolume(mcap)}</span></span>
+      </div>
+      {/* Per-coin news */}
+      <div style={{ borderTop: "1px solid #1e293b", marginTop: 10, paddingTop: 10 }}>
+        <div style={{ fontSize: 10, fontWeight: 700, color: "#475569", letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 6 }}>{coin.symbol} News</div>
+        {newsLoading ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+            {[1,2].map((i) => <div key={i} style={{ height: 10, background: "#1e293b", borderRadius: 3, width: i === 1 ? "90%" : "70%", animation: "shimmer 1.5s infinite" }} />)}
+          </div>
+        ) : !articles || articles.length === 0 ? (
+          <div style={{ fontSize: 11, color: "#334155", fontStyle: "italic" }}>No news found</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {articles.map((a) => (
+              <a key={a.id} href={a.url} target="_blank" rel="noopener noreferrer"
+                style={{ textDecoration: "none", display: "block" }}>
+                <div style={{ fontSize: 11, color: "#94a3b8", lineHeight: 1.35, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>{a.title}</div>
+                <div style={{ fontSize: 10, color: "#334155", marginTop: 1 }}>{a.source}{a.timeAgo ? ` · ${a.timeAgo}` : ""}</div>
+              </a>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 const LiveIndicator = () => (
   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -1791,9 +1868,9 @@ export default function App() {
   const filteredPinned = applyFilters(pinnedTokens.filter(chainFilter));
 
   const coinConfigs = [
-    { id: "bitcoin", symbol: "BTC", color: "#F7931A" },
-    { id: "ethereum", symbol: "ETH", color: "#627EEA" },
-    { id: "solana", symbol: "SOL", color: "#9945FF" },
+    { id: "bitcoin", symbol: "BTC", color: "#F7931A", newsKey: "bitcoin" },
+    { id: "ethereum", symbol: "ETH", color: "#627EEA", newsKey: "ethereum" },
+    { id: "solana", symbol: "SOL", color: "#9945FF", newsKey: "solana" },
   ];
 
   return (
@@ -1846,34 +1923,12 @@ export default function App() {
           <div style={{ background: "#7f1d1d33", border: "1px solid #991b1b", borderRadius: 8, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 13 }}>⚠ Price fetch failed: {priceError}</div>
         )}
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))", gap: 16 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 16 }}>
           {priceLoading
             ? [1, 2, 3].map((i) => <PriceSkeleton key={i} />)
-            : coinConfigs.map((coin) => {
-                const data = prices?.[coin.id];
-                const price = data?.usd || 0;
-                const change = data?.usd_24h_change || 0;
-                const vol = data?.usd_24h_vol || 0;
-                const mcap = data?.usd_market_cap || 0;
-                const positive = change >= 0;
-                return (
-                  <div key={coin.symbol} style={{ background: "#0d1321", border: "1px solid #1e293b", borderLeft: `3px solid ${coin.color}`, borderRadius: 12, padding: "16px 18px", boxShadow: `0 0 24px ${coin.color}0a` }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-                      <div style={{ width: 28, height: 28, borderRadius: "50%", background: coin.color, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 800, color: "#fff", flexShrink: 0, boxShadow: `0 0 10px ${coin.color}66` }}>
-                        {coin.symbol === "BTC" ? "₿" : coin.symbol === "ETH" ? "Ξ" : "◎"}
-                      </div>
-                      <span style={{ fontWeight: 700, fontSize: 13, color: "#94a3b8", letterSpacing: 0.5 }}>{coin.symbol}</span>
-                    </div>
-                    <div style={{ fontSize: 24, fontWeight: 800, color: "#f8fafc", marginBottom: 2, letterSpacing: -0.5 }}>{formatPrice(price)}</div>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: positive ? "#4ade80" : "#f87171", marginBottom: 4 }}>{formatChange(change)}</div>
-                    <Sparkline data={sparklines?.[coin.id]} width={160} height={40} color={positive ? "#4ade80" : "#f87171"} interactive />
-                    <div style={{ color: "#475569", fontSize: 11, lineHeight: 1.8, borderTop: "1px solid #1e293b", paddingTop: 8, marginTop: 4, display: "flex", flexDirection: "column", gap: 1 }}>
-                      <span>Vol 24h <span style={{ color: "#64748b" }}>{formatVolume(vol)}</span></span>
-                      <span>MCap <span style={{ color: "#64748b" }}>{formatVolume(mcap)}</span></span>
-                    </div>
-                  </div>
-                );
-              })}
+            : coinConfigs.map((coin) => (
+                <CoinCard key={coin.symbol} coin={coin} data={prices?.[coin.id]} sparkline={sparklines?.[coin.id]} />
+              ))}
         </div>
       </div>
 
