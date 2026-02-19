@@ -72,7 +72,7 @@ function fetchPoolsIntoList(data, network, out, { volMin, liqMin, h1Min, h24HrMi
       chainId,
       marketCap:  parseFloat(pool.attributes.market_cap_usd || pool.attributes.fdv_usd || 0),
       fdv:        parseFloat(pool.attributes.fdv_usd || 0),
-      volume:     { h24: vol24 },
+      volume:     { h1: parseFloat(pool.attributes.volume_usd?.h1 || 0), h6: parseFloat(pool.attributes.volume_usd?.h6 || 0), h24: vol24 },
       liquidity:  { usd: liq },
       priceChange: {
         h1: parseFloat(pool.attributes.price_change_percentage?.h1 || 0),
@@ -254,13 +254,13 @@ function useTopVolumeTokens(activeChain) {
       let successPages = 0;
 
       for (const network of networksToFetch) {
-        for (const page of [1, 2]) {
+        for (const page of [1, 2, 3]) {
           try {
             const res = await fetch(
               `https://api.geckoterminal.com/api/v2/networks/${network}/pools?page=${page}&sort=h24_volume_usd_desc&include=base_token`
             );
             if (!res.ok) continue;
-            fetchPoolsIntoList(await res.json(), network, allTokens, { volMin: 1000, liqMin: 10000, h1Min: 50, h24HrMin: 75 });
+            fetchPoolsIntoList(await res.json(), network, allTokens, { volMin: 500, liqMin: 2000, h1Min: 5, h24HrMin: 10 });
             successPages++;
           } catch {}
         }
@@ -703,6 +703,8 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
   const chain = getChainLabel(pair.chainId);
   const ca = pair.baseToken?.address || "";
   const mcap = pair.marketCap || pair.fdv || 0;
+  const vol1h = pair.volume?.h1 || 0;
+  const vol6h = pair.volume?.h6 || 0;
   const vol24 = pair.volume?.h24 || 0;
   const liq = pair.liquidity?.usd || 0;
   const change1h = pair.priceChange?.h1 ?? null;
@@ -793,8 +795,8 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
         </div>
       )}
 
-      {/* Clickable area → DexScreener */}
-      <a href={dexUrl} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "none", color: "inherit" }}>
+      {/* Token info */}
+      <div>
         <div style={{ display: "flex", alignItems: "flex-start" }}>
           <div style={{ display: "flex", gap: 12, alignItems: "center", paddingRight: 100 }}>
             <div style={{ position: "relative", width: 40, height: 40, flexShrink: 0 }}>
@@ -842,12 +844,13 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
               </div>
             </div>
           </div>
-          <div style={{ display: "flex", gap: 12, color: "#64748b", fontSize: 12, marginTop: 6 }}>
-            <span>Vol <span style={{ color: "#94a3b8" }}>{formatVolume(vol24)}</span></span>
+          <div style={{ display: "flex", gap: 10, color: "#64748b", fontSize: 12, marginTop: 6, flexWrap: "wrap" }}>
+            <span>Vol 1h <span style={{ color: "#94a3b8" }}>{formatVolume(vol1h)}</span></span>
+            <span>Vol 24h <span style={{ color: "#94a3b8" }}>{formatVolume(vol24)}</span></span>
             <span>Liq <span style={{ color: "#94a3b8" }}>{formatVolume(liq)}</span></span>
           </div>
         </div>
-      </a>
+      </div>
 
       <BuySellBar buys={buys24} sells={sells24} />
 
@@ -869,6 +872,15 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
       {/* Trade buttons */}
       {ca && (
         <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
+          <a
+            href={dexUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            title="View chart on DexScreener"
+            style={{ flex: 1, textAlign: "center", padding: "6px 0", borderRadius: 8, background: "#1e293b", border: "1px solid #334155", color: "#94a3b8", fontSize: 12, fontWeight: 700, textDecoration: "none", letterSpacing: 0.3 }}
+          >
+            📊 Chart
+          </a>
           {pair.chainId === "solana" && (
             <a
               href={`https://jup.ag/tokens/${ca}`}
@@ -1109,7 +1121,9 @@ const LiveIndicator = () => (
 
 // ─── Filter / Sort Bar ───
 const SORT_OPTIONS = [
-  { key: "vol",      label: "Vol" },
+  { key: "vol",      label: "Vol 24h" },
+  { key: "vol1h",    label: "Vol 1h" },
+  { key: "vol6h",    label: "Vol 6h" },
   { key: "mcap",     label: "MCap" },
   { key: "change1h", label: "1h %" },
   { key: "change6h", label: "6h %" },
@@ -1375,8 +1389,10 @@ export default function App() {
       .filter((t) => change1hMin === null || (t.priceChange?.h1 ?? -Infinity) >= change1hMin)
       .sort((a, b) => {
         let aVal, bVal;
-        if (sortBy === "vol")      { aVal = a.volume?.h24 || 0;          bVal = b.volume?.h24 || 0; }
-        else if (sortBy === "mcap") { aVal = a.marketCap || a.fdv || 0;   bVal = b.marketCap || b.fdv || 0; }
+        if (sortBy === "vol")        { aVal = a.volume?.h24 || 0;          bVal = b.volume?.h24 || 0; }
+        else if (sortBy === "vol1h") { aVal = a.volume?.h1 || 0;           bVal = b.volume?.h1 || 0; }
+        else if (sortBy === "vol6h") { aVal = a.volume?.h6 || 0;           bVal = b.volume?.h6 || 0; }
+        else if (sortBy === "mcap")  { aVal = a.marketCap || a.fdv || 0;   bVal = b.marketCap || b.fdv || 0; }
         else if (sortBy === "change1h") { aVal = a.priceChange?.h1 ?? -999; bVal = b.priceChange?.h1 ?? -999; }
         else if (sortBy === "change6h") { aVal = a.priceChange?.h6 ?? -999; bVal = b.priceChange?.h6 ?? -999; }
         else if (sortBy === "age") { aVal = a.pairCreatedAt || 0;         bVal = b.pairCreatedAt || 0; }
@@ -1656,8 +1672,8 @@ export default function App() {
           />
 
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 16 }}>
-            <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#f59e0b", margin: 0 }}>📊 Top Volume Today</h2>
-            <span style={{ color: "#64748b", fontSize: 12 }}>Powered by GeckoTerminal • Sorted by 24h Vol</span>
+            <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#f59e0b", margin: 0 }}>📊 Top Volume</h2>
+            <span style={{ color: "#64748b", fontSize: 12 }}>Sort by Vol 1h / 6h / 24h above</span>
           </div>
 
           {topVolError && (
