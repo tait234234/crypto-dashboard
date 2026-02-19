@@ -101,8 +101,8 @@ function fetchPoolsIntoList(data, network, out, { volMin, liqMin, h1Min, h24HrMi
       volume:     { h1: parseFloat(pool.attributes.volume_usd?.h1 || 0), h6: parseFloat(pool.attributes.volume_usd?.h6 || 0), h24: vol24 },
       liquidity:  { usd: liq },
       priceChange: {
-        h1: parseFloat(pool.attributes.price_change_percentage?.h1 || 0),
-        h6: parseFloat(pool.attributes.price_change_percentage?.h6 || 0),
+        h1: pool.attributes.price_change_percentage?.h1 != null ? parseFloat(pool.attributes.price_change_percentage.h1) : null,
+        h6: pool.attributes.price_change_percentage?.h6 != null ? parseFloat(pool.attributes.price_change_percentage.h6) : null,
       },
       txns: {
         h1:  { buys: h1Buys  || 0, sells: h1Sells  || 0 },
@@ -293,8 +293,8 @@ async function postRPC(body, timeoutMs = 12000) {
         if (!res.ok)            { lastErr = new Error(`RPC error HTTP ${res.status}`); break; }
         const data = await res.json();
         if (data.error) {
-          if (data.error.code === -32601) throw new Error(data.error.message || "RPC error");
-          lastErr = new Error(data.error.message || "RPC error");
+          if (data.error?.code === -32601) throw new Error(data.error.message || "RPC error");
+          lastErr = new Error(data.error?.message || "RPC error");
           continue;
         }
         return data;
@@ -547,8 +547,9 @@ function formatTokenAmount(n) {
 
 function formatAge(createdAt) {
   if (!createdAt) return "—";
-  const diffMs = Date.now() - createdAt;
+  const diffMs = Math.max(0, Date.now() - createdAt);
   const diffMins = Math.round(diffMs / 60000);
+  if (diffMins < 1) return "new";
   if (diffMins < 60) return diffMins + "m";
   const diffHrs = diffMs / 3600000;
   if (diffHrs < 2) {
@@ -934,11 +935,14 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
               {["5m", "1h", "12h", "24h"].map((tf) => {
                 const active = chartTf === tf;
                 return (
-                  <button key={tf} onClick={(e) => { e.stopPropagation(); setChartTf(tf); }}
+                  <button key={tf}
+                    onClick={(e) => { e.stopPropagation(); setChartTf(tf); }}
+                    disabled={chartLoading}
                     style={{ padding: "2px 7px", fontSize: 9, fontWeight: 700, borderRadius: 4,
                       border: `1px solid ${active ? "#38bdf8" : "#1e293b"}`,
                       background: active ? "#38bdf822" : "transparent",
-                      color: active ? "#7dd3fc" : "#475569", cursor: "pointer" }}>
+                      color: active ? "#7dd3fc" : "#475569",
+                      cursor: chartLoading ? "default" : "pointer", opacity: chartLoading && !active ? 0.4 : 1 }}>
                     {tf}
                   </button>
                 );
@@ -949,23 +953,31 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
               {[["price", "Price"], ["mcap", "MCap"], ["vol", "Vol"]].map(([mode, label]) => {
                 const active = chartMode === mode;
                 return (
-                  <button key={mode} onClick={(e) => { e.stopPropagation(); setChartMode(mode); }}
+                  <button key={mode}
+                    onClick={(e) => { e.stopPropagation(); setChartMode(mode); }}
+                    disabled={chartLoading}
                     style={{ padding: "2px 7px", fontSize: 9, fontWeight: 700, borderRadius: 4,
                       border: `1px solid ${active ? "#6366f1" : "#1e293b"}`,
                       background: active ? "#6366f122" : "transparent",
-                      color: active ? "#a5b4fc" : "#475569", cursor: "pointer" }}>
+                      color: active ? "#a5b4fc" : "#475569",
+                      cursor: chartLoading ? "default" : "pointer", opacity: chartLoading && !active ? 0.4 : 1 }}>
                     {label}
                   </button>
                 );
               })}
             </div>
           </div>
-          {chartLoading && <div style={{ color: "#475569", fontSize: 11, textAlign: "center", paddingBottom: 4 }}>Loading…</div>}
+          {/* Loading bar */}
+          {chartLoading && (
+            <div style={{ height: 2, borderRadius: 1, background: "#1e293b", overflow: "hidden", marginBottom: 6 }}>
+              <div style={{ height: "100%", width: "40%", background: "#6366f1", borderRadius: 1, animation: "shimmer 1.2s ease-in-out infinite" }} />
+            </div>
+          )}
           {!chartLoading && activeChartData && activeChartData.length >= 2 && (
-            <Sparkline data={activeChartData} width={260} height={52} interactive formatter={chartFormatter} />
+            <Sparkline data={activeChartData} width="100%" height={52} interactive formatter={chartFormatter} />
           )}
           {!chartLoading && (!activeChartData || activeChartData.length < 2) && (
-            <div style={{ color: "#334155", fontSize: 11, textAlign: "center", paddingBottom: 4 }}>No chart data</div>
+            <div style={{ color: "#334155", fontSize: 11, textAlign: "center", padding: "8px 0" }}>No chart data</div>
           )}
         </div>
       )}
@@ -1236,7 +1248,10 @@ const LiveIndicator = () => (
 );
 
 // ─── Sparkline (SVG mini chart with optional hover) ───
+// Uses a fixed internal viewBox (300×height) so it scales to any container width
+const SPARK_VB_W = 300;
 const Sparkline = ({ data, width = 140, height = 32, color, interactive = false, formatter }) => {
+  const containerRef = useRef(null);
   const [hoverIdx, setHoverIdx] = useState(null);
   if (!data || data.length < 2) return null;
 
@@ -1251,16 +1266,18 @@ const Sparkline = ({ data, width = 140, height = 32, color, interactive = false,
   const stroke = color || (positive ? "#4ade80" : "#f87171");
   const gradId = `sf-${stroke.replace(/[^a-zA-Z0-9]/g, "")}`;
 
+  // Always calculate coords against fixed viewBox width
   const coords = prices.map((p, i) => ({
-    x: (i / (prices.length - 1)) * width,
+    x: (i / (prices.length - 1)) * SPARK_VB_W,
     y: height - 2 - ((p - min) / range) * (height - 4),
   }));
   const linePath = `M${coords.map((c) => `${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(" L")}`;
-  const fillPath = `${linePath} L${width},${height} L0,${height} Z`;
+  const fillPath = `${linePath} L${SPARK_VB_W},${height} L0,${height} Z`;
 
   const onMove = interactive ? (e) => {
     const rect = e.currentTarget.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
+    // Scale mouse x to viewBox space
+    const mx = ((e.clientX - rect.left) / rect.width) * SPARK_VB_W;
     let best = 0, bestD = Infinity;
     for (let i = 0; i < coords.length; i++) {
       const d = Math.abs(coords[i].x - mx);
@@ -1270,32 +1287,45 @@ const Sparkline = ({ data, width = 140, height = 32, color, interactive = false,
   } : undefined;
 
   const hp = hoverIdx !== null ? coords[hoverIdx] : null;
+  // Convert tooltip x from viewBox space back to % for positioning
+  const tooltipLeftPct = hp ? (hp.x / SPARK_VB_W) * 100 : 0;
+
+  // svgWidth is the rendered pixel width (for numeric backward-compat); "100%" means fill container
+  const svgWidth = width === "100%" ? "100%" : width;
 
   return (
-    <div style={{ position: "relative" }}>
+    <div ref={containerRef} style={{ position: "relative" }}>
       <svg
-        width={width} height={height} viewBox={`0 0 ${width} ${height}`}
+        width={svgWidth} height={height}
+        viewBox={`0 0 ${SPARK_VB_W} ${height}`}
+        preserveAspectRatio="none"
         style={{ display: "block", marginTop: 6, cursor: interactive ? "crosshair" : "default" }}
         onMouseMove={onMove}
         onMouseLeave={interactive ? () => setHoverIdx(null) : undefined}
       >
         <defs>
           <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor={stroke} stopOpacity="0.15" />
+            <stop offset="0%" stopColor={stroke} stopOpacity="0.18" />
             <stop offset="100%" stopColor={stroke} stopOpacity="0" />
           </linearGradient>
         </defs>
         <path d={fillPath} fill={`url(#${gradId})`} />
-        <path d={linePath} fill="none" stroke={stroke} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" opacity="0.8" />
+        <path d={linePath} fill="none" stroke={stroke} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
         {hp && (
           <>
-            <line x1={hp.x} y1={0} x2={hp.x} y2={height} stroke="#ffffff33" strokeWidth="1" strokeDasharray="2,2" />
-            <circle cx={hp.x} cy={hp.y} r={3} fill={stroke} stroke="#0d1321" strokeWidth="1.5" />
+            <line x1={hp.x} y1={0} x2={hp.x} y2={height} stroke="#ffffff22" strokeWidth="1" strokeDasharray="3,3" />
+            <circle cx={hp.x} cy={hp.y} r="4" fill={stroke} stroke="#0d1321" strokeWidth="2" />
           </>
         )}
       </svg>
       {hp && (
-        <div style={{ position: "absolute", bottom: "100%", left: Math.min(Math.max(hp.x - 44, 0), width - 88), background: "#1e293bee", border: "1px solid #334155", borderRadius: 6, padding: "4px 8px", fontSize: 11, color: "#e2e8f0", whiteSpace: "nowrap", pointerEvents: "none", marginBottom: 4, zIndex: 10 }}>
+        <div style={{
+          position: "absolute", bottom: "100%",
+          left: `clamp(0px, calc(${tooltipLeftPct}% - 44px), calc(100% - 94px))`,
+          background: "#1e293bef", border: "1px solid #334155", borderRadius: 6,
+          padding: "4px 8px", fontSize: 11, color: "#e2e8f0",
+          whiteSpace: "nowrap", pointerEvents: "none", marginBottom: 4, zIndex: 10,
+        }}>
           <div style={{ fontWeight: 700 }}>{(formatter || formatPrice)(prices[hoverIdx])}</div>
           {times && times[hoverIdx] && (
             <div style={{ color: "#64748b", fontSize: 10 }}>
@@ -1626,6 +1656,15 @@ export default function App() {
 
   const removeWallet = (address) => {
     setWallets((prev) => prev.filter((w) => w.address !== address));
+    // Remove this wallet's holdings from the mint map so badges disappear
+    setWalletMintMap((prev) => {
+      const next = { ...prev };
+      Object.keys(next).forEach((mint) => {
+        next[mint] = next[mint].filter((h) => h.address !== address);
+        if (next[mint].length === 0) delete next[mint];
+      });
+      return next;
+    });
   };
 
   const chainFilter = (t) =>
@@ -1788,7 +1827,7 @@ export default function App() {
                       isPinned={true}
                       onPin={pinToken}
                       onUnpin={unpinToken}
-                      walletHolders={walletMintMap[pair.baseToken?.address || ""] || []}
+                      walletHolders={(pair.baseToken?.address && walletMintMap[pair.baseToken.address]) || []}
                     />
                   ))}
                 </div>
@@ -1838,7 +1877,7 @@ export default function App() {
                       isPinned={pinnedCAs.some((p) => p.ca === ca)}
                       onPin={pinToken}
                       onUnpin={unpinToken}
-                      walletHolders={walletMintMap[ca] || []}
+                      walletHolders={(ca && walletMintMap[ca]) || []}
                     />
                   );
                 })}
