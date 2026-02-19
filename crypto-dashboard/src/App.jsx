@@ -463,16 +463,37 @@ const TF_CONFIG = {
 // Successful-only cache keyed by network:pool:tf (never caches null/empty results)
 const chartCache = {};
 
-function usePoolChart(chainId, poolAddress, enabled, timeframe = "1D") {
+// Cache: "network:ca" → GT pool address (only caches successes)
+const gtPoolCache = {};
+async function findGTPool(network, tokenCA) {
+  const key = `${network}:${tokenCA}`;
+  if (gtPoolCache[key]) return gtPoolCache[key];
+  try {
+    const url = `https://api.geckoterminal.com/api/v2/networks/${network}/tokens/${tokenCA}/pools?page=1`;
+    let res = await fetch(url);
+    if (res.status === 429) { await delay(2000); res = await fetch(url); }
+    if (!res.ok) return null;
+    const json = await res.json();
+    const pools = json.data || [];
+    if (!pools.length) return null;
+    const addr = pools[0].attributes?.address;
+    if (addr) gtPoolCache[key] = addr;
+    return addr || null;
+  } catch {
+    return null;
+  }
+}
+
+function usePoolChart(chainId, tokenCA, enabled, timeframe = "1D") {
   const [priceData, setPriceData] = useState(null);
   const [volumeData, setVolumeData] = useState(null);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    if (!enabled || !poolAddress || !chainId) return;
+    if (!enabled || !tokenCA || !chainId) return;
     const network = CHAIN_TO_GT_NETWORK[chainId] ?? chainId;
     const { timespan, aggregate, limit } = TF_CONFIG[timeframe] || TF_CONFIG["1D"];
-    const cacheKey = `${network}:${poolAddress}:${timeframe}`;
+    const cacheKey = `${network}:${tokenCA}:${timeframe}`;
 
     // Serve from cache only if we previously got real data
     if (chartCache[cacheKey]) {
@@ -487,6 +508,10 @@ function usePoolChart(chainId, poolAddress, enabled, timeframe = "1D") {
       setPriceData(null); // clear stale data from previous timeframe
       setVolumeData(null);
       try {
+        // Resolve the correct GeckoTerminal pool address from the token CA
+        const poolAddress = await findGTPool(network, tokenCA);
+        if (!poolAddress) throw new Error("No GT pool found for token");
+        if (cancelled) return;
         const url = `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/ohlcv/${timespan}?aggregate=${aggregate}&limit=${limit}`;
         let res = await fetch(url);
         if (res.status === 429) { await delay(2000); res = await fetch(url); }
@@ -508,7 +533,7 @@ function usePoolChart(chainId, poolAddress, enabled, timeframe = "1D") {
     };
     run();
     return () => { cancelled = true; };
-  }, [enabled, chainId, poolAddress, timeframe]);
+  }, [enabled, chainId, tokenCA, timeframe]);
 
   return { priceData, volumeData, loading };
 }
@@ -772,7 +797,7 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
   const [chartTf, setChartTf] = useState("1D");        // "1H" | "4H" | "12H" | "1D"
   const [caCopied, setCaCopied] = useState(false);
   const { holders, loading: holdersLoading, error: holdersError, refetch: refetchHolders } = useTokenHolders(ca, pair.chainId, showHolders);
-  const { priceData: chartData, volumeData, loading: chartLoading } = usePoolChart(pair.chainId, pair.pairAddress, showChart, chartTf);
+  const { priceData: chartData, volumeData, loading: chartLoading } = usePoolChart(pair.chainId, ca, showChart, chartTf);
 
   // Derive mcap series by scaling price by fixed supply ratio
   const currentPrice = pair.priceUsd ? parseFloat(pair.priceUsd) : 0;
