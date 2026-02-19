@@ -1190,17 +1190,30 @@ async function fetchWalletTxs(address, limit = 40) {
 // Extract all counterparty addresses from a Helius enhanced transaction
 function extractCounterparties(tx, ownAddress) {
   const addrs = new Set();
-  // Native SOL transfers
   (tx.nativeTransfers || []).forEach((t) => {
     if (t.fromUserAccount && t.fromUserAccount !== ownAddress) addrs.add(t.fromUserAccount);
     if (t.toUserAccount && t.toUserAccount !== ownAddress) addrs.add(t.toUserAccount);
   });
-  // SPL token transfers
   (tx.tokenTransfers || []).forEach((t) => {
     if (t.fromUserAccount && t.fromUserAccount !== ownAddress) addrs.add(t.fromUserAccount);
     if (t.toUserAccount && t.toUserAccount !== ownAddress) addrs.add(t.toUserAccount);
   });
   return [...addrs];
+}
+
+// Extract {counterpartyAddress → Set<mint>} from a transaction
+function extractCounterpartyMints(tx, ownAddress) {
+  const map = new Map(); // counterparty → Set<mint>
+  (tx.tokenTransfers || []).forEach((t) => {
+    if (!t.mint) return;
+    [t.fromUserAccount, t.toUserAccount].forEach((acct) => {
+      if (acct && acct !== ownAddress) {
+        if (!map.has(acct)) map.set(acct, new Set());
+        map.get(acct).add(t.mint);
+      }
+    });
+  });
+  return map;
 }
 
 // Hook: given walletMintMap + wallets, compute all link edges + discover related untracked wallets
@@ -1264,16 +1277,21 @@ function useWalletLinks(wallets, walletMintMap) {
       });
 
       // Common funder + related wallet discovery:
-      // Build: externalAddr → { wallets: Set<trackedAddr>, txCount: number }
-      const externalMap = new Map(); // externalAddr → { wallets: Set, txCount }
+      // Build: externalAddr → { wallets: Set<trackedAddr>, txCount, mints: Set<mint> }
+      const externalMap = new Map();
       addrs.forEach((addr) => {
         const txs = txsByWallet.get(addr) || [];
         txs.forEach((tx) => {
+          // Accumulate counterparty → mints from token transfers
+          const mintMap = extractCounterpartyMints(tx, addr);
           extractCounterparties(tx, addr).forEach((cp) => {
             if (!addrSet.has(cp)) {
-              if (!externalMap.has(cp)) externalMap.set(cp, { wallets: new Set(), txCount: 0 });
-              externalMap.get(cp).wallets.add(addr);
-              externalMap.get(cp).txCount++;
+              if (!externalMap.has(cp)) externalMap.set(cp, { wallets: new Set(), txCount: 0, mints: new Set() });
+              const entry = externalMap.get(cp);
+              entry.wallets.add(addr);
+              entry.txCount++;
+              // Collect mints transferred to/from this counterparty
+              (mintMap.get(cp) || []).forEach((m) => entry.mints.add(m));
             }
           });
         });
@@ -1296,12 +1314,12 @@ function useWalletLinks(wallets, walletMintMap) {
       // Related wallet discovery: external addresses that interacted with ANY tracked wallet
       // Sort by: (number of distinct tracked wallets it touched) desc, then txCount desc
       const related = [];
-      externalMap.forEach(({ wallets: walletSet, txCount }, extAddr) => {
+      externalMap.forEach(({ wallets: walletSet, txCount, mints }, extAddr) => {
         related.push({
           address: extAddr,
           sharedWith: [...walletSet],
           txCount,
-          // Label wallets by their names
+          mints: [...mints], // token mints transferred to/from this address
           sharedWithLabels: [...walletSet].map((a) => {
             const w = wallets.find((x) => x.address === a);
             return w?.label || `${a.slice(0, 4)}…${a.slice(-4)}`;
@@ -1545,19 +1563,26 @@ function WalletGraph({ wallets, links, loading }) {
 }
 
 // ─── Related Wallets Panel ───
-function RelatedWallets({ relatedWallets, trackedAddrs, loading, onTrack }) {
+function RelatedWallets({ relatedWallets, trackedAddrs, loading, onTrack, walletMintMap }) {
   const [expanded, setExpanded] = useState(false);
-  const [tracked, setTracked] = useState(new Set()); // locally tracked within this session
+  const [tracked, setTracked] = useState(new Set());
 
-  if (loading) return null; // don't flash empty while analysing
+  // Build mint → {icon, symbol} from walletMintMap (take first entry per mint that has an icon)
+  const mintMeta = useMemo(() => {
+    const m = new Map();
+    Object.entries(walletMintMap || {}).forEach(([mint, holders]) => {
+      const h = holders.find((x) => x.icon) || holders[0];
+      if (h) m.set(mint, { icon: h.icon || null, symbol: h.symbol || mint.slice(0, 4) });
+    });
+    return m;
+  }, [walletMintMap]);
+
+  if (loading) return null;
   if (!relatedWallets.length) return null;
 
-  // Partition into "linked to 2+ wallets" (strong signal) vs "linked to 1 wallet" (weak)
   const strong = relatedWallets.filter((r) => r.sharedWith.length >= 2);
   const weak   = relatedWallets.filter((r) => r.sharedWith.length < 2);
   const shown  = expanded ? relatedWallets : strong.length > 0 ? strong : weak.slice(0, 5);
-
-  const truncAddr = (a) => `${a.slice(0, 6)}…${a.slice(-6)}`;
 
   return (
     <div style={{ background: "#0d1321", border: "1px solid #1e293b", borderRadius: 14, padding: "16px 20px", marginBottom: 20 }}>
@@ -1577,63 +1602,90 @@ function RelatedWallets({ relatedWallets, trackedAddrs, loading, onTrack }) {
         {shown.map((r) => {
           const isAlreadyTracked = trackedAddrs.has(r.address) || tracked.has(r.address);
           const isStrong = r.sharedWith.length >= 2;
+
+          // Resolve token icons for mints this address transacted with
+          const tokenIcons = (r.mints || [])
+            .map((mint) => ({ mint, ...mintMeta.get(mint) }))
+            .filter((t) => t.icon || t.symbol)
+            .slice(0, 6);
+
           return (
-            <div key={r.address} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", background: "#111827", borderRadius: 8, border: `1px solid ${isStrong ? "#f59e0b33" : "#1e293b"}` }}>
-              {/* Signal badge */}
-              <div style={{ flexShrink: 0, width: 6, height: 6, borderRadius: "50%", background: isStrong ? "#f59e0b" : "#334155" }} title={isStrong ? "Linked to multiple tracked wallets" : "Linked to 1 tracked wallet"} />
+            <div key={r.address} style={{ background: "#111827", borderRadius: 8, border: `1px solid ${isStrong ? "#f59e0b33" : "#1e293b"}`, overflow: "hidden" }}>
+              {/* Main row */}
+              <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px" }}>
+                {/* Signal dot */}
+                <div style={{ flexShrink: 0, width: 6, height: 6, borderRadius: "50%", background: isStrong ? "#f59e0b" : "#334155" }} title={isStrong ? "Linked to multiple tracked wallets" : "Linked to 1 tracked wallet"} />
 
-              {/* Address */}
-              <span style={{ fontFamily: "monospace", fontSize: 11, color: "#94a3b8", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {r.address}
-              </span>
-
-              {/* Tags */}
-              <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
-                {isStrong && (
-                  <span style={{ background: "#f59e0b22", color: "#f59e0b", border: "1px solid #f59e0b44", borderRadius: 4, fontSize: 9, fontWeight: 700, padding: "1px 5px", whiteSpace: "nowrap" }}>
-                    {r.sharedWith.length} wallets
-                  </span>
-                )}
-                <span style={{ background: "#1e293b", color: "#475569", borderRadius: 4, fontSize: 9, padding: "1px 5px", whiteSpace: "nowrap" }}>
-                  {r.txCount} tx{r.txCount !== 1 ? "s" : ""}
+                {/* Address */}
+                <span style={{ fontFamily: "monospace", fontSize: 11, color: "#94a3b8", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {r.address}
                 </span>
-                {r.sharedWithLabels.slice(0, 2).map((lbl, i) => (
-                  <span key={i} style={{ background: "#6366f122", color: "#818cf8", border: "1px solid #6366f133", borderRadius: 4, fontSize: 9, padding: "1px 5px", whiteSpace: "nowrap" }}>
-                    {lbl}
+
+                {/* Tags */}
+                <div style={{ display: "flex", gap: 4, flexShrink: 0, alignItems: "center" }}>
+                  {isStrong && (
+                    <span style={{ background: "#f59e0b22", color: "#f59e0b", border: "1px solid #f59e0b44", borderRadius: 4, fontSize: 9, fontWeight: 700, padding: "1px 5px", whiteSpace: "nowrap" }}>
+                      {r.sharedWith.length} wallets
+                    </span>
+                  )}
+                  <span style={{ background: "#1e293b", color: "#475569", borderRadius: 4, fontSize: 9, padding: "1px 5px", whiteSpace: "nowrap" }}>
+                    {r.txCount} tx{r.txCount !== 1 ? "s" : ""}
                   </span>
-                ))}
+                  {r.sharedWithLabels.slice(0, 2).map((lbl, i) => (
+                    <span key={i} style={{ background: "#6366f122", color: "#818cf8", border: "1px solid #6366f133", borderRadius: 4, fontSize: 9, padding: "1px 5px", whiteSpace: "nowrap" }}>
+                      {lbl}
+                    </span>
+                  ))}
+                </div>
+
+                {/* Copy + Track */}
+                <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                  <button
+                    onClick={() => navigator.clipboard?.writeText(r.address)}
+                    title="Copy address"
+                    style={{ width: 24, height: 24, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", color: "#64748b", fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+                  >
+                    ⎘
+                  </button>
+                  <button
+                    onClick={() => { onTrack(r.address, ""); setTracked((prev) => new Set([...prev, r.address])); }}
+                    disabled={isAlreadyTracked}
+                    title={isAlreadyTracked ? "Already tracked" : "Add to tracker"}
+                    style={{ padding: "2px 8px", height: 24, borderRadius: 5, background: isAlreadyTracked ? "#1e293b" : "#4ade8022", border: `1px solid ${isAlreadyTracked ? "#334155" : "#4ade8044"}`, color: isAlreadyTracked ? "#334155" : "#4ade80", fontSize: 10, fontWeight: 700, cursor: isAlreadyTracked ? "default" : "pointer", whiteSpace: "nowrap" }}
+                  >
+                    {isAlreadyTracked ? "✓ tracked" : "+ Track"}
+                  </button>
+                </div>
               </div>
 
-              {/* Copy + Track */}
-              <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
-                <button
-                  onClick={() => navigator.clipboard?.writeText(r.address)}
-                  title="Copy address"
-                  style={{ width: 24, height: 24, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", color: "#64748b", fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
-                >
-                  ⎘
-                </button>
-                <button
-                  onClick={() => { onTrack(r.address, ""); setTracked((prev) => new Set([...prev, r.address])); }}
-                  disabled={isAlreadyTracked}
-                  title={isAlreadyTracked ? "Already tracked" : "Add to tracker"}
-                  style={{ padding: "2px 8px", height: 24, borderRadius: 5, background: isAlreadyTracked ? "#1e293b" : "#4ade8022", border: `1px solid ${isAlreadyTracked ? "#334155" : "#4ade8044"}`, color: isAlreadyTracked ? "#334155" : "#4ade80", fontSize: 10, fontWeight: 700, cursor: isAlreadyTracked ? "default" : "pointer", whiteSpace: "nowrap" }}
-                >
-                  {isAlreadyTracked ? "✓ tracked" : "+ Track"}
-                </button>
-              </div>
+              {/* Token icons strip */}
+              {tokenIcons.length > 0 && (
+                <div style={{ display: "flex", alignItems: "center", gap: 4, padding: "4px 10px 7px 24px", flexWrap: "wrap" }}>
+                  {tokenIcons.map(({ mint, icon, symbol }) => (
+                    <div key={mint} title={symbol} style={{ display: "flex", alignItems: "center", gap: 3, background: "#0d1321", border: "1px solid #1e293b", borderRadius: 20, padding: "2px 6px 2px 2px" }}>
+                      {icon
+                        ? <img src={icon} alt={symbol} style={{ width: 14, height: 14, borderRadius: "50%", objectFit: "cover", flexShrink: 0 }} onError={(e) => { e.target.style.display = "none"; }} />
+                        : <div style={{ width: 14, height: 14, borderRadius: "50%", background: "#334155", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 7, color: "#94a3b8", fontWeight: 700 }}>{(symbol || "?")[0]}</div>
+                      }
+                      <span style={{ fontSize: 9, color: "#64748b", fontWeight: 600 }}>{symbol}</span>
+                    </div>
+                  ))}
+                  {(r.mints || []).length > 6 && (
+                    <span style={{ fontSize: 9, color: "#334155" }}>+{r.mints.length - 6} more</span>
+                  )}
+                </div>
+              )}
             </div>
           );
         })}
       </div>
 
-      {/* Show more / less toggle */}
       {(weak.length > 0 || (strong.length === 0 && weak.length > 5)) && (
         <button
           onClick={() => setExpanded((v) => !v)}
           style={{ marginTop: 10, width: "100%", padding: "6px 0", background: "transparent", border: "1px dashed #1e293b", borderRadius: 6, color: "#475569", fontSize: 11, cursor: "pointer" }}
         >
-          {expanded ? `Show less` : `Show ${weak.length} more (weaker signal)`}
+          {expanded ? "Show less" : `Show ${weak.length} more (weaker signal)`}
         </button>
       )}
 
@@ -2276,7 +2328,9 @@ export default function App() {
       holdings.forEach((h) => {
         if (!h.mint) return;
         const price = h.pair?.priceUsd ? parseFloat(h.pair.priceUsd) : 0;
-        const entry = { address: walletAddr, label: walletLabel, amount: h.amount, usdValue: price * h.amount };
+        const icon = h.pair?.icon || h.pair?.info?.imageUrl || null;
+        const symbol = h.pair?.baseToken?.symbol || null;
+        const entry = { address: walletAddr, label: walletLabel, amount: h.amount, usdValue: price * h.amount, icon, symbol };
         next[h.mint] = [...(next[h.mint] || []), entry];
       });
       return next;
@@ -2653,6 +2707,7 @@ export default function App() {
             trackedAddrs={new Set(wallets.map((w) => w.address))}
             loading={walletLinksLoading}
             onTrack={addWallet}
+            walletMintMap={walletMintMap}
           />
 
           {wallets.map((wallet) => (
