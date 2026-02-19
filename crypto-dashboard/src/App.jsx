@@ -33,7 +33,7 @@ function useCryptoPrices() {
         );
         if (!res.ok) continue;
         const data = await res.json();
-        const raw = (data.prices || []).map(([, p]) => p);
+        const raw = data.prices || []; // [[timestamp, price], ...]
         // Downsample to ~50 points for a clean sparkline
         const step = Math.max(1, Math.floor(raw.length / 50));
         result[id] = raw.filter((_, i) => i % step === 0);
@@ -415,6 +415,46 @@ function useTokenHolders(ca, chainId, enabled) {
   return { holders, loading, error, refetch };
 }
 
+// ─── Pool Chart Hook (GeckoTerminal OHLCV for token cards) ───
+function usePoolChart(chainId, poolAddress, enabled) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const fetchedRef = useRef(null);
+
+  useEffect(() => {
+    if (!enabled || !poolAddress || !chainId) { setData(null); return; }
+    const cacheKey = `${chainId}:${poolAddress}`;
+    if (fetchedRef.current === cacheKey && data) return; // already fetched this pool
+    let cancelled = false;
+    const run = async () => {
+      setLoading(true);
+      try {
+        const network = chainId === "base" ? "base" : "solana";
+        const res = await fetch(
+          `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/ohlcv/hour?aggregate=1&limit=24`
+        );
+        if (!res.ok) throw new Error("OHLCV fetch failed");
+        const json = await res.json();
+        const candles = json.data?.attributes?.ohlcv_list || [];
+        // candles: [[timestamp, open, high, low, close, volume], ...] newest first
+        const points = candles
+          .slice()
+          .reverse()
+          .map((c) => [c[0] * 1000, c[4]]); // [timestamp_ms, close_price]
+        if (!cancelled) { setData(points); fetchedRef.current = cacheKey; }
+      } catch {
+        if (!cancelled) setData(null);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    run();
+    return () => { cancelled = true; };
+  }, [enabled, chainId, poolAddress]);
+
+  return { data, loading };
+}
+
 // ─── Helpers ───
 function formatPrice(num) {
   if (!num || num === 0) return "$0";
@@ -668,8 +708,10 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
 
   const [showHolders, setShowHolders] = useState(false);
   const [showWalletHolders, setShowWalletHolders] = useState(false);
+  const [showChart, setShowChart] = useState(false);
   const [caCopied, setCaCopied] = useState(false);
   const { holders, loading: holdersLoading, error: holdersError, refetch: refetchHolders } = useTokenHolders(ca, pair.chainId, showHolders);
+  const { data: chartData, loading: chartLoading } = usePoolChart(pair.chainId, pair.pairAddress, showChart);
 
   const glowClass = change1h === null ? "token-card-flat" : change1h >= 0 ? "token-card-up" : "token-card-down";
 
@@ -680,6 +722,14 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
     >
       {/* Action buttons — top right */}
       <div style={{ position: "absolute", top: 12, right: 12, display: "flex", gap: 4, zIndex: 2 }}>
+        {/* Mini chart toggle */}
+        <button
+          onClick={(e) => { e.stopPropagation(); setShowChart((v) => !v); }}
+          title={showChart ? "Hide chart" : "Show 24h chart"}
+          style={{ width: 28, height: 28, borderRadius: 6, background: showChart ? "#6366f122" : "#1e293b", border: `1px solid ${showChart ? "#6366f1" : "#334155"}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, color: showChart ? "#818cf8" : "#94a3b8", cursor: "pointer", flexShrink: 0 }}
+        >
+          📈
+        </button>
         {/* BubbleMaps */}
         <a
           href={bubbleMapsUrl}
@@ -803,6 +853,19 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
       </div>
 
       <BuySellBar buys={buys24} sells={sells24} />
+
+      {/* Mini chart */}
+      {showChart && (
+        <div style={{ marginTop: 8, padding: "8px 0 4px", borderTop: "1px solid #1e293b" }}>
+          {chartLoading && <div style={{ color: "#475569", fontSize: 11, textAlign: "center" }}>Loading chart…</div>}
+          {!chartLoading && chartData && chartData.length >= 2 && (
+            <Sparkline data={chartData} width={260} height={48} interactive />
+          )}
+          {!chartLoading && (!chartData || chartData.length < 2) && (
+            <div style={{ color: "#334155", fontSize: 11, textAlign: "center" }}>No chart data</div>
+          )}
+        </div>
+      )}
 
       {/* CA row */}
       {ca && (
@@ -1069,33 +1132,76 @@ const LiveIndicator = () => (
   </div>
 );
 
-// ─── Sparkline (SVG mini chart) ───
-const Sparkline = ({ data, width = 140, height = 32, color }) => {
+// ─── Sparkline (SVG mini chart with optional hover) ───
+const Sparkline = ({ data, width = 140, height = 32, color, interactive = false }) => {
+  const [hoverIdx, setHoverIdx] = useState(null);
   if (!data || data.length < 2) return null;
-  const min = Math.min(...data);
-  const max = Math.max(...data);
+
+  // data can be [[timestamp, price], ...] or [price, ...]
+  const hasTime = Array.isArray(data[0]);
+  const prices = hasTime ? data.map((d) => d[1]) : data;
+  const times  = hasTime ? data.map((d) => d[0]) : null;
+  const min = Math.min(...prices);
+  const max = Math.max(...prices);
   const range = max - min || 1;
-  const positive = data[data.length - 1] >= data[0];
+  const positive = prices[prices.length - 1] >= prices[0];
   const stroke = color || (positive ? "#4ade80" : "#f87171");
-  const pts = data.map((val, i) => {
-    const x = (i / (data.length - 1)) * width;
-    const y = height - 2 - ((val - min) / range) * (height - 4);
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  });
-  // Build fill area path (line + close at bottom)
-  const linePath = `M${pts.join(" L")}`;
+  const gradId = `sf-${stroke.replace(/[^a-zA-Z0-9]/g, "")}`;
+
+  const coords = prices.map((p, i) => ({
+    x: (i / (prices.length - 1)) * width,
+    y: height - 2 - ((p - min) / range) * (height - 4),
+  }));
+  const linePath = `M${coords.map((c) => `${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(" L")}`;
   const fillPath = `${linePath} L${width},${height} L0,${height} Z`;
+
+  const onMove = interactive ? (e) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    let best = 0, bestD = Infinity;
+    for (let i = 0; i < coords.length; i++) {
+      const d = Math.abs(coords[i].x - mx);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    setHoverIdx(best);
+  } : undefined;
+
+  const hp = hoverIdx !== null ? coords[hoverIdx] : null;
+
   return (
-    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} style={{ display: "block", marginTop: 6 }}>
-      <defs>
-        <linearGradient id={`spark-fill-${stroke.replace("#", "")}`} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor={stroke} stopOpacity="0.15" />
-          <stop offset="100%" stopColor={stroke} stopOpacity="0" />
-        </linearGradient>
-      </defs>
-      <path d={fillPath} fill={`url(#spark-fill-${stroke.replace("#", "")})`} />
-      <path d={linePath} fill="none" stroke={stroke} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" opacity="0.8" />
-    </svg>
+    <div style={{ position: "relative" }}>
+      <svg
+        width={width} height={height} viewBox={`0 0 ${width} ${height}`}
+        style={{ display: "block", marginTop: 6, cursor: interactive ? "crosshair" : "default" }}
+        onMouseMove={onMove}
+        onMouseLeave={interactive ? () => setHoverIdx(null) : undefined}
+      >
+        <defs>
+          <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={stroke} stopOpacity="0.15" />
+            <stop offset="100%" stopColor={stroke} stopOpacity="0" />
+          </linearGradient>
+        </defs>
+        <path d={fillPath} fill={`url(#${gradId})`} />
+        <path d={linePath} fill="none" stroke={stroke} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" opacity="0.8" />
+        {hp && (
+          <>
+            <line x1={hp.x} y1={0} x2={hp.x} y2={height} stroke="#ffffff33" strokeWidth="1" strokeDasharray="2,2" />
+            <circle cx={hp.x} cy={hp.y} r={3} fill={stroke} stroke="#0d1321" strokeWidth="1.5" />
+          </>
+        )}
+      </svg>
+      {hp && (
+        <div style={{ position: "absolute", bottom: "100%", left: Math.min(Math.max(hp.x - 44, 0), width - 88), background: "#1e293bee", border: "1px solid #334155", borderRadius: 6, padding: "4px 8px", fontSize: 11, color: "#e2e8f0", whiteSpace: "nowrap", pointerEvents: "none", marginBottom: 4, zIndex: 10 }}>
+          <div style={{ fontWeight: 700 }}>{formatPrice(prices[hoverIdx])}</div>
+          {times && times[hoverIdx] && (
+            <div style={{ color: "#64748b", fontSize: 10 }}>
+              {new Date(times[hoverIdx]).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 };
 
@@ -1173,12 +1279,25 @@ const FilterBar = ({ sortBy, sortDir, onSort, minVol, onMinVol, minMcap, onMinMc
 // ─── Add Wallet Panel ───
 // Parse a bulk import block: one wallet per line, optional label after comma or whitespace
 function parseBulkWallets(raw) {
-  return raw
+  const trimmed = raw.trim();
+  // Detect JSON array format: [{"address": "...", "name": "..."}, ...]
+  if (trimmed.startsWith("[")) {
+    try {
+      const arr = JSON.parse(trimmed);
+      if (Array.isArray(arr)) {
+        return arr
+          .filter((w) => w && typeof w.address === "string")
+          .map((w) => ({ address: w.address.trim(), label: (w.name || w.label || "").trim() }))
+          .filter(({ address }) => address.length >= 32 && address.length <= 44);
+      }
+    } catch { /* not valid JSON, fall through to line-by-line */ }
+  }
+  // Line-by-line format: "address,label" or "address label"
+  return trimmed
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"))
     .map((line) => {
-      // support: "address,label"  or  "address label"
       const commaIdx = line.indexOf(",");
       if (commaIdx !== -1) {
         return { address: line.slice(0, commaIdx).trim(), label: line.slice(commaIdx + 1).trim() };
@@ -1272,7 +1391,7 @@ const AddWalletPanel = ({ onAdd, onClose }) => {
             ref={inputRef}
             value={bulk}
             onChange={(e) => { setBulk(e.target.value); setBulkResult(null); }}
-            placeholder={"Paste one address per line.\nOptional label after comma or space:\n\nABC...XYZ, My main wallet\nDEF...UVW whale"}
+            placeholder={"Paste addresses (one per line) or JSON array:\n\nABC...XYZ, My main wallet\nDEF...UVW whale\n\nJSON: [{\"address\":\"...\",\"name\":\"...\"}]"}
             rows={6}
             style={{ background: "#0d1321", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 12, fontFamily: "monospace", padding: "10px 12px", outline: "none", resize: "vertical", lineHeight: 1.6 }}
           />
@@ -1489,7 +1608,7 @@ export default function App() {
                     </div>
                     <div style={{ fontSize: 24, fontWeight: 800, color: "#f8fafc", marginBottom: 2, letterSpacing: -0.5 }}>{formatPrice(price)}</div>
                     <div style={{ fontSize: 13, fontWeight: 700, color: positive ? "#4ade80" : "#f87171", marginBottom: 4 }}>{formatChange(change)}</div>
-                    <Sparkline data={sparklines?.[coin.id]} width={160} height={32} color={positive ? "#4ade80" : "#f87171"} />
+                    <Sparkline data={sparklines?.[coin.id]} width={160} height={40} color={positive ? "#4ade80" : "#f87171"} interactive />
                     <div style={{ color: "#475569", fontSize: 11, lineHeight: 1.8, borderTop: "1px solid #1e293b", paddingTop: 8, marginTop: 4, display: "flex", flexDirection: "column", gap: 1 }}>
                       <span>Vol 24h <span style={{ color: "#64748b" }}>{formatVolume(vol)}</span></span>
                       <span>MCap <span style={{ color: "#64748b" }}>{formatVolume(mcap)}</span></span>
@@ -1636,12 +1755,28 @@ export default function App() {
               <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#4ade80", margin: 0 }}>Wallet Tracker</h2>
               <p style={{ color: "#475569", fontSize: 12, margin: "4px 0 0" }}>Add Solana wallets to track their token positions</p>
             </div>
-            <button
-              onClick={() => setShowAddWallet(!showAddWallet)}
-              style={{ padding: "8px 16px", borderRadius: 8, border: "1px solid #4ade8044", background: showAddWallet ? "#4ade8022" : "transparent", color: "#4ade80", fontSize: 13, fontWeight: 600, cursor: "pointer" }}
-            >
-              + Add Wallet
-            </button>
+            <div style={{ display: "flex", gap: 8 }}>
+              {wallets.length > 0 && (
+                <button
+                  onClick={() => {
+                    const data = wallets.map((w) => ({ address: w.address, name: w.label || "", emoji: "", groups: [] }));
+                    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+                    const url = URL.createObjectURL(blob);
+                    Object.assign(document.createElement("a"), { href: url, download: "cryptodawn-wallets.json" }).click();
+                    URL.revokeObjectURL(url);
+                  }}
+                  style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid #334155", background: "transparent", color: "#64748b", fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+                >
+                  ↓ Export
+                </button>
+              )}
+              <button
+                onClick={() => setShowAddWallet(!showAddWallet)}
+                style={{ padding: "8px 16px", borderRadius: 8, border: "1px solid #4ade8044", background: showAddWallet ? "#4ade8022" : "transparent", color: "#4ade80", fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+              >
+                + Add Wallet
+              </button>
+            </div>
           </div>
 
           {showAddWallet && <AddWalletPanel onAdd={addWallet} onClose={() => setShowAddWallet(false)} />}
