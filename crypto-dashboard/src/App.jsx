@@ -452,27 +452,16 @@ const CHAIN_TO_GT_NETWORK = {
   optimism: "optimism", blast: "blast", sui: "sui",
 };
 
-// Timeframe definitions — all use reliable hour-level data; "1H" tries minute first then falls back
-// label → primary fetch config + optional fallback
+// Timeframe → { timespan, aggregate, limit } for GeckoTerminal OHLCV API
 const TF_CONFIG = {
-  "1H":  { timespan: "minute", aggregate: 5,  limit: 12,  fallback: { timespan: "hour", aggregate: 1, limit: 6  } },
-  "4H":  { timespan: "hour",   aggregate: 1,  limit: 4,   fallback: null },
-  "12H": { timespan: "hour",   aggregate: 1,  limit: 12,  fallback: null },
-  "1D":  { timespan: "hour",   aggregate: 1,  limit: 24,  fallback: null },
+  "1H":  { timespan: "hour", aggregate: 1, limit: 6  }, // last 6h at 1h res, shows recent movement
+  "4H":  { timespan: "hour", aggregate: 1, limit: 12 }, // last 12h at 1h res
+  "12H": { timespan: "hour", aggregate: 1, limit: 12 },
+  "1D":  { timespan: "hour", aggregate: 1, limit: 24 },
 };
 
-// In-memory cache keyed by network:pool:tf
+// Successful-only cache keyed by network:pool:tf (never caches null/empty results)
 const chartCache = {};
-
-async function fetchOHLCV(network, poolAddress, timespan, aggregate, limit) {
-  const url = `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/ohlcv/${timespan}?aggregate=${aggregate}&limit=${limit}`;
-  let res = await fetch(url);
-  if (res.status === 429) { await delay(2000); res = await fetch(url); }
-  if (!res.ok) throw new Error(`OHLCV ${res.status}`);
-  const json = await res.json();
-  const candles = (json.data?.attributes?.ohlcv_list || []).slice().reverse();
-  return candles; // [[ts, open, high, low, close, vol], ...] oldest first
-}
 
 function usePoolChart(chainId, poolAddress, enabled, timeframe = "1D") {
   const [priceData, setPriceData] = useState(null);
@@ -482,29 +471,34 @@ function usePoolChart(chainId, poolAddress, enabled, timeframe = "1D") {
   useEffect(() => {
     if (!enabled || !poolAddress || !chainId) return;
     const network = CHAIN_TO_GT_NETWORK[chainId] ?? chainId;
-    const cfg = TF_CONFIG[timeframe] || TF_CONFIG["1D"];
+    const { timespan, aggregate, limit } = TF_CONFIG[timeframe] || TF_CONFIG["1D"];
     const cacheKey = `${network}:${poolAddress}:${timeframe}`;
 
+    // Serve from cache only if we previously got real data
     if (chartCache[cacheKey]) {
-      const { priceData: pd, volumeData: vd } = chartCache[cacheKey];
-      setPriceData(pd); setVolumeData(vd);
+      setPriceData(chartCache[cacheKey].priceData);
+      setVolumeData(chartCache[cacheKey].volumeData);
       return;
     }
 
     let cancelled = false;
     const run = async () => {
       setLoading(true);
+      setPriceData(null); // clear stale data from previous timeframe
+      setVolumeData(null);
       try {
-        let candles = await fetchOHLCV(network, poolAddress, cfg.timespan, cfg.aggregate, cfg.limit);
-        // If primary returned < 2 candles and there's a fallback, try it
-        if (candles.length < 2 && cfg.fallback) {
-          candles = await fetchOHLCV(network, poolAddress, cfg.fallback.timespan, cfg.fallback.aggregate, cfg.fallback.limit);
-        }
-        const prices  = candles.map((c) => [c[0] * 1000, c[4]]); // [ts_ms, close]
-        const volumes = candles.map((c) => [c[0] * 1000, c[5]]); // [ts_ms, volume]
+        const url = `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/ohlcv/${timespan}?aggregate=${aggregate}&limit=${limit}`;
+        let res = await fetch(url);
+        if (res.status === 429) { await delay(2000); res = await fetch(url); }
+        if (!res.ok) throw new Error(`OHLCV ${res.status}`);
+        const json = await res.json();
+        const candles = (json.data?.attributes?.ohlcv_list || []).slice().reverse();
+        const prices  = candles.map((c) => [c[0] * 1000, c[4]]);
+        const volumes = candles.map((c) => [c[0] * 1000, c[5]]);
         const pd = prices.length >= 2 ? prices : null;
         const vd = volumes.length >= 2 ? volumes : null;
-        chartCache[cacheKey] = { priceData: pd, volumeData: vd };
+        // Only cache when we have real data — empty results stay uncached so retries work
+        if (pd) chartCache[cacheKey] = { priceData: pd, volumeData: vd };
         if (!cancelled) { setPriceData(pd); setVolumeData(vd); }
       } catch {
         if (!cancelled) { setPriceData(null); setVolumeData(null); }
