@@ -265,38 +265,45 @@ function usePinnedTokens(pinnedCAs) {
   return { tokens, loading, refetch: fetchPinned };
 }
 
-// ─── Solana RPC helper — tries endpoints in order, handles 403 / 429 ───
+// ─── Solana RPC helper — tries endpoints in order with retry + backoff ───
 const SOLANA_RPCS = [
-  "https://mainnet.helius-rpc.com/?api-key=0dd8f0ec-f2a5-4f9e-b275-379afa3e73cd",
   "https://api.mainnet-beta.solana.com",
-  "https://solana-mainnet.g.alchemy.com/v2/demo",
   "https://rpc.ankr.com/solana",
+  "https://mainnet.helius-rpc.com/?api-key=0dd8f0ec-f2a5-4f9e-b275-379afa3e73cd",
+  "https://solana-mainnet.g.alchemy.com/v2/demo",
   "https://solana.public-rpc.com",
 ];
 
-async function postRPC(body) {
+async function postRPC(body, timeoutMs = 12000) {
   let lastErr = new Error("All RPC endpoints failed");
   for (const rpc of SOLANA_RPCS) {
-    try {
-      const res = await fetch(rpc, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (res.status === 403) { lastErr = new Error("RPC access denied"); continue; }
-      if (res.status === 429) { lastErr = new Error("Rate limited"); await delay(1000); continue; }
-      if (!res.ok)            { lastErr = new Error(`RPC error HTTP ${res.status}`); continue; }
-      const data = await res.json();
-      if (data.error) {
-        // Some errors (like method not found) won't be different on other nodes
-        if (data.error.code === -32601) throw new Error(data.error.message || "RPC error");
-        lastErr = new Error(data.error.message || "RPC error");
-        continue; // try next endpoint for transient RPC errors
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+        const res = await fetch(rpc, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: ctrl.signal,
+        });
+        clearTimeout(timer);
+        if (res.status === 403) { lastErr = new Error("RPC access denied"); break; } // skip this endpoint
+        if (res.status === 429) { lastErr = new Error("Rate limited"); await delay(2000 * (attempt + 1)); continue; }
+        if (!res.ok)            { lastErr = new Error(`RPC error HTTP ${res.status}`); break; }
+        const data = await res.json();
+        if (data.error) {
+          if (data.error.code === -32601) throw new Error(data.error.message || "RPC error");
+          lastErr = new Error(data.error.message || "RPC error");
+          continue;
+        }
+        return data;
+      } catch (e) {
+        if (e.name === "AbortError") { lastErr = new Error("RPC request timed out"); break; }
+        if (e.message?.includes("RPC error")) throw e;
+        lastErr = e;
+        if (attempt === 0) await delay(1000);
       }
-      return data;
-    } catch (e) {
-      if (e.message?.includes("RPC error")) throw e; // non-retryable
-      lastErr = e;
     }
   }
   throw lastErr;
@@ -313,14 +320,25 @@ function useWalletTokens(address) {
     setLoading(true);
     setError(null);
     try {
-      const rpcData = await postRPC({
-        jsonrpc: "2.0", id: 1,
-        method: "getTokenAccountsByOwner",
-        params: [address, { programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" }, { encoding: "jsonParsed" }],
-      });
+      // Query both Token Program and Token-2022 Program
+      const TOKEN_PROGRAMS = [
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",   // SPL Token
+        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",   // Token-2022
+      ];
+      const allAccounts = [];
+      for (const pid of TOKEN_PROGRAMS) {
+        try {
+          const rpcData = await postRPC({
+            jsonrpc: "2.0", id: 1,
+            method: "getTokenAccountsByOwner",
+            params: [address, { programId: pid }, { encoding: "jsonParsed" }],
+          });
+          const accts = rpcData.result?.value || [];
+          allAccounts.push(...accts);
+        } catch { } // if one program fails, still try the other
+      }
 
-      const accounts = rpcData.result?.value || [];
-      const rawHoldings = accounts
+      const rawHoldings = allAccounts
         .map((a) => ({
           mint: a.account.data.parsed.info.mint,
           amount: a.account.data.parsed.info.tokenAmount.uiAmount || 0,
@@ -427,15 +445,17 @@ function useTokenHolders(ca, chainId, enabled) {
 }
 
 // ─── Pool Chart Hook (GeckoTerminal OHLCV for token cards) ───
+// Returns { priceData, volumeData, loading } — priceData: [[ts, close]], volumeData: [[ts, vol]]
 function usePoolChart(chainId, poolAddress, enabled) {
-  const [data, setData] = useState(null);
+  const [priceData, setPriceData] = useState(null);
+  const [volumeData, setVolumeData] = useState(null);
   const [loading, setLoading] = useState(false);
   const fetchedRef = useRef(null);
 
   useEffect(() => {
-    if (!enabled || !poolAddress || !chainId) return; // don't clear data on disable so it persists if re-toggled
+    if (!enabled || !poolAddress || !chainId) return;
     const cacheKey = `${chainId}:${poolAddress}`;
-    if (fetchedRef.current === cacheKey) return; // already fetched this pool
+    if (fetchedRef.current === cacheKey) return;
     let cancelled = false;
     const run = async () => {
       setLoading(true);
@@ -443,21 +463,21 @@ function usePoolChart(chainId, poolAddress, enabled) {
         const network = chainId === "base" ? "base" : "solana";
         const url = `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/ohlcv/hour?aggregate=1&limit=24`;
         let res = await fetch(url);
-        if (res.status === 429) { await delay(2000); res = await fetch(url); } // one retry on rate limit
+        if (res.status === 429) { await delay(2000); res = await fetch(url); }
         if (!res.ok) throw new Error("OHLCV fetch failed");
         const json = await res.json();
         const candles = json.data?.attributes?.ohlcv_list || [];
         // candles: [[timestamp, open, high, low, close, volume], ...] newest first
-        const points = candles
-          .slice()
-          .reverse()
-          .map((c) => [c[0] * 1000, c[4]]); // [timestamp_ms, close_price]
+        const sorted = candles.slice().reverse();
+        const prices = sorted.map((c) => [c[0] * 1000, c[4]]);   // [ts, close]
+        const volumes = sorted.map((c) => [c[0] * 1000, c[5]]);  // [ts, volume]
         if (!cancelled) {
-          setData(points.length >= 2 ? points : null);
+          setPriceData(prices.length >= 2 ? prices : null);
+          setVolumeData(volumes.length >= 2 ? volumes : null);
           fetchedRef.current = cacheKey;
         }
       } catch {
-        if (!cancelled) { setData(null); fetchedRef.current = cacheKey; }
+        if (!cancelled) { setPriceData(null); setVolumeData(null); fetchedRef.current = cacheKey; }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -466,7 +486,7 @@ function usePoolChart(chainId, poolAddress, enabled) {
     return () => { cancelled = true; };
   }, [enabled, chainId, poolAddress]);
 
-  return { data, loading };
+  return { priceData, volumeData, loading };
 }
 
 // ─── Helpers ───
@@ -723,9 +743,19 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
   const [showHolders, setShowHolders] = useState(false);
   const [showWalletHolders, setShowWalletHolders] = useState(false);
   const [showChart, setShowChart] = useState(false);
+  const [chartMode, setChartMode] = useState("price"); // "price" | "mcap"
   const [caCopied, setCaCopied] = useState(false);
   const { holders, loading: holdersLoading, error: holdersError, refetch: refetchHolders } = useTokenHolders(ca, pair.chainId, showHolders);
-  const { data: chartData, loading: chartLoading } = usePoolChart(pair.chainId, pair.pairAddress, showChart);
+  const { priceData: chartData, volumeData, loading: chartLoading } = usePoolChart(pair.chainId, pair.pairAddress, showChart);
+
+  // Derive mcap chart: mcap = price * supply, supply = currentMcap / currentPrice
+  const currentPrice = pair.priceUsd ? parseFloat(pair.priceUsd) : 0;
+  const supply = currentPrice > 0 && mcap > 0 ? mcap / currentPrice : 0;
+  const mcapChartData = chartData && supply > 0
+    ? chartData.map(([ts, price]) => [ts, price * supply])
+    : null;
+
+  const activeChartData = chartMode === "mcap" ? mcapChartData : chartData;
 
   const glowClass = change1h === null ? "token-card-flat" : change1h >= 0 ? "token-card-up" : "token-card-down";
 
@@ -868,15 +898,38 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
 
       <BuySellBar buys={buys24} sells={sells24} />
 
-      {/* Mini chart */}
+      {/* Mini chart with Price / MCap toggle */}
       {showChart && (
         <div style={{ marginTop: 8, padding: "8px 0 4px", borderTop: "1px solid #1e293b" }}>
+          {/* Toggle buttons */}
+          <div style={{ display: "flex", gap: 4, marginBottom: 6, justifyContent: "center" }}>
+            {["price", "mcap"].map((mode) => {
+              const active = chartMode === mode;
+              return (
+                <button
+                  key={mode}
+                  onClick={(e) => { e.stopPropagation(); setChartMode(mode); }}
+                  style={{
+                    padding: "3px 10px", fontSize: 10, fontWeight: 600, letterSpacing: 0.3,
+                    borderRadius: 5, border: `1px solid ${active ? "#6366f1" : "#334155"}`,
+                    background: active ? "#6366f122" : "transparent",
+                    color: active ? "#a5b4fc" : "#64748b",
+                    cursor: "pointer", textTransform: "uppercase",
+                  }}
+                >
+                  {mode === "price" ? "Price" : "MCap"}
+                </button>
+              );
+            })}
+          </div>
           {chartLoading && <div style={{ color: "#475569", fontSize: 11, textAlign: "center" }}>Loading chart…</div>}
-          {!chartLoading && chartData && chartData.length >= 2 && (
-            <Sparkline data={chartData} width={260} height={48} interactive />
+          {!chartLoading && activeChartData && activeChartData.length >= 2 && (
+            <Sparkline data={activeChartData} width={260} height={48} interactive formatter={chartMode === "mcap" ? formatVolume : formatPrice} />
           )}
-          {!chartLoading && (!chartData || chartData.length < 2) && (
-            <div style={{ color: "#334155", fontSize: 11, textAlign: "center" }}>No chart data</div>
+          {!chartLoading && (!activeChartData || activeChartData.length < 2) && (
+            <div style={{ color: "#334155", fontSize: 11, textAlign: "center" }}>
+              {chartMode === "mcap" && (!mcapChartData) ? "No MCap data (missing supply)" : "No chart data"}
+            </div>
           )}
         </div>
       )}
@@ -1147,7 +1200,7 @@ const LiveIndicator = () => (
 );
 
 // ─── Sparkline (SVG mini chart with optional hover) ───
-const Sparkline = ({ data, width = 140, height = 32, color, interactive = false }) => {
+const Sparkline = ({ data, width = 140, height = 32, color, interactive = false, formatter }) => {
   const [hoverIdx, setHoverIdx] = useState(null);
   if (!data || data.length < 2) return null;
 
@@ -1207,7 +1260,7 @@ const Sparkline = ({ data, width = 140, height = 32, color, interactive = false 
       </svg>
       {hp && (
         <div style={{ position: "absolute", bottom: "100%", left: Math.min(Math.max(hp.x - 44, 0), width - 88), background: "#1e293bee", border: "1px solid #334155", borderRadius: 6, padding: "4px 8px", fontSize: 11, color: "#e2e8f0", whiteSpace: "nowrap", pointerEvents: "none", marginBottom: 4, zIndex: 10 }}>
-          <div style={{ fontWeight: 700 }}>{formatPrice(prices[hoverIdx])}</div>
+          <div style={{ fontWeight: 700 }}>{(formatter || formatPrice)(prices[hoverIdx])}</div>
           {times && times[hoverIdx] && (
             <div style={{ color: "#64748b", fontSize: 10 }}>
               {new Date(times[hoverIdx]).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
