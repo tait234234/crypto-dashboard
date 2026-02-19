@@ -452,18 +452,29 @@ const CHAIN_TO_GT_NETWORK = {
   optimism: "optimism", blast: "blast", sui: "sui",
 };
 
-// Timeframe definitions: label → { timespan, aggregate, limit }
+// Timeframe definitions — all use reliable hour-level data; "1H" tries minute first then falls back
+// label → primary fetch config + optional fallback
 const TF_CONFIG = {
-  "5m":  { timespan: "minute", aggregate: 1,  limit: 60  }, // 1h of 1min candles
-  "1h":  { timespan: "minute", aggregate: 5,  limit: 60  }, // 5h of 5min candles
-  "12h": { timespan: "hour",   aggregate: 1,  limit: 12  }, // 12 x 1h
-  "24h": { timespan: "hour",   aggregate: 1,  limit: 24  }, // 24 x 1h
+  "1H":  { timespan: "minute", aggregate: 5,  limit: 12,  fallback: { timespan: "hour", aggregate: 1, limit: 6  } },
+  "4H":  { timespan: "hour",   aggregate: 1,  limit: 4,   fallback: null },
+  "12H": { timespan: "hour",   aggregate: 1,  limit: 12,  fallback: null },
+  "1D":  { timespan: "hour",   aggregate: 1,  limit: 24,  fallback: null },
 };
 
-// Cache: cacheKey → { priceData, volumeData } so switching TF re-fetches but revisiting works
+// In-memory cache keyed by network:pool:tf
 const chartCache = {};
 
-function usePoolChart(chainId, poolAddress, enabled, timeframe = "24h") {
+async function fetchOHLCV(network, poolAddress, timespan, aggregate, limit) {
+  const url = `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/ohlcv/${timespan}?aggregate=${aggregate}&limit=${limit}`;
+  let res = await fetch(url);
+  if (res.status === 429) { await delay(2000); res = await fetch(url); }
+  if (!res.ok) throw new Error(`OHLCV ${res.status}`);
+  const json = await res.json();
+  const candles = (json.data?.attributes?.ohlcv_list || []).slice().reverse();
+  return candles; // [[ts, open, high, low, close, vol], ...] oldest first
+}
+
+function usePoolChart(chainId, poolAddress, enabled, timeframe = "1D") {
   const [priceData, setPriceData] = useState(null);
   const [volumeData, setVolumeData] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -471,10 +482,9 @@ function usePoolChart(chainId, poolAddress, enabled, timeframe = "24h") {
   useEffect(() => {
     if (!enabled || !poolAddress || !chainId) return;
     const network = CHAIN_TO_GT_NETWORK[chainId] ?? chainId;
-    const { timespan, aggregate, limit } = TF_CONFIG[timeframe] || TF_CONFIG["24h"];
+    const cfg = TF_CONFIG[timeframe] || TF_CONFIG["1D"];
     const cacheKey = `${network}:${poolAddress}:${timeframe}`;
 
-    // Serve from cache immediately if available
     if (chartCache[cacheKey]) {
       const { priceData: pd, volumeData: vd } = chartCache[cacheKey];
       setPriceData(pd); setVolumeData(vd);
@@ -485,22 +495,18 @@ function usePoolChart(chainId, poolAddress, enabled, timeframe = "24h") {
     const run = async () => {
       setLoading(true);
       try {
-        const url = `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/ohlcv/${timespan}?aggregate=${aggregate}&limit=${limit}`;
-        let res = await fetch(url);
-        if (res.status === 429) { await delay(2000); res = await fetch(url); }
-        if (!res.ok) throw new Error(`OHLCV ${res.status}`);
-        const json = await res.json();
-        const candles = json.data?.attributes?.ohlcv_list || [];
-        // GeckoTerminal: [[timestamp, open, high, low, close, volume], ...] newest first
-        const sorted = candles.slice().reverse();
-        const prices  = sorted.map((c) => [c[0] * 1000, c[4]]); // [ts, close]
-        const volumes = sorted.map((c) => [c[0] * 1000, c[5]]); // [ts, vol]
+        let candles = await fetchOHLCV(network, poolAddress, cfg.timespan, cfg.aggregate, cfg.limit);
+        // If primary returned < 2 candles and there's a fallback, try it
+        if (candles.length < 2 && cfg.fallback) {
+          candles = await fetchOHLCV(network, poolAddress, cfg.fallback.timespan, cfg.fallback.aggregate, cfg.fallback.limit);
+        }
+        const prices  = candles.map((c) => [c[0] * 1000, c[4]]); // [ts_ms, close]
+        const volumes = candles.map((c) => [c[0] * 1000, c[5]]); // [ts_ms, volume]
         const pd = prices.length >= 2 ? prices : null;
         const vd = volumes.length >= 2 ? volumes : null;
-        chartCache[cacheKey] = { priceData: pd, volumeData: vd }; // cache success
+        chartCache[cacheKey] = { priceData: pd, volumeData: vd };
         if (!cancelled) { setPriceData(pd); setVolumeData(vd); }
       } catch {
-        // Don't cache failures — allow retry on next open
         if (!cancelled) { setPriceData(null); setVolumeData(null); }
       } finally {
         if (!cancelled) setLoading(false);
@@ -768,21 +774,21 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
   const [showHolders, setShowHolders] = useState(false);
   const [showWalletHolders, setShowWalletHolders] = useState(false);
   const [showChart, setShowChart] = useState(false);
-  const [chartMode, setChartMode] = useState("price"); // "price" | "mcap" | "vol"
-  const [chartTf, setChartTf] = useState("24h");       // "5m" | "1h" | "12h" | "24h"
+  const [chartMode, setChartMode] = useState("price"); // "price" | "mcap"
+  const [chartTf, setChartTf] = useState("1D");        // "1H" | "4H" | "12H" | "1D"
   const [caCopied, setCaCopied] = useState(false);
   const { holders, loading: holdersLoading, error: holdersError, refetch: refetchHolders } = useTokenHolders(ca, pair.chainId, showHolders);
   const { priceData: chartData, volumeData, loading: chartLoading } = usePoolChart(pair.chainId, pair.pairAddress, showChart, chartTf);
 
-  // Derive mcap chart: supply = currentMcap / currentPrice (constant, so mcap chart mirrors price shape scaled)
+  // Derive mcap series by scaling price by fixed supply ratio
   const currentPrice = pair.priceUsd ? parseFloat(pair.priceUsd) : 0;
   const supply = currentPrice > 0 && mcap > 0 ? mcap / currentPrice : 0;
   const mcapChartData = chartData && supply > 0
     ? chartData.map(([ts, price]) => [ts, price * supply])
     : null;
 
-  const activeChartData = chartMode === "mcap" ? mcapChartData : chartMode === "vol" ? volumeData : chartData;
-  const chartFormatter = chartMode === "price" ? formatPrice : formatVolume;
+  const activeChartData = chartMode === "mcap" ? mcapChartData : chartData;
+  const chartFormatter = chartMode === "mcap" ? formatVolume : formatPrice;
 
   const glowClass = change1h === null ? "token-card-flat" : change1h >= 0 ? "token-card-up" : "token-card-down";
 
@@ -932,7 +938,7 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
             {/* Timeframe pills */}
             <div style={{ display: "flex", gap: 3 }}>
-              {["5m", "1h", "12h", "24h"].map((tf) => {
+              {["1H", "4H", "12H", "1D"].map((tf) => {
                 const active = chartTf === tf;
                 return (
                   <button key={tf}
@@ -942,15 +948,16 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
                       border: `1px solid ${active ? "#38bdf8" : "#1e293b"}`,
                       background: active ? "#38bdf822" : "transparent",
                       color: active ? "#7dd3fc" : "#475569",
-                      cursor: chartLoading ? "default" : "pointer", opacity: chartLoading && !active ? 0.4 : 1 }}>
+                      cursor: chartLoading ? "default" : "pointer",
+                      opacity: chartLoading && !active ? 0.4 : 1 }}>
                     {tf}
                   </button>
                 );
               })}
             </div>
-            {/* Mode pills */}
+            {/* Mode pills — Vol is always shown as overlay, not a separate mode */}
             <div style={{ display: "flex", gap: 3 }}>
-              {[["price", "Price"], ["mcap", "MCap"], ["vol", "Vol"]].map(([mode, label]) => {
+              {[["price", "Price"], ["mcap", "MCap"]].map(([mode, label]) => {
                 const active = chartMode === mode;
                 return (
                   <button key={mode}
@@ -960,7 +967,8 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
                       border: `1px solid ${active ? "#6366f1" : "#1e293b"}`,
                       background: active ? "#6366f122" : "transparent",
                       color: active ? "#a5b4fc" : "#475569",
-                      cursor: chartLoading ? "default" : "pointer", opacity: chartLoading && !active ? 0.4 : 1 }}>
+                      cursor: chartLoading ? "default" : "pointer",
+                      opacity: chartLoading && !active ? 0.4 : 1 }}>
                     {label}
                   </button>
                 );
@@ -974,7 +982,14 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank })
             </div>
           )}
           {!chartLoading && activeChartData && activeChartData.length >= 2 && (
-            <Sparkline data={activeChartData} width="100%" height={52} interactive formatter={chartFormatter} />
+            <Sparkline
+              data={activeChartData}
+              volumeData={volumeData}
+              width="100%"
+              height={56}
+              interactive
+              formatter={chartFormatter}
+            />
           )}
           {!chartLoading && (!activeChartData || activeChartData.length < 2) && (
             <div style={{ color: "#334155", fontSize: 11, textAlign: "center", padding: "8px 0" }}>No chart data</div>
@@ -1247,18 +1262,19 @@ const LiveIndicator = () => (
   </div>
 );
 
-// ─── Sparkline (SVG mini chart with optional hover) ───
-// Uses a fixed internal viewBox (300×height) so it scales to any container width
+// ─── Sparkline (SVG mini chart with optional hover + volume overlay) ───
+// Uses a fixed internal viewBox (300×height) so it scales to any container width.
+// Optional volumeData: [[ts, vol], ...] — renders as semi-transparent bars behind the line.
 const SPARK_VB_W = 300;
-const Sparkline = ({ data, width = 140, height = 32, color, interactive = false, formatter }) => {
+const Sparkline = ({ data, volumeData, width = 140, height = 32, color, interactive = false, formatter }) => {
   const containerRef = useRef(null);
   const [hoverIdx, setHoverIdx] = useState(null);
   if (!data || data.length < 2) return null;
 
-  // data can be [[timestamp, price], ...] or [price, ...]
   const hasTime = Array.isArray(data[0]);
   const prices = hasTime ? data.map((d) => d[1]) : data;
   const times  = hasTime ? data.map((d) => d[0]) : null;
+
   const min = Math.min(...prices);
   const max = Math.max(...prices);
   const range = max - min || 1;
@@ -1266,7 +1282,7 @@ const Sparkline = ({ data, width = 140, height = 32, color, interactive = false,
   const stroke = color || (positive ? "#4ade80" : "#f87171");
   const gradId = `sf-${stroke.replace(/[^a-zA-Z0-9]/g, "")}`;
 
-  // Always calculate coords against fixed viewBox width
+  // Price line coords in viewBox space
   const coords = prices.map((p, i) => ({
     x: (i / (prices.length - 1)) * SPARK_VB_W,
     y: height - 2 - ((p - min) / range) * (height - 4),
@@ -1274,9 +1290,23 @@ const Sparkline = ({ data, width = 140, height = 32, color, interactive = false,
   const linePath = `M${coords.map((c) => `${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(" L")}`;
   const fillPath = `${linePath} L${SPARK_VB_W},${height} L0,${height} Z`;
 
+  // Volume bar calculations — bars use bottom 30% of chart height
+  const VOL_MAX_H = height * 0.3;
+  let volBars = null;
+  if (volumeData && volumeData.length >= 2) {
+    const vols = volumeData.map((d) => d[1]);
+    const maxVol = Math.max(...vols) || 1;
+    const n = vols.length;
+    const barW = Math.max(2, SPARK_VB_W / n - 1);
+    volBars = vols.map((v, i) => {
+      const barH = (v / maxVol) * VOL_MAX_H;
+      const x = (i / (n - 1)) * SPARK_VB_W - barW / 2;
+      return { x, y: height - barH, w: barW, h: barH };
+    });
+  }
+
   const onMove = interactive ? (e) => {
     const rect = e.currentTarget.getBoundingClientRect();
-    // Scale mouse x to viewBox space
     const mx = ((e.clientX - rect.left) / rect.width) * SPARK_VB_W;
     let best = 0, bestD = Infinity;
     for (let i = 0; i < coords.length; i++) {
@@ -1287,10 +1317,7 @@ const Sparkline = ({ data, width = 140, height = 32, color, interactive = false,
   } : undefined;
 
   const hp = hoverIdx !== null ? coords[hoverIdx] : null;
-  // Convert tooltip x from viewBox space back to % for positioning
   const tooltipLeftPct = hp ? (hp.x / SPARK_VB_W) * 100 : 0;
-
-  // svgWidth is the rendered pixel width (for numeric backward-compat); "100%" means fill container
   const svgWidth = width === "100%" ? "100%" : width;
 
   return (
@@ -1309,8 +1336,20 @@ const Sparkline = ({ data, width = 140, height = 32, color, interactive = false,
             <stop offset="100%" stopColor={stroke} stopOpacity="0" />
           </linearGradient>
         </defs>
+        {/* Volume bars — behind everything */}
+        {volBars && volBars.map((b, i) => (
+          <rect key={i} x={b.x} y={b.y} width={b.w} height={b.h}
+            fill={stroke} opacity="0.15" rx="1" />
+        ))}
+        {/* Hover volume bar highlight */}
+        {hp && volBars && volBars[hoverIdx] && (() => {
+          const b = volBars[hoverIdx];
+          return <rect x={b.x} y={b.y} width={b.w} height={b.h} fill={stroke} opacity="0.35" rx="1" />;
+        })()}
+        {/* Price fill + line */}
         <path d={fillPath} fill={`url(#${gradId})`} />
         <path d={linePath} fill="none" stroke={stroke} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+        {/* Crosshair */}
         {hp && (
           <>
             <line x1={hp.x} y1={0} x2={hp.x} y2={height} stroke="#ffffff22" strokeWidth="1" strokeDasharray="3,3" />
@@ -1318,16 +1357,20 @@ const Sparkline = ({ data, width = 140, height = 32, color, interactive = false,
           </>
         )}
       </svg>
+      {/* Hover tooltip */}
       {hp && (
         <div style={{
           position: "absolute", bottom: "100%",
-          left: `clamp(0px, calc(${tooltipLeftPct}% - 44px), calc(100% - 94px))`,
+          left: `clamp(0px, calc(${tooltipLeftPct}% - 50px), calc(100% - 110px))`,
           background: "#1e293bef", border: "1px solid #334155", borderRadius: 6,
           padding: "4px 8px", fontSize: 11, color: "#e2e8f0",
           whiteSpace: "nowrap", pointerEvents: "none", marginBottom: 4, zIndex: 10,
         }}>
           <div style={{ fontWeight: 700 }}>{(formatter || formatPrice)(prices[hoverIdx])}</div>
-          {times && times[hoverIdx] && (
+          {volBars && volumeData?.[hoverIdx] && (
+            <div style={{ color: "#64748b", fontSize: 10 }}>Vol {formatVolume(volumeData[hoverIdx][1])}</div>
+          )}
+          {times?.[hoverIdx] && (
             <div style={{ color: "#64748b", fontSize: 10 }}>
               {new Date(times[hoverIdx]).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
             </div>
