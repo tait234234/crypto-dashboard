@@ -3,6 +3,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 // ─── Live Price Hook (CoinGecko) ───
 function useCryptoPrices() {
   const [prices, setPrices] = useState(null);
+  const [sparklines, setSparklines] = useState({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -22,13 +23,34 @@ function useCryptoPrices() {
     }
   }, []);
 
+  const fetchSparklines = useCallback(async () => {
+    const ids = ["bitcoin", "ethereum", "solana"];
+    const result = {};
+    for (const id of ids) {
+      try {
+        const res = await fetch(
+          `https://api.coingecko.com/api/v3/coins/${id}/market_chart?vs_currency=usd&days=1`
+        );
+        if (!res.ok) continue;
+        const data = await res.json();
+        const raw = (data.prices || []).map(([, p]) => p);
+        // Downsample to ~50 points for a clean sparkline
+        const step = Math.max(1, Math.floor(raw.length / 50));
+        result[id] = raw.filter((_, i) => i % step === 0);
+      } catch {}
+    }
+    if (Object.keys(result).length > 0) setSparklines(result);
+  }, []);
+
   useEffect(() => {
     fetchPrices();
-    const interval = setInterval(fetchPrices, 60000);
-    return () => clearInterval(interval);
-  }, [fetchPrices]);
+    fetchSparklines();
+    const priceInterval = setInterval(fetchPrices, 60000);
+    const sparklineInterval = setInterval(fetchSparklines, 300000); // every 5 min
+    return () => { clearInterval(priceInterval); clearInterval(sparklineInterval); };
+  }, [fetchPrices, fetchSparklines]);
 
-  return { prices, loading, error, refetch: fetchPrices };
+  return { prices, sparklines, loading, error, refetch: fetchPrices };
 }
 
 // ─── GeckoTerminal Trending Tokens Hook ───
@@ -92,12 +114,18 @@ function fetchPoolsIntoList(data, network, out, { volMin, liqMin, h1Min, h24HrMi
   });
 }
 
+// Tokens that always dominate volume but aren't interesting for discovery
+const BLACKLISTED_CAS = new Set([
+  "So11111111111111111111111111111111111111112",  // Wrapped SOL
+]);
+
 function dedupeAndSlice(tokens, sortByVol = false) {
   const arr  = sortByVol ? [...tokens].sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0)) : tokens;
   const seen = new Set();
   return arr.filter((t) => {
-    if (!t.baseToken.address || seen.has(t.baseToken.address)) return false;
-    seen.add(t.baseToken.address);
+    const addr = t.baseToken.address;
+    if (!addr || seen.has(addr) || BLACKLISTED_CAS.has(addr)) return false;
+    seen.add(addr);
     return true;
   }).slice(0, 40);
 }
@@ -231,84 +259,6 @@ function usePinnedTokens(pinnedCAs) {
 
   useEffect(() => { fetchPinned(); }, [fetchPinned]);
   return { tokens, loading, refetch: fetchPinned };
-}
-
-// ─── Top Volume Tokens Hook (GeckoTerminal) ───
-function useTopVolumeTokens(activeChain) {
-  const cacheKey = `gt_topvol_${activeChain}`;
-  const [tokens, setTokens] = useState(() => readCache(cacheKey));
-  const [loading, setLoading] = useState(() => readCache(cacheKey).length === 0);
-  const [refreshing, setRefreshing] = useState(false);
-  const [fetchedAt, setFetchedAt] = useState(() => readCacheTs(cacheKey));
-  const [error, setError] = useState(null);
-  const fetchIdRef = useRef(0);
-  const hasDataRef = useRef(readCache(cacheKey).length > 0);
-
-  const fetchTopVol = useCallback(async () => {
-    const myId = ++fetchIdRef.current;
-    if (!hasDataRef.current) { setLoading(true); setError(null); }
-    else setRefreshing(true);
-    try {
-      const networksToFetch = getNetworksToFetch(activeChain);
-      const allTokens = [];
-      let successPages = 0;
-
-      for (const network of networksToFetch) {
-        for (const page of [1, 2, 3]) {
-          try {
-            const res = await fetch(
-              `https://api.geckoterminal.com/api/v2/networks/${network}/pools?page=${page}&sort=h24_volume_usd_desc&include=base_token`
-            );
-            if (!res.ok) continue;
-            fetchPoolsIntoList(await res.json(), network, allTokens, { volMin: 500, liqMin: 2000, h1Min: 5, h24HrMin: 10 });
-            successPages++;
-          } catch {}
-        }
-      }
-
-      if (successPages === 0) throw new Error("GeckoTerminal unreachable — rate limited or offline.");
-      const deduped = dedupeAndSlice(allTokens, true);
-
-      if (fetchIdRef.current !== myId) return;
-      const now = Date.now();
-      setTokens(deduped);
-      setFetchedAt(now);
-      setError(null);
-      hasDataRef.current = true;
-      writeCache(cacheKey, deduped);
-    } catch (err) {
-      if (fetchIdRef.current !== myId) return;
-      if (!hasDataRef.current) setError(err.message);
-    } finally {
-      if (fetchIdRef.current !== myId) return;
-      setLoading(false);
-      setRefreshing(false);
-    }
-  }, [activeChain]);
-
-  useEffect(() => {
-    const cached = readCache(cacheKey);
-    if (cached.length > 0) {
-      setTokens(cached);
-      setFetchedAt(readCacheTs(cacheKey));
-      hasDataRef.current = true;
-      setLoading(false);
-    } else {
-      setTokens([]);
-      setFetchedAt(null);
-      hasDataRef.current = false;
-      setLoading(true);
-    }
-    setError(null);
-  }, [activeChain]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    fetchTopVol();
-    const interval = setInterval(fetchTopVol, 120000);
-    return () => { fetchIdRef.current++; clearInterval(interval); };
-  }, [fetchTopVol]);
-
-  return { tokens, loading, refreshing, fetchedAt, error, refetch: fetchTopVol };
 }
 
 // ─── Solana RPC helper — tries endpoints in order, handles 403 / 429 ───
@@ -1119,6 +1069,36 @@ const LiveIndicator = () => (
   </div>
 );
 
+// ─── Sparkline (SVG mini chart) ───
+const Sparkline = ({ data, width = 140, height = 32, color }) => {
+  if (!data || data.length < 2) return null;
+  const min = Math.min(...data);
+  const max = Math.max(...data);
+  const range = max - min || 1;
+  const positive = data[data.length - 1] >= data[0];
+  const stroke = color || (positive ? "#4ade80" : "#f87171");
+  const pts = data.map((val, i) => {
+    const x = (i / (data.length - 1)) * width;
+    const y = height - 2 - ((val - min) / range) * (height - 4);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  // Build fill area path (line + close at bottom)
+  const linePath = `M${pts.join(" L")}`;
+  const fillPath = `${linePath} L${width},${height} L0,${height} Z`;
+  return (
+    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} style={{ display: "block", marginTop: 6 }}>
+      <defs>
+        <linearGradient id={`spark-fill-${stroke.replace("#", "")}`} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={stroke} stopOpacity="0.15" />
+          <stop offset="100%" stopColor={stroke} stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      <path d={fillPath} fill={`url(#spark-fill-${stroke.replace("#", "")})`} />
+      <path d={linePath} fill="none" stroke={stroke} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" opacity="0.8" />
+    </svg>
+  );
+};
+
 // ─── Filter / Sort Bar ───
 const SORT_OPTIONS = [
   { key: "vol",      label: "Vol 24h" },
@@ -1327,7 +1307,7 @@ export default function App() {
   const [activeSection, setActiveSection] = useState("discover"); // "discover" | "wallets"
   const chains = ["All Chains", "Solana", "Base"];
 
-  const { prices, loading: priceLoading, error: priceError } = useCryptoPrices();
+  const { prices, sparklines, loading: priceLoading, error: priceError } = useCryptoPrices();
   const { tokens, loading: tokenLoading, refreshing: tokenRefreshing, fetchedAt: tokenFetchedAt, error: tokenError } = useTrendingTokens(activeChain);
 
   // Pinned CAs: [{ca, chainId}]
@@ -1336,7 +1316,6 @@ export default function App() {
   });
 
   const { tokens: pinnedTokens, loading: pinnedLoading, refetch: refetchPinned } = usePinnedTokens(pinnedCAs);
-  const { tokens: topVolTokens, loading: topVolLoading, refreshing: topVolRefreshing, fetchedAt: topVolFetchedAt, error: topVolError } = useTopVolumeTokens(activeChain);
 
   // Wallets: [{address, label}]
   const [wallets, setWallets] = useState(() => {
@@ -1401,10 +1380,7 @@ export default function App() {
       });
   };
 
-  // Most recent successful API fetch across both data sources
-  const lastFetchedAt = tokenFetchedAt || topVolFetchedAt
-    ? new Date(Math.max(tokenFetchedAt || 0, topVolFetchedAt || 0))
-    : null;
+  const lastFetchedAt = tokenFetchedAt ? new Date(tokenFetchedAt) : null;
 
   useEffect(() => {
     localStorage.setItem("pinnedCAs", JSON.stringify(pinnedCAs));
@@ -1436,8 +1412,6 @@ export default function App() {
 
   const filteredTokens = applyFilters(tokens.filter(chainFilter));
   const filteredPinned = applyFilters(pinnedTokens.filter(chainFilter));
-  // topVolTokens already fetched per-chain by the hook; still apply sort/filter controls
-  const filteredTopVol = applyFilters(topVolTokens);
 
   const coinConfigs = [
     { id: "bitcoin", symbol: "BTC", color: "#F7931A" },
@@ -1480,12 +1454,12 @@ export default function App() {
           <span style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase" }}>Market Overview</span>
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
             <LiveIndicator />
-            {(tokenRefreshing || topVolRefreshing) && (
+            {tokenRefreshing && (
               <span style={{ color: "#475569", fontSize: 11, display: "flex", alignItems: "center", gap: 4 }}>
                 <span style={{ display: "inline-block", animation: "spin 1s linear infinite" }}>↺</span> Refreshing…
               </span>
             )}
-            {lastFetchedAt && !tokenRefreshing && !topVolRefreshing && (
+            {lastFetchedAt && !tokenRefreshing && (
               <span style={{ color: "#334155", fontSize: 11 }}>Updated {lastFetchedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
             )}
           </div>
@@ -1514,8 +1488,9 @@ export default function App() {
                       <span style={{ fontWeight: 700, fontSize: 13, color: "#94a3b8", letterSpacing: 0.5 }}>{coin.symbol}</span>
                     </div>
                     <div style={{ fontSize: 24, fontWeight: 800, color: "#f8fafc", marginBottom: 2, letterSpacing: -0.5 }}>{formatPrice(price)}</div>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: positive ? "#4ade80" : "#f87171", marginBottom: 12 }}>{formatChange(change)}</div>
-                    <div style={{ color: "#475569", fontSize: 11, lineHeight: 1.8, borderTop: "1px solid #1e293b", paddingTop: 8, display: "flex", flexDirection: "column", gap: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: positive ? "#4ade80" : "#f87171", marginBottom: 4 }}>{formatChange(change)}</div>
+                    <Sparkline data={sparklines?.[coin.id]} width={160} height={32} color={positive ? "#4ade80" : "#f87171"} />
+                    <div style={{ color: "#475569", fontSize: 11, lineHeight: 1.8, borderTop: "1px solid #1e293b", paddingTop: 8, marginTop: 4, display: "flex", flexDirection: "column", gap: 1 }}>
                       <span>Vol 24h <span style={{ color: "#64748b" }}>{formatVolume(vol)}</span></span>
                       <span>MCap <span style={{ color: "#64748b" }}>{formatVolume(mcap)}</span></span>
                     </div>
@@ -1531,7 +1506,6 @@ export default function App() {
         <div className="tab-group">
           {[
             { key: "discover", label: "🔥 Discover" },
-            { key: "topvol",   label: "📊 Top Vol" },
             { key: "wallets",  label: `👜 Wallets${wallets.length > 0 ? ` (${wallets.length})` : ""}` },
           ].map((s) => (
             <button
@@ -1650,57 +1624,6 @@ export default function App() {
 
           {!tokenLoading && filteredTokens.length === 0 && !tokenError && (
             <div style={{ textAlign: "center", color: "#475569", padding: 48, fontSize: 14 }}>No trending tokens found for this chain right now.</div>
-          )}
-        </>
-      )}
-
-      {/* ─── Top Vol Section ─── */}
-      {activeSection === "topvol" && (
-        <>
-          <FilterBar
-            sortBy={sortBy}
-            sortDir={sortDir}
-            onSort={handleSort}
-            minVol={minVol}
-            onMinVol={setMinVol}
-            minMcap={minMcap}
-            onMinMcap={setMinMcap}
-            minChange1h={minChange1h}
-            onMinChange1h={setMinChange1h}
-            count={filteredTopVol.length}
-            total={topVolTokens.length}
-          />
-
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 16 }}>
-            <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#f59e0b", margin: 0 }}>📊 Top Volume</h2>
-            <span style={{ color: "#64748b", fontSize: 12 }}>Sort by Vol 1h / 6h / 24h above</span>
-          </div>
-
-          {topVolError && (
-            <div style={{ background: "#7f1d1d33", border: "1px solid #991b1b", borderRadius: 8, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 13 }}>⚠ Fetch failed: {topVolError}</div>
-          )}
-
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 14 }}>
-            {topVolLoading
-              ? [1, 2, 3, 4, 5, 6].map((i) => <TokenSkeleton key={i} />)
-              : filteredTopVol.map((pair, i) => {
-                  const ca = pair.baseToken?.address || "";
-                  return (
-                    <TokenCard
-                      key={`topvol-${pair.pairAddress}-${i}`}
-                      pair={pair}
-                      rank={i + 1}
-                      isPinned={pinnedCAs.some((p) => p.ca === ca)}
-                      onPin={pinToken}
-                      onUnpin={unpinToken}
-                      walletHolders={walletMintMap[ca] || []}
-                    />
-                  );
-                })}
-          </div>
-
-          {!topVolLoading && filteredTopVol.length === 0 && !topVolError && (
-            <div style={{ textAlign: "center", color: "#475569", padding: 48, fontSize: 14 }}>No tokens found for this chain / filter combination.</div>
           )}
         </>
       )}
