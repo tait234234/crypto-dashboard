@@ -1181,9 +1181,12 @@ async function fetchWalletTxs(address, maxTxs = 200) {
   let before = undefined;
   while (all.length < maxTxs) {
     const toFetch = Math.min(PER_PAGE, maxTxs - all.length);
-    const url = `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_KEY}&limit=${toFetch}&type=TRANSFER${before ? `&before=${before}` : ""}`;
+    // No type filter — include TRANSFER, SWAP, etc. so co-investors via DEX
+    // swaps also appear as related wallet counterparties.
+    const base = "https://api.helius.xyz/v0/addresses/" + address + "/transactions";
+    const params = "?api-key=" + HELIUS_KEY + "&limit=" + toFetch + (before ? "&before=" + before : "");
     try {
-      const res = await fetch(url);
+      const res = await fetch(base + params);
       if (!res.ok) break;
       const page = await res.json();
       if (!Array.isArray(page) || !page.length) break;
@@ -2088,7 +2091,7 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
       {activeCA && renderTokenHolders()}
 
       <div style={{ fontSize: 10, color: "#1e293b", marginTop: 8 }}>
-        Based on last 50 transactions per wallet via Helius • Amber dot = linked to 2+ of your wallets
+        Based on up to 200 transactions per wallet (all types) via Helius • Amber dot = linked to 2+ of your wallets
       </div>
     </div>
   );
