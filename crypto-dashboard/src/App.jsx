@@ -1569,7 +1569,11 @@ function RelatedWallets({ relatedWallets, trackedAddrs, loading, onTrack, wallet
 
   // ── Token CA filter state ──
   const [caInput, setCaInput] = useState("");
-  const [activeCA, setActiveCA] = useState(null); // CA currently being filtered by
+  const [activeCA, setActiveCA] = useState(null);
+  const [filterLoading, setFilterLoading] = useState(false);
+  const [filterError, setFilterError] = useState(null);
+  const [filterMeta, setFilterMeta] = useState(null);   // { icon, symbol }
+  const [filterResults, setFilterResults] = useState([]); // relatedWallet entries that hold the CA, + tokenAmount
 
   // Build mint → {icon, symbol} from walletMintMap
   const mintMeta = useMemo(() => {
@@ -1581,59 +1585,89 @@ function RelatedWallets({ relatedWallets, trackedAddrs, loading, onTrack, wallet
     return m;
   }, [walletMintMap]);
 
-  // Tracked wallets that hold the active token CA — derived directly from walletMintMap
-  const tokenHolders = useMemo(() => {
-    if (!activeCA) return [];
-    return walletMintMap[activeCA] || [];
-  }, [activeCA, walletMintMap]);
-
-  const handleSearch = (e) => {
+  const handleSearch = async (e) => {
     e.preventDefault();
     const ca = caInput.trim();
-    if (!ca) return;
+    if (!ca || !relatedWallets.length) return;
     setActiveCA(ca);
+    setFilterLoading(true);
+    setFilterError(null);
+    setFilterResults([]);
+
+    // Resolve token meta from walletMintMap first, fall back to DexScreener
+    let meta = mintMeta.get(ca) || null;
+    if (!meta) {
+      try {
+        const dex = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${ca}`);
+        const dexJson = await dex.json();
+        const pair = dexJson?.pairs?.[0];
+        if (pair) meta = { icon: pair.info?.imageUrl || null, symbol: pair.baseToken?.symbol || ca.slice(0, 6) };
+      } catch (_) {}
+    }
+    setFilterMeta(meta);
+
+    // Check each related wallet for holdings — batch 5 at a time to avoid rate limits
+    const BATCH = 5;
+    const found = [];
+    for (let i = 0; i < relatedWallets.length; i += BATCH) {
+      const batch = relatedWallets.slice(i, i + BATCH);
+      const results = await Promise.all(batch.map(async (w) => {
+        try {
+          const res = await fetch(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              jsonrpc: "2.0", id: w.address,
+              method: "getTokenAccountsByOwner",
+              params: [w.address, { mint: ca }, { encoding: "jsonParsed" }],
+            }),
+          });
+          const json = await res.json();
+          const accounts = json?.result?.value || [];
+          const amount = accounts.reduce(
+            (sum, a) => sum + (a.account?.data?.parsed?.info?.tokenAmount?.uiAmount || 0), 0
+          );
+          return amount > 0 ? { ...w, tokenAmount: amount } : null;
+        } catch (_) { return null; }
+      }));
+      found.push(...results.filter(Boolean));
+      setFilterResults([...found]); // update incrementally
+    }
+
+    setFilterLoading(false);
   };
 
-  const clearSearch = () => { setActiveCA(null); setCaInput(""); };
+  const clearSearch = () => { setActiveCA(null); setCaInput(""); setFilterResults([]); setFilterMeta(null); setFilterError(null); };
 
   if (loading) return null;
-  if (!relatedWallets.length && !activeCA) return (
-    <div style={{ background: "#0d1321", border: "1px solid #1e293b", borderRadius: 14, padding: "16px 20px", marginBottom: 20 }}>
-      <h3 style={{ margin: "0 0 10px", fontSize: 13, fontWeight: 800, color: "#e2e8f0", letterSpacing: 0.5 }}>
-        Potentially Related Wallets
-      </h3>
-      {renderCAFilter()}
-      {renderTokenHolders()}
-    </div>
-  );
+  if (!relatedWallets.length && !activeCA) return null;
 
   function renderCAFilter() {
-    const meta = activeCA ? mintMeta.get(activeCA) : null;
+    const meta = filterMeta || (activeCA ? mintMeta.get(activeCA) : null);
     return (
-      <form onSubmit={handleSearch} style={{ display: "flex", gap: 6, alignItems: "center" }}>
-        {/* Show token icon next to input when active */}
+      <form onSubmit={handleSearch} style={{ display: "flex", gap: 6, flexShrink: 0, alignItems: "center" }}>
         {meta?.icon && (
-          <img src={meta.icon} alt={meta.symbol} style={{ width: 18, height: 18, borderRadius: "50%", objectFit: "cover", flexShrink: 0 }} onError={(e) => { e.target.style.display = "none"; }} />
+          <img src={meta.icon} alt={meta.symbol} style={{ width: 16, height: 16, borderRadius: "50%", objectFit: "cover", flexShrink: 0 }} onError={(e) => { e.target.style.display = "none"; }} />
         )}
         <input
           value={caInput}
           onChange={(e) => setCaInput(e.target.value)}
           placeholder="Filter by token CA…"
           style={{
-            flex: 1, padding: "5px 10px", background: "#111827", border: `1px solid ${activeCA ? "#6366f144" : "#1e293b"}`,
+            width: 220, padding: "5px 10px", background: "#111827", border: `1px solid ${activeCA ? "#6366f144" : "#1e293b"}`,
             borderRadius: 6, color: "#e2e8f0", fontSize: 11, outline: "none", fontFamily: "monospace",
           }}
         />
         <button
           type="submit"
-          disabled={!caInput.trim()}
+          disabled={filterLoading || !caInput.trim()}
           style={{
             padding: "5px 12px", borderRadius: 6, background: "#6366f122", border: "1px solid #6366f144",
             color: "#818cf8", fontSize: 11, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap",
-            opacity: !caInput.trim() ? 0.5 : 1,
+            opacity: filterLoading || !caInput.trim() ? 0.5 : 1,
           }}
         >
-          Filter
+          {filterLoading ? "…" : "Filter"}
         </button>
         {activeCA && (
           <button type="button" onClick={clearSearch}
@@ -1648,73 +1682,95 @@ function RelatedWallets({ relatedWallets, trackedAddrs, loading, onTrack, wallet
 
   function renderTokenHolders() {
     if (!activeCA) return null;
-    const meta = mintMeta.get(activeCA);
+    const meta = filterMeta || mintMeta.get(activeCA);
     const fmt = (n) => n >= 1e9 ? `${(n / 1e9).toFixed(2)}B`
       : n >= 1e6 ? `${(n / 1e6).toFixed(2)}M`
       : n >= 1e3 ? `${(n / 1e3).toFixed(1)}K`
-      : n.toLocaleString();
+      : n.toLocaleString(undefined, { maximumFractionDigits: 2 });
 
     return (
-      <div style={{ marginTop: 10 }}>
+      <div style={{ marginTop: 12, borderTop: "1px solid #1e293b", paddingTop: 12 }}>
+        {/* Header */}
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
           {meta?.icon && (
-            <img src={meta.icon} alt={meta.symbol} style={{ width: 16, height: 16, borderRadius: "50%", objectFit: "cover" }} onError={(e) => { e.target.style.display = "none"; }} />
+            <img src={meta.icon} alt={meta?.symbol} style={{ width: 16, height: 16, borderRadius: "50%", objectFit: "cover" }} onError={(e) => { e.target.style.display = "none"; }} />
           )}
           <span style={{ fontSize: 11, fontWeight: 700, color: "#e2e8f0" }}>
-            {meta?.symbol ? `Tracked wallets holding ${meta.symbol}` : "Tracked wallets holding this token"}
+            {meta?.symbol ? `Related wallets holding ${meta.symbol}` : "Related wallets holding this token"}
           </span>
-          <span style={{ background: tokenHolders.length ? "#6366f122" : "#1e293b", color: tokenHolders.length ? "#818cf8" : "#475569", border: `1px solid ${tokenHolders.length ? "#6366f133" : "#1e293b"}`, borderRadius: 4, fontSize: 10, fontWeight: 700, padding: "1px 6px" }}>
-            {tokenHolders.length}
+          <span style={{ background: filterResults.length ? "#6366f122" : "#1e293b", color: filterResults.length ? "#818cf8" : "#475569", border: `1px solid ${filterResults.length ? "#6366f133" : "#1e293b"}`, borderRadius: 4, fontSize: 10, fontWeight: 700, padding: "1px 6px" }}>
+            {filterLoading ? `${filterResults.length}…` : filterResults.length}
           </span>
+          {filterLoading && (
+            <span style={{ fontSize: 10, color: "#475569" }}>checking {relatedWallets.length} wallets…</span>
+          )}
         </div>
 
-        {tokenHolders.length === 0 ? (
-          <div style={{ fontSize: 11, color: "#475569", padding: "8px 0" }}>
-            None of your tracked wallets hold this token.
-          </div>
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-            {tokenHolders.map((h) => (
-              <div key={h.address} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px", background: "#111827", borderRadius: 7, border: "1px solid #6366f122" }}>
-                {/* Token icon */}
-                {meta?.icon
-                  ? <img src={meta.icon} alt={meta.symbol} style={{ width: 14, height: 14, borderRadius: "50%", objectFit: "cover", flexShrink: 0 }} onError={(e) => { e.target.style.display = "none"; }} />
-                  : <div style={{ width: 14, height: 14, borderRadius: "50%", background: "#334155", flexShrink: 0 }} />
-                }
+        {filterError && <div style={{ fontSize: 11, color: "#f87171", marginBottom: 8 }}>{filterError}</div>}
 
-                {/* Label + address */}
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  {h.label && (
-                    <div style={{ fontSize: 10, fontWeight: 700, color: "#818cf8", marginBottom: 1 }}>{h.label}</div>
-                  )}
-                  <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block" }}>
-                    {h.address}
-                  </span>
-                </div>
-
-                {/* Amount + USD */}
-                <div style={{ textAlign: "right", flexShrink: 0 }}>
-                  <div style={{ fontSize: 10, fontWeight: 700, color: "#e2e8f0" }}>{fmt(h.amount)} {meta?.symbol || ""}</div>
-                  {h.usdValue > 0 && (
-                    <div style={{ fontSize: 9, color: "#475569" }}>${h.usdValue.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
-                  )}
-                </div>
-
-                {/* Copy */}
-                <button
-                  onClick={() => navigator.clipboard?.writeText(h.address)}
-                  title="Copy address"
-                  style={{ width: 24, height: 24, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", color: "#64748b", fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}
-                >
-                  ⎘
-                </button>
-              </div>
-            ))}
+        {!filterLoading && filterResults.length === 0 && (
+          <div style={{ fontSize: 11, color: "#475569", padding: "4px 0" }}>
+            None of your related wallets hold this token.
           </div>
         )}
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {filterResults.map((r) => {
+            const isAlreadyTracked = trackedAddrs.has(r.address) || tracked.has(r.address);
+            const isStrong = r.sharedWith.length >= 2;
+            return (
+              <div key={r.address} style={{ background: "#111827", borderRadius: 8, border: `1px solid ${isStrong ? "#f59e0b33" : "#6366f122"}`, overflow: "hidden" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px" }}>
+                  {/* Dot */}
+                  <div style={{ width: 7, height: 7, borderRadius: "50%", background: isStrong ? "#f59e0b" : "#334155", flexShrink: 0 }} />
+
+                  {/* Address */}
+                  <span style={{ fontFamily: "monospace", fontSize: 11, color: "#94a3b8", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {r.address}
+                  </span>
+
+                  {/* Shared count */}
+                  <span style={{ fontSize: 9, color: "#64748b", flexShrink: 0 }}>
+                    {r.sharedWith.length} wallet{r.sharedWith.length !== 1 ? "s" : ""}
+                  </span>
+
+                  {/* Token amount badge */}
+                  <span style={{ background: "#6366f111", color: "#818cf8", border: "1px solid #6366f122", borderRadius: 4, fontSize: 9, fontWeight: 700, padding: "1px 6px", whiteSpace: "nowrap", flexShrink: 0 }}>
+                    {fmt(r.tokenAmount)} {meta?.symbol || ""}
+                  </span>
+
+                  {/* Copy + Track */}
+                  <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                    <button onClick={() => navigator.clipboard?.writeText(r.address)} title="Copy address"
+                      style={{ width: 24, height: 24, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", color: "#64748b", fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                      ⎘
+                    </button>
+                    <button
+                      onClick={() => { onTrack(r.address, ""); setTracked((prev) => new Set([...prev, r.address])); }}
+                      disabled={isAlreadyTracked}
+                      style={{ padding: "2px 8px", height: 24, borderRadius: 5, background: isAlreadyTracked ? "#1e293b" : "#4ade8022", border: `1px solid ${isAlreadyTracked ? "#334155" : "#4ade8044"}`, color: isAlreadyTracked ? "#334155" : "#4ade80", fontSize: 10, fontWeight: 700, cursor: isAlreadyTracked ? "default" : "pointer", whiteSpace: "nowrap" }}
+                    >
+                      {isAlreadyTracked ? "✓ tracked" : "+ Track"}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Shared with labels */}
+                {r.sharedWithLabels?.length > 0 && (
+                  <div style={{ display: "flex", gap: 4, padding: "0 10px 7px 25px", flexWrap: "wrap" }}>
+                    {r.sharedWithLabels.slice(0, 2).map((lbl, i) => (
+                      <span key={i} style={{ fontSize: 9, background: "#1e293b", color: "#64748b", borderRadius: 3, padding: "1px 5px" }}>{lbl}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
       </div>
     );
   }
+
 
   const strong = relatedWallets.filter((r) => r.sharedWith.length >= 2);
   const weak   = relatedWallets.filter((r) => r.sharedWith.length < 2);
@@ -1732,41 +1788,7 @@ function RelatedWallets({ relatedWallets, trackedAddrs, loading, onTrack, wallet
             Addresses that transacted with your tracked wallets — not yet added to tracker
           </div>
         </div>
-        {/* Token CA filter — always visible */}
-        <form onSubmit={handleSearch} style={{ display: "flex", gap: 6, flexShrink: 0, alignItems: "center" }}>
-          {activeCA && mintMeta.get(activeCA)?.icon && (
-            <img src={mintMeta.get(activeCA).icon} alt="" style={{ width: 16, height: 16, borderRadius: "50%", objectFit: "cover", flexShrink: 0 }} onError={(e) => { e.target.style.display = "none"; }} />
-          )}
-          <input
-            value={caInput}
-            onChange={(e) => setCaInput(e.target.value)}
-            placeholder="Filter by token CA…"
-            style={{
-              width: 220, padding: "5px 10px", background: "#111827", border: `1px solid ${activeCA ? "#6366f144" : "#1e293b"}`,
-              borderRadius: 6, color: "#e2e8f0", fontSize: 11, outline: "none", fontFamily: "monospace",
-            }}
-          />
-          <button
-            type="submit"
-            disabled={!caInput.trim()}
-            style={{
-              padding: "5px 12px", borderRadius: 6, background: "#6366f122", border: "1px solid #6366f144",
-              color: "#818cf8", fontSize: 11, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap",
-              opacity: !caInput.trim() ? 0.5 : 1,
-            }}
-          >
-            Filter
-          </button>
-          {activeCA && (
-            <button
-              type="button"
-              onClick={clearSearch}
-              style={{ padding: "5px 8px", borderRadius: 6, background: "transparent", border: "1px solid #334155", color: "#475569", fontSize: 11, cursor: "pointer" }}
-            >
-              ✕
-            </button>
-          )}
-        </form>
+        {renderCAFilter()}
       </div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -1861,11 +1883,7 @@ function RelatedWallets({ relatedWallets, trackedAddrs, loading, onTrack, wallet
       )}
 
       {/* Token holder filter results */}
-      {activeCA && (
-        <div style={{ marginTop: 12, borderTop: "1px solid #1e293b", paddingTop: 12 }}>
-          {renderTokenHolders()}
-        </div>
-      )}
+      {activeCA && renderTokenHolders()}
 
       <div style={{ fontSize: 10, color: "#1e293b", marginTop: 8 }}>
         Based on last 50 transactions per wallet via Helius • Amber dot = linked to 2+ of your wallets
