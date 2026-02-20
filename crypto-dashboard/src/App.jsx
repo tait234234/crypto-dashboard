@@ -1483,19 +1483,44 @@ function useWalletLinks(wallets, walletMintMap) {
       });
 
       // Common funder + related wallet discovery:
+      // Also track SOL/stablecoin transfer amounts per counterparty so we can
+      // prioritise high-value intermediaries for 2nd-degree probing.
+      const USDT_MINT_LOCAL = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+      const STABLES_LOCAL = new Set([USDC_MINT, USDT_MINT_LOCAL]);
       const externalMap = new Map();
       addrs.forEach((addr) => {
         const txs = txsByWallet.get(addr) || [];
         txs.forEach((tx) => {
+          const excluded = buildExcluded(tx);
           const mintMap = extractCounterpartyMints(tx, addr);
           extractCounterparties(tx, addr).forEach((cp) => {
             if (!addrSet.has(cp)) {
-              if (!externalMap.has(cp)) externalMap.set(cp, { wallets: new Set(), txCount: 0, mints: new Set() });
+              if (!externalMap.has(cp)) externalMap.set(cp, { wallets: new Set(), txCount: 0, mints: new Set(), sol: 0, stable: 0 });
               const entry = externalMap.get(cp);
               entry.wallets.add(addr);
               entry.txCount++;
               (mintMap.get(cp) || []).forEach((m) => entry.mints.add(m));
             }
+          });
+          // Accumulate SOL amounts per counterparty
+          (tx.nativeTransfers || []).forEach((t) => {
+            const solAmt = (t.amount || 0) / 1e9;
+            if (solAmt <= 0) return;
+            [t.fromUserAccount, t.toUserAccount].forEach((a) => {
+              if (a && a !== addr && !addrSet.has(a) && !excluded.has(a) && externalMap.has(a)) {
+                externalMap.get(a).sol += solAmt;
+              }
+            });
+          });
+          // Accumulate stablecoin amounts per counterparty
+          (tx.tokenTransfers || []).forEach((t) => {
+            const amt = t.tokenAmount || 0;
+            if (amt <= 0 || !STABLES_LOCAL.has(t.mint)) return;
+            [t.fromUserAccount, t.toUserAccount].forEach((a) => {
+              if (a && a !== addr && !addrSet.has(a) && !excluded.has(a) && externalMap.has(a)) {
+                externalMap.get(a).stable += amt;
+              }
+            });
           });
         });
       });
@@ -1514,9 +1539,9 @@ function useWalletLinks(wallets, walletMintMap) {
         }
       });
 
-      // 1st-degree related wallet list
+      // 1st-degree related wallet list — now includes sol/stable amounts
       const related = [];
-      externalMap.forEach(({ wallets: walletSet, txCount, mints }, extAddr) => {
+      externalMap.forEach(({ wallets: walletSet, txCount, mints, sol, stable }, extAddr) => {
         related.push({
           address: extAddr,
           sharedWith: [...walletSet],
@@ -1524,6 +1549,8 @@ function useWalletLinks(wallets, walletMintMap) {
           mints: [...mints],
           degree: 1,
           via: [],
+          sol: Math.round(sol * 1000) / 1000,
+          stable: Math.round(stable * 100) / 100,
           sharedWithLabels: [...walletSet].map((a) => {
             const w = wallets.find((x) => x.address === a);
             return w?.label || `${a.slice(0, 4)}…${a.slice(-4)}`;
@@ -1533,10 +1560,18 @@ function useWalletLinks(wallets, walletMintMap) {
       related.sort((a, b) => b.sharedWith.length - a.sharedWith.length || b.txCount - a.txCount);
 
       // ── 2nd-degree discovery: probe top intermediary wallets ──
-      // Increased from 10 → 20 targets, lowered min txCount from 2 → 1
+      // Sort by transfer value (SOL + stables) so high-value fund-flow
+      // intermediaries are probed first and deeper.
       const probeTargets = related
         .filter((r) => r.txCount >= 1)
-        .slice(0, 20);
+        .sort((a, b) => {
+          // Value score: SOL + stables normalised to SOL equivalent
+          const valA = (a.sol || 0) + (a.stable || 0) / 150;
+          const valB = (b.sol || 0) + (b.stable || 0) / 150;
+          if (valB !== valA) return valB - valA;
+          return b.sharedWith.length - a.sharedWith.length || b.txCount - a.txCount;
+        })
+        .slice(0, 30); // increased from 20 → 30
 
       if (probeTargets.length > 0 && !cancelled) {
         const knownAddrs = new Set([...addrSet, ...externalMap.keys()]);
@@ -1545,25 +1580,44 @@ function useWalletLinks(wallets, walletMintMap) {
         await Promise.all(
           probeTargets.map(async (intermediary) => {
             try {
-              const txs = await fetchWalletTxs(intermediary.address, 100, "TRANSFER");
+              // High-value intermediaries (≥$100 stables or ≥1 SOL) get a deeper probe
+              const isHighValue = (intermediary.stable || 0) >= 100 || (intermediary.sol || 0) >= 1;
+              const txLimit = isHighValue ? 300 : 100;
+              const txs = await fetchWalletTxs(intermediary.address, txLimit, "TRANSFER");
               if (cancelled) return;
               txs.forEach((tx) => {
+                const excluded = buildExcluded(tx);
                 extractCounterparties(tx, intermediary.address).forEach((cp) => {
                   if (addrSet.has(cp) || cp === intermediary.address) return;
                   if (knownAddrs.has(cp)) return;
-                  if (!secondDegree.has(cp)) secondDegree.set(cp, { via: new Set(), trackedLinks: new Set(), txCount: 0 });
+                  if (!secondDegree.has(cp)) secondDegree.set(cp, { via: new Set(), trackedLinks: new Set(), txCount: 0, sol: 0, stable: 0 });
                   const entry = secondDegree.get(cp);
                   entry.via.add(intermediary.address);
                   entry.txCount++;
                   intermediary.sharedWith.forEach((w) => entry.trackedLinks.add(w));
+                });
+                // Track SOL/stablecoin amounts for 2nd-degree counterparties
+                (tx.nativeTransfers || []).forEach((t) => {
+                  const solAmt = (t.amount || 0) / 1e9;
+                  if (solAmt <= 0) return;
+                  [t.fromUserAccount, t.toUserAccount].forEach((a) => {
+                    if (a && secondDegree.has(a)) secondDegree.get(a).sol += solAmt;
+                  });
+                });
+                (tx.tokenTransfers || []).forEach((t) => {
+                  const amt = t.tokenAmount || 0;
+                  if (amt <= 0 || !STABLES_LOCAL.has(t.mint)) return;
+                  [t.fromUserAccount, t.toUserAccount].forEach((a) => {
+                    if (a && secondDegree.has(a)) secondDegree.get(a).stable += amt;
+                  });
                 });
               });
             } catch {}
           })
         );
 
-        // Add 2nd-degree wallets — lowered from txCount >= 2 to >= 1
-        secondDegree.forEach(({ via, trackedLinks, txCount }, addr) => {
+        // Add 2nd-degree wallets with transfer amounts
+        secondDegree.forEach(({ via, trackedLinks, txCount, sol, stable }, addr) => {
           if (txCount < 1) return;
           related.push({
             address: addr,
@@ -1572,6 +1626,8 @@ function useWalletLinks(wallets, walletMintMap) {
             mints: [],
             degree: 2,
             via: [...via],
+            sol: Math.round(sol * 1000) / 1000,
+            stable: Math.round(stable * 100) / 100,
             viaLabels: [...via].map((v) => `${v.slice(0, 4)}…${v.slice(-4)}`),
             sharedWithLabels: [...trackedLinks].map((a) => {
               const w = wallets.find((x) => x.address === a);
@@ -1582,6 +1638,10 @@ function useWalletLinks(wallets, walletMintMap) {
 
         related.sort((a, b) => {
           if (a.degree !== b.degree) return a.degree - b.degree;
+          // Within same degree, sort by value then by shared wallet count
+          const valA = (a.sol || 0) + (a.stable || 0) / 150;
+          const valB = (b.sol || 0) + (b.stable || 0) / 150;
+          if (valB !== valA) return valB - valA;
           return b.sharedWith.length - a.sharedWith.length || b.txCount - a.txCount;
         });
       }
@@ -2516,6 +2576,8 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
                 <span style={{ display: "flex", gap: 10, marginTop: 5, flexWrap: "wrap", fontSize: 11 }}>
                   <span>Degree: <strong>{r.degree === 2 ? "2nd°" : "1st°"}</strong></span>
                   <span>Tx appearances: <strong>{r.txCount}</strong></span>
+                  {r.sol > 0 && <span>SOL: <strong>{r.sol}</strong></span>}
+                  {r.stable > 0 && <span>Stables: <strong>${r.stable}</strong></span>}
                   <span>Linked to: <strong>{r.sharedWithLabels?.join(", ") || "—"}</strong></span>
                   {r.via?.length > 0 && <span>Via: <strong>{r.via[0].slice(0, 8)}…</strong></span>}
                 </span>
@@ -2564,6 +2626,17 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
                   <span style={{ background: "#1e293b", color: "#475569", borderRadius: 4, fontSize: 9, padding: "1px 5px", whiteSpace: "nowrap" }}>
                     {r.txCount} tx{r.txCount !== 1 ? "s" : ""}
                   </span>
+                  {/* SOL/stablecoin transfer amounts */}
+                  {r.sol > 0 && (
+                    <span style={{ background: "#6366f122", color: "#818cf8", border: "1px solid #6366f133", borderRadius: 4, fontSize: 9, fontWeight: 700, padding: "1px 5px", whiteSpace: "nowrap" }}>
+                      {r.sol >= 1000 ? `${(r.sol / 1000).toFixed(1)}K` : r.sol.toFixed(r.sol < 1 ? 3 : 1)} SOL
+                    </span>
+                  )}
+                  {r.stable > 0 && (
+                    <span style={{ background: "#4ade8022", color: "#4ade80", border: "1px solid #4ade8044", borderRadius: 4, fontSize: 9, fontWeight: 700, padding: "1px 5px", whiteSpace: "nowrap" }}>
+                      ${r.stable >= 1000 ? `${(r.stable / 1000).toFixed(1)}K` : r.stable.toFixed(0)}
+                    </span>
+                  )}
                   {r.sharedWithLabels.slice(0, 2).map((lbl, i) => (
                     <span key={i} style={{ background: "#6366f122", color: "#818cf8", border: "1px solid #6366f133", borderRadius: 4, fontSize: 9, padding: "1px 5px", whiteSpace: "nowrap" }}>
                       {lbl}
@@ -2645,7 +2718,7 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
       {activeCA && renderTokenHolders()}
 
       <div style={{ fontSize: 10, color: "#334155", marginTop: 8 }}>
-        200 recent + 500 TRANSFER txs per wallet + 2nd-degree probing via Helius • Amber = 2+ wallets • Purple = 2nd° • Use Rescan for deeper history
+        200 recent + 500 TRANSFER txs per wallet • 2nd° probes top 30 intermediaries (high-value first, up to 300 txs) • Amber = 2+ wallets • Purple = 2nd° • Green = stablecoins
       </div>
     </div>
   );
