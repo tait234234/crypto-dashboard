@@ -522,33 +522,78 @@ const TF_CONFIG = {
   "1D":  { timespan: "hour", aggregate: 1, limit: 24 },
 };
 
-// Successful-only cache keyed by network:pool:tf (never caches null/empty results)
-const chartCache = {};
+// ── GeckoTerminal request queue ──
+// Limits to 2 concurrent requests with 400ms spacing to stay within free-tier rate limits.
+// All GT API calls must go through gtFetch() instead of raw fetch().
+const _gtReq = (() => {
+  const q = [];
+  let active = 0;
+  const MAX = 2, SPACING = 400;
+  let lastLaunch = 0;
+  function next() {
+    if (active >= MAX || !q.length) return;
+    const wait = Math.max(0, lastLaunch + SPACING - Date.now());
+    setTimeout(() => {
+      if (active >= MAX || !q.length) return;
+      const { fn, resolve, reject } = q.shift();
+      active++; lastLaunch = Date.now();
+      fn().then(resolve, reject).finally(() => { active--; next(); });
+    }, wait);
+  }
+  return (fn) => new Promise((resolve, reject) => { q.push({ fn, resolve, reject }); next(); });
+})();
 
-// Cache: "network:ca" → GT pool address (only caches successes)
-const gtPoolCache = {};
+async function gtFetch(url) {
+  return _gtReq(async () => {
+    for (let i = 0; i < 3; i++) {
+      const res = await fetch(url);
+      if (res.status !== 429) return res;
+      await delay(1500 * (i + 1)); // 1.5s → 3s → 4.5s backoff
+    }
+    throw new Error("GT rate limited");
+  });
+}
+
+// ── Persistent cache helpers (sessionStorage + in-memory) ──
+const _memCache = {};
+function ssGet(key) {
+  if (_memCache[key] !== undefined) return _memCache[key];
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return null;
+    const { v, ts, ttl } = JSON.parse(raw);
+    if (Date.now() - ts > ttl) { sessionStorage.removeItem(key); return null; }
+    _memCache[key] = v;
+    return v;
+  } catch { return null; }
+}
+function ssSet(key, value, ttl) {
+  _memCache[key] = value;
+  try { sessionStorage.setItem(key, JSON.stringify({ v: value, ts: Date.now(), ttl })); } catch {}
+}
+const SS_TTL_POOL  = 24 * 60 * 60 * 1000; // pool address: 24h
+const SS_TTL_CHART = 30 * 60 * 1000;       // chart data:   30min
+
+// ── Pool address lookup cache ──
 const gtPoolPending = {}; // dedup concurrent lookups for same token
+
 async function findGTPool(network, tokenCA) {
-  const key = `${network}:${tokenCA}`;
-  if (gtPoolCache[key]) return gtPoolCache[key];
+  const key = "gtp:" + network + ":" + tokenCA;
+  const cached = ssGet(key);
+  if (cached) return cached;
   if (gtPoolPending[key]) return gtPoolPending[key];
+
   const promise = (async () => {
     try {
-      const url = `https://api.geckoterminal.com/api/v2/networks/${network}/tokens/${tokenCA}/pools?page=1`;
-      let res = await fetch(url);
-      if (res.status === 429) { await delay(2000); res = await fetch(url); }
+      const url = "https://api.geckoterminal.com/api/v2/networks/" + network + "/tokens/" + tokenCA + "/pools?page=1";
+      const res = await gtFetch(url);
       if (!res.ok) return null;
       const json = await res.json();
-      const pools = json.data || [];
-      if (!pools.length) return null;
-      const addr = pools[0].attributes?.address;
-      if (addr) gtPoolCache[key] = addr;
-      return addr || null;
-    } catch {
-      return null;
-    } finally {
-      delete gtPoolPending[key];
-    }
+      const addr = json.data?.[0]?.attributes?.address || null;
+      if (addr) ssSet(key, addr, SS_TTL_POOL);
+      return addr;
+    } catch { return null; }
+    finally { delete gtPoolPending[key]; }
   })();
   gtPoolPending[key] = promise;
   return promise;
@@ -559,54 +604,58 @@ function usePoolChart(chainId, tokenCA, gtPoolAddr, enabled, timeframe = "1D") {
   const [priceData, setPriceData] = useState(null);
   const [volumeData, setVolumeData] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [failed, setFailed]   = useState(false);
+  const [retryTick, setRetryTick] = useState(0);
+  const retry = useCallback(() => setRetryTick((n) => n + 1), []);
 
   useEffect(() => {
     if (!enabled || !tokenCA || !chainId) return;
     const network = CHAIN_TO_GT_NETWORK[chainId] ?? chainId;
     const { timespan, aggregate, limit } = TF_CONFIG[timeframe] || TF_CONFIG["1D"];
-    const cacheKey = `${network}:${tokenCA}:${timeframe}`;
+    const cacheKey = "ctd:" + network + ":" + tokenCA + ":" + timeframe;
 
-    // Serve from cache only if we previously got real data
-    if (chartCache[cacheKey]) {
-      setPriceData(chartCache[cacheKey].priceData);
-      setVolumeData(chartCache[cacheKey].volumeData);
+    // Serve from cache (memory or sessionStorage) — skip fetch entirely
+    const cached = ssGet(cacheKey);
+    if (cached) {
+      setPriceData(cached.priceData);
+      setVolumeData(cached.volumeData);
+      setFailed(false);
       return;
     }
 
     let cancelled = false;
     const run = async () => {
       setLoading(true);
-      setPriceData(null); // clear stale data from previous timeframe
+      setFailed(false);
+      setPriceData(null);
       setVolumeData(null);
       try {
-        // Use known GT pool address if available, otherwise look it up from token CA
         const poolAddress = gtPoolAddr || await findGTPool(network, tokenCA);
-        if (!poolAddress) throw new Error("No GT pool found for token");
+        if (!poolAddress) throw new Error("no pool");
         if (cancelled) return;
-        const url = `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/ohlcv/${timespan}?aggregate=${aggregate}&limit=${limit}`;
-        let res = await fetch(url);
-        if (res.status === 429) { await delay(2000); res = await fetch(url); }
-        if (!res.ok) throw new Error(`OHLCV ${res.status}`);
+        const url = "https://api.geckoterminal.com/api/v2/networks/" + network + "/pools/" + poolAddress
+          + "/ohlcv/" + timespan + "?aggregate=" + aggregate + "&limit=" + limit;
+        const res = await gtFetch(url);
+        if (!res.ok) throw new Error("OHLCV " + res.status);
         const json = await res.json();
         const candles = (json.data?.attributes?.ohlcv_list || []).slice().reverse();
         const prices  = candles.map((c) => [c[0] * 1000, c[4]]);
         const volumes = candles.map((c) => [c[0] * 1000, c[5]]);
         const pd = prices.length >= 2 ? prices : null;
         const vd = volumes.length >= 2 ? volumes : null;
-        // Only cache when we have real data — empty results stay uncached so retries work
-        if (pd) chartCache[cacheKey] = { priceData: pd, volumeData: vd };
-        if (!cancelled) { setPriceData(pd); setVolumeData(vd); }
+        if (pd) ssSet(cacheKey, { priceData: pd, volumeData: vd }, SS_TTL_CHART);
+        if (!cancelled) { setPriceData(pd); setVolumeData(vd); setFailed(!pd); }
       } catch {
-        if (!cancelled) { setPriceData(null); setVolumeData(null); }
+        if (!cancelled) { setPriceData(null); setVolumeData(null); setFailed(true); }
       } finally {
         if (!cancelled) setLoading(false);
       }
     };
     run();
     return () => { cancelled = true; };
-  }, [enabled, chainId, tokenCA, gtPoolAddr, timeframe]);
+  }, [enabled, chainId, tokenCA, gtPoolAddr, timeframe, retryTick]);
 
-  return { priceData, volumeData, loading };
+  return { priceData, volumeData, loading, failed, retry };
 }
 
 // ─── Helpers ───
@@ -869,7 +918,7 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank, a
   const [caCopied, setCaCopied] = useState(false);
   const { holders, loading: holdersLoading, error: holdersError, refetch: refetchHolders } = useTokenHolders(ca, pair.chainId, showHolders);
   const gtPoolAddr = pair.source === "gt" ? pair.pairAddress : null;
-  const { priceData: chartData, volumeData, loading: chartLoading } = usePoolChart(pair.chainId, ca, gtPoolAddr, showChart, chartTf);
+  const { priceData: chartData, volumeData, loading: chartLoading, failed: chartFailed, retry: retryChart } = usePoolChart(pair.chainId, ca, gtPoolAddr, showChart, chartTf);
 
   // Derive mcap series by scaling price by fixed supply ratio
   const currentPrice = pair.priceUsd ? parseFloat(pair.priceUsd) : 0;
@@ -1083,7 +1132,19 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank, a
             />
           )}
           {!chartLoading && (!activeChartData || activeChartData.length < 2) && (
-            <div style={{ color: "#334155", fontSize: 11, textAlign: "center", padding: "8px 0" }}>No chart data</div>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "8px 0" }}>
+              <span style={{ color: "#334155", fontSize: 11 }}>
+                {chartFailed ? "Chart unavailable" : "No chart data"}
+              </span>
+              {chartFailed && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); retryChart(); }}
+                  style={{ padding: "1px 7px", borderRadius: 4, background: "#1e293b", border: "1px solid #334155", color: "#64748b", fontSize: 10, cursor: "pointer" }}
+                >
+                  retry
+                </button>
+              )}
+            </div>
           )}
         </div>
       )}
