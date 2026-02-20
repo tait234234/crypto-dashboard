@@ -1861,6 +1861,41 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
   const [showLimit, setShowLimit] = useState(DEFAULT_SHOWN);
   const [tracked, setTracked] = useState(new Set());
   const [addrSearch, setAddrSearch] = useState(""); // direct wallet address search
+  const [deepScan, setDeepScan] = useState({ running: false, target: null, found: null, txsChecked: 0 });
+
+  const runDeepScan = useCallback(async (targetAddress) => {
+    setDeepScan({ running: true, target: targetAddress, found: null, txsChecked: 0 });
+    const MAX_TXS = 5000;
+    let totalChecked = 0;
+    const foundTxs = [];
+    for (const addr of [...trackedAddrs]) {
+      let before;
+      let fetched = 0;
+      while (fetched < MAX_TXS) {
+        const base = "https://api.helius.xyz/v0/addresses/" + addr + "/transactions";
+        let params = "?api-key=" + HELIUS_KEY + "&limit=100";
+        if (before) params += "&before=" + before;
+        try {
+          const res = await fetch(base + params);
+          if (!res.ok) break;
+          const page = await res.json();
+          if (!Array.isArray(page) || !page.length) break;
+          fetched += page.length;
+          totalChecked += page.length;
+          before = page[page.length - 1].signature;
+          for (const tx of page) {
+            const cps = extractCounterparties(tx, addr);
+            if (cps.includes(targetAddress)) {
+              foundTxs.push({ trackedAddr: addr, signature: tx.signature, type: tx.type, timestamp: tx.timestamp });
+            }
+          }
+          setDeepScan((prev) => ({ ...prev, txsChecked: totalChecked }));
+          if (page.length < 100) break;
+        } catch { break; }
+      }
+    }
+    setDeepScan({ running: false, target: targetAddress, found: foundTxs, txsChecked: totalChecked });
+  }, [trackedAddrs]);
 
   // ── Portfolio overlap scoring ──
   // For each related wallet, fetch all their SPL token mints and count overlap
@@ -2256,10 +2291,49 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
           {addrSearch.length > 10 && (() => {
             const rank = relatedWallets.findIndex((r) => r.address === addrSearch);
             if (rank === -1) {
+              const isDeepTarget = deepScan.target === addrSearch;
+              const deepResult = isDeepTarget ? deepScan.found : null;
               return (
                 <div style={{ background: "#7f1d1d22", border: "1px solid #991b1b44", borderRadius: 8, padding: "9px 14px", fontSize: 12, color: "#fca5a5", marginBottom: 8 }}>
-                  <strong>Not detected</strong> — <code style={{ fontSize: 11 }}>{addrSearch.slice(0, 16)}…</code> did not appear in the transaction history of your tracked wallet(s) within the fetched range.
-                  <span style={{ display: "block", fontSize: 11, color: "#ef4444aa", marginTop: 4 }}>Try clicking ↺ Rescan — it runs a fresh fetch. If still missing, the interaction may predate the current history window.</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                    <span><strong>Not detected</strong> — <code style={{ fontSize: 11 }}>{addrSearch.slice(0, 16)}…</code> did not appear within the standard scan window.</span>
+                    {!deepScan.running && deepResult === null && (
+                      <button
+                        onClick={() => runDeepScan(addrSearch)}
+                        style={{ background: "#7f1d1d", border: "1px solid #991b1b", borderRadius: 5, color: "#fca5a5", fontSize: 11, fontWeight: 700, padding: "3px 10px", cursor: "pointer", whiteSpace: "nowrap" }}
+                      >
+                        🔍 Deep Scan (up to 5000 txs)
+                      </button>
+                    )}
+                    {deepScan.running && isDeepTarget && (
+                      <span style={{ fontSize: 11, color: "#fb923c" }}>Scanning… {deepScan.txsChecked} txs checked</span>
+                    )}
+                  </div>
+                  {deepResult !== null && (
+                    deepResult.length > 0 ? (
+                      <div style={{ marginTop: 8, background: "#14532d33", border: "1px solid #16a34a55", borderRadius: 6, padding: "8px 12px", color: "#86efac" }}>
+                        <strong>Found {deepResult.length} transaction{deepResult.length > 1 ? "s" : ""}!</strong>
+                        <span style={{ color: "#4ade8088", fontSize: 11 }}> (deep scan checked {deepScan.txsChecked.toLocaleString()} txs)</span>
+                        <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                          {deepResult.slice(0, 5).map((t) => (
+                            <div key={t.signature} style={{ fontFamily: "monospace", fontSize: 10, color: "#a7f3d0" }}>
+                              <span style={{ color: "#6ee7b7" }}>{t.type || "tx"}</span>{" "}
+                              {new Date((t.timestamp || 0) * 1000).toLocaleDateString()}{" "}
+                              — <a href={"https://solscan.io/tx/" + t.signature} target="_blank" rel="noopener noreferrer" style={{ color: "#34d399" }}>{t.signature.slice(0, 20)}…</a>
+                            </div>
+                          ))}
+                          {deepResult.length > 5 && <span style={{ fontSize: 10, color: "#6ee7b7" }}>…and {deepResult.length - 5} more</span>}
+                        </div>
+                      </div>
+                    ) : (
+                      <div style={{ marginTop: 6, fontSize: 11, color: "#ef4444aa" }}>
+                        Deep scan complete — {deepScan.txsChecked.toLocaleString()} txs checked, no direct interaction found. These wallets may only be linked through a common funder or on-chain program.
+                      </div>
+                    )
+                  )}
+                  {!deepScan.running && deepResult === null && (
+                    <span style={{ display: "block", fontSize: 11, color: "#ef4444aa", marginTop: 4 }}>The interaction may predate the standard 700-tx scan window. Use Deep Scan to search up to 5,000 txs.</span>
+                  )}
                 </div>
               );
             }
