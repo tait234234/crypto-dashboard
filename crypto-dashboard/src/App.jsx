@@ -225,7 +225,7 @@ function useTrendingTokens(activeChain) {
               `https://api.geckoterminal.com/api/v2/networks/${network}/trending_pools?page=${page}&include=base_token`
             );
             if (!res.ok) continue;
-            fetchPoolsIntoList(await res.json(), network, allTokens, { volMin: 500, liqMin: 5000, h1Min: 20, h24HrMin: 30 });
+            fetchPoolsIntoList(await res.json(), network, allTokens, { volMin: 500, liqMin: 1000, h1Min: 20, h24HrMin: 30 });
             successPages++;
           } catch {}
         }
@@ -408,7 +408,7 @@ function useWalletTokens(address) {
         }))
         .filter((t) => t.amount > 0)
         .sort((a, b) => b.amount - a.amount)
-        .slice(0, 30);
+        .slice(0, 80); // fetch 80 so USD-value sort below can surface high-value tokens
 
       if (rawHoldings.length === 0) { setHoldings([]); return; }
 
@@ -439,7 +439,15 @@ function useWalletTokens(address) {
 
       const enriched = rawHoldings
         .map((h) => ({ ...h, pair: tokenMap.get(h.mint) || null }))
-        .filter((h) => h.pair);
+        .filter((h) => h.pair)
+        // Re-sort by USD value so high-value positions in any token show first,
+        // regardless of raw token-unit balance
+        .sort((a, b) => {
+          const usdA = parseFloat(a.pair.priceUsd || 0) * a.amount;
+          const usdB = parseFloat(b.pair.priceUsd || 0) * b.amount;
+          return usdB - usdA;
+        })
+        .slice(0, 50);
 
       setHoldings(enriched);
     } catch (err) {
