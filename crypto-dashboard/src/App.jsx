@@ -1244,6 +1244,24 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank, a
 const HELIUS_KEY = "0dd8f0ec-f2a5-4f9e-b275-379afa3e73cd";
 
 // Fetch up to maxTxs transactions for a wallet via Helius enhanced API (paginated)
+async function fetchWithRetry(url, retries = 3) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const res = await fetch(url);
+      if (res.status === 429 || res.status === 503) {
+        if (i < retries) { await new Promise((r) => setTimeout(r, 1000 * (i + 1))); continue; }
+        return null;
+      }
+      if (!res.ok) return null;
+      return res;
+    } catch {
+      if (i < retries) { await new Promise((r) => setTimeout(r, 1000 * (i + 1))); continue; }
+      return null;
+    }
+  }
+  return null;
+}
+
 async function fetchWalletTxs(address, maxTxs = 200, type = null) {
   const PER_PAGE = 100;
   const all = [];
@@ -1254,9 +1272,9 @@ async function fetchWalletTxs(address, maxTxs = 200, type = null) {
     let params = "?api-key=" + HELIUS_KEY + "&limit=" + toFetch;
     if (type) params += "&type=" + type;
     if (before) params += "&before=" + before;
+    const res = await fetchWithRetry(base + params);
+    if (!res) break;
     try {
-      const res = await fetch(base + params);
-      if (!res.ok) break;
       const page = await res.json();
       if (!Array.isArray(page) || !page.length) break;
       all.push(...page);
@@ -1946,6 +1964,17 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
       { maxNodes:  8, txLimit: 100 }, // hop 3: 2nd intermediaries
       { maxNodes:  5, txLimit: 100 }, // hop 4: 3rd intermediaries
     ];
+    const CONCURRENCY = 3; // max parallel wallet fetches to avoid Helius rate limits
+
+    // Process items in throttled batches of CONCURRENCY with a delay between groups
+    const throttledForEach = async (items, fn) => {
+      for (let i = 0; i < items.length; i += CONCURRENCY) {
+        if (found) return;
+        const group = items.slice(i, i + CONCURRENCY);
+        await Promise.all(group.map(fn));
+        if (i + CONCURRENCY < items.length) await new Promise((r) => setTimeout(r, 400));
+      }
+    };
 
     const visited = new Set([...trackedAddrs]);
     let found = null;
@@ -1955,10 +1984,10 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
       const { maxNodes, txLimit } = HOP_CONFIG[hop];
       const batch = queue.slice(0, maxNodes);
       if (!batch.length) break;
-      setPathFind((p) => ({ ...p, status: `Hop ${hop + 1} — scanning ${batch.length} wallet${batch.length !== 1 ? "s" : ""} (all tx types, ≥1 SOL / ≥$100 stable)…` }));
+      setPathFind((p) => ({ ...p, status: `Hop ${hop + 1} — scanning ${batch.length} wallet${batch.length !== 1 ? "s" : ""} (${CONCURRENCY} at a time)…` }));
 
       const nextQueue = [];
-      await Promise.all(batch.map(async (node) => {
+      await throttledForEach(batch, async (node) => {
         if (found) return;
         try {
           const txs = await fetchWalletTxs(node.address, txLimit); // ALL tx types
@@ -1975,7 +2004,7 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
             }
           }
         } catch { /* ignore failed nodes */ }
-      }));
+      });
 
       if (!found) {
         queue = nextQueue.sort((a, b) => (b.edge?.sol || 0) + (b.edge?.stable || 0) / 150 - (a.edge?.sol || 0) - (a.edge?.stable || 0) / 150);
