@@ -1897,6 +1897,95 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
     setDeepScan({ running: false, target: targetAddress, found: foundTxs, txsChecked: totalChecked });
   }, [trackedAddrs]);
 
+  const [pathFind, setPathFind] = useState({ running: false, target: null, path: null, status: "" });
+
+  const runPathFinder = useCallback(async (targetAddress) => {
+    setPathFind({ running: true, target: targetAddress, path: null, status: "Starting…" });
+
+    // Aggregate significant transfers per counterparty across a set of txs
+    const getSignificantCPs = (txs, ownAddr, minSol = 1.0, minUsdc = 100) => {
+      const totals = new Map(); // address → { sol, usdc }
+      txs.forEach((tx) => {
+        const excluded = buildExcluded(tx);
+        const ok = (a) => a && a !== ownAddr && !excluded.has(a);
+        (tx.nativeTransfers || []).forEach((t) => {
+          const sol = (t.amount || 0) / 1e9;
+          if (sol <= 0) return;
+          [t.fromUserAccount, t.toUserAccount].forEach((a) => {
+            if (!ok(a)) return;
+            if (!totals.has(a)) totals.set(a, { sol: 0, usdc: 0 });
+            totals.get(a).sol += sol;
+          });
+        });
+        (tx.tokenTransfers || []).forEach((t) => {
+          if (t.mint !== USDC_MINT) return;
+          const usdc = t.tokenAmount || 0;
+          if (usdc <= 0) return;
+          [t.fromUserAccount, t.toUserAccount].forEach((a) => {
+            if (!ok(a)) return;
+            if (!totals.has(a)) totals.set(a, { sol: 0, usdc: 0 });
+            totals.get(a).usdc += usdc;
+          });
+        });
+      });
+      return [...totals.entries()]
+        .filter(([, v]) => v.sol >= minSol || v.usdc >= minUsdc)
+        .sort((a, b) => (b[1].sol + b[1].usdc / 150) - (a[1].sol + a[1].usdc / 150))
+        .map(([addr, v]) => ({ address: addr, sol: Math.round(v.sol * 100) / 100, usdc: Math.round(v.usdc) }));
+    };
+
+    // BFS config per hop: [max nodes to expand, txs to fetch per node]
+    const HOP_CONFIG = [
+      { maxNodes: 15, txLimit: 500 }, // hop 1: deep scan of tracked wallets
+      { maxNodes: 12, txLimit: 200 }, // hop 2: intermediaries
+      { maxNodes:  8, txLimit: 100 }, // hop 3: 2nd intermediaries
+      { maxNodes:  5, txLimit: 100 }, // hop 4: 3rd intermediaries
+    ];
+
+    const visited = new Set([...trackedAddrs]);
+    let found = null;
+    // BFS queue: each node = { address, path: [addr, …] }
+    let queue = [...trackedAddrs].map((a) => ({ address: a, path: [a] }));
+
+    for (let hop = 0; hop < HOP_CONFIG.length && !found; hop++) {
+      const { maxNodes, txLimit } = HOP_CONFIG[hop];
+      const batch = queue.slice(0, maxNodes);
+      if (!batch.length) break;
+      setPathFind((p) => ({ ...p, status: `Hop ${hop + 1} — scanning ${batch.length} wallet${batch.length !== 1 ? "s" : ""} for ≥1 SOL / ≥$100 transfers…` }));
+
+      const nextQueue = [];
+      await Promise.all(batch.map(async (node) => {
+        if (found) return;
+        try {
+          const txs = await fetchWalletTxs(node.address, txLimit, "TRANSFER");
+          if (found) return;
+          const cps = getSignificantCPs(txs, node.address);
+          for (const cp of cps) {
+            if (cp.address === targetAddress) {
+              found = { path: [...node.path, cp.address], edge: cp };
+              return;
+            }
+            if (!visited.has(cp.address)) {
+              visited.add(cp.address);
+              nextQueue.push({ address: cp.address, path: [...node.path, cp.address], edge: cp });
+            }
+          }
+        } catch { /* ignore failed nodes */ }
+      }));
+
+      if (!found) {
+        // Sort next queue so highest-value nodes get explored first
+        queue = nextQueue.sort((a, b) => (b.edge?.sol || 0) - (a.edge?.sol || 0));
+      }
+    }
+
+    if (found) {
+      setPathFind({ running: false, target: targetAddress, path: found.path, status: "Path found!" });
+    } else {
+      setPathFind({ running: false, target: targetAddress, path: null, status: `No path found within ${HOP_CONFIG.length} hops via transfers ≥1 SOL or ≥$100 USDC.` });
+    }
+  }, [trackedAddrs]);
+
   // ── Portfolio overlap scoring ──
   // For each related wallet, fetch all their SPL token mints and count overlap
   // with the set of mints held by any tracked wallet.
@@ -2293,27 +2382,43 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
             if (rank === -1) {
               const isDeepTarget = deepScan.target === addrSearch;
               const deepResult = isDeepTarget ? deepScan.found : null;
+              const isPathTarget = pathFind.target === addrSearch;
+              const deepDone = isDeepTarget && !deepScan.running && deepResult !== null;
+              const showPathBtn = !pathFind.running && !(isPathTarget && pathFind.path !== null) && !(isPathTarget && pathFind.status && !pathFind.running && pathFind.path === null && deepDone);
               return (
                 <div style={{ background: "#7f1d1d22", border: "1px solid #991b1b44", borderRadius: 8, padding: "9px 14px", fontSize: 12, color: "#fca5a5", marginBottom: 8 }}>
+                  {/* Header row */}
                   <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                     <span><strong>Not detected</strong> — <code style={{ fontSize: 11 }}>{addrSearch.slice(0, 16)}…</code> did not appear within the standard scan window.</span>
-                    {!deepScan.running && deepResult === null && (
-                      <button
-                        onClick={() => runDeepScan(addrSearch)}
-                        style={{ background: "#7f1d1d", border: "1px solid #991b1b", borderRadius: 5, color: "#fca5a5", fontSize: 11, fontWeight: 700, padding: "3px 10px", cursor: "pointer", whiteSpace: "nowrap" }}
-                      >
-                        🔍 Deep Scan (up to 5000 txs)
-                      </button>
-                    )}
-                    {deepScan.running && isDeepTarget && (
-                      <span style={{ fontSize: 11, color: "#fb923c" }}>Scanning… {deepScan.txsChecked} txs checked</span>
-                    )}
                   </div>
+
+                  {/* Action buttons row */}
+                  {!deepScan.running && !pathFind.running && (
+                    <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                      {deepResult === null && (
+                        <button onClick={() => runDeepScan(addrSearch)}
+                          style={{ background: "#1e1b4b", border: "1px solid #4f46e5", borderRadius: 5, color: "#a5b4fc", fontSize: 11, fontWeight: 700, padding: "4px 11px", cursor: "pointer", whiteSpace: "nowrap" }}>
+                          🔍 Deep Scan — direct txs (up to 5 000)
+                        </button>
+                      )}
+                      {!(isPathTarget && pathFind.status) && (
+                        <button onClick={() => runPathFinder(addrSearch)}
+                          style={{ background: "#1c1917", border: "1px solid #78716c", borderRadius: 5, color: "#d6d3d1", fontSize: 11, fontWeight: 700, padding: "4px 11px", cursor: "pointer", whiteSpace: "nowrap" }}>
+                          🕸️ Trace Path — multi-hop ≥1 SOL / ≥$100
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Deep scan progress / result */}
+                  {deepScan.running && isDeepTarget && (
+                    <div style={{ marginTop: 7, fontSize: 11, color: "#fb923c" }}>🔍 Scanning… {deepScan.txsChecked.toLocaleString()} txs checked</div>
+                  )}
                   {deepResult !== null && (
                     deepResult.length > 0 ? (
                       <div style={{ marginTop: 8, background: "#14532d33", border: "1px solid #16a34a55", borderRadius: 6, padding: "8px 12px", color: "#86efac" }}>
-                        <strong>Found {deepResult.length} transaction{deepResult.length > 1 ? "s" : ""}!</strong>
-                        <span style={{ color: "#4ade8088", fontSize: 11 }}> (deep scan checked {deepScan.txsChecked.toLocaleString()} txs)</span>
+                        <strong>Direct link found — {deepResult.length} tx{deepResult.length > 1 ? "s" : ""}!</strong>
+                        <span style={{ color: "#4ade8088", fontSize: 11 }}> ({deepScan.txsChecked.toLocaleString()} txs scanned)</span>
                         <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
                           {deepResult.slice(0, 5).map((t) => (
                             <div key={t.signature} style={{ fontFamily: "monospace", fontSize: 10, color: "#a7f3d0" }}>
@@ -2327,12 +2432,45 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
                       </div>
                     ) : (
                       <div style={{ marginTop: 6, fontSize: 11, color: "#ef4444aa" }}>
-                        Deep scan complete — {deepScan.txsChecked.toLocaleString()} txs checked, no direct interaction found. These wallets may only be linked through a common funder or on-chain program.
+                        Deep scan done — {deepScan.txsChecked.toLocaleString()} txs checked, no direct tx found. Try Trace Path to find an indirect link.
                       </div>
                     )
                   )}
-                  {!deepScan.running && deepResult === null && (
-                    <span style={{ display: "block", fontSize: 11, color: "#ef4444aa", marginTop: 4 }}>The interaction may predate the standard 700-tx scan window. Use Deep Scan to search up to 5,000 txs.</span>
+
+                  {/* Path finder progress */}
+                  {pathFind.running && isPathTarget && (
+                    <div style={{ marginTop: 7, fontSize: 11, color: "#fb923c" }}>🕸️ {pathFind.status}</div>
+                  )}
+
+                  {/* Path finder result */}
+                  {!pathFind.running && isPathTarget && pathFind.path && (
+                    <div style={{ marginTop: 8, background: "#1e3a5f33", border: "1px solid #3b82f655", borderRadius: 6, padding: "10px 12px", color: "#93c5fd" }}>
+                      <strong style={{ color: "#60a5fa" }}>Path found — {pathFind.path.length - 1} hop{pathFind.path.length - 2 !== 1 ? "s" : ""}!</strong>
+                      <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 0, flexWrap: "wrap" }}>
+                        {pathFind.path.map((addr, i) => (
+                          <span key={addr} style={{ display: "flex", alignItems: "center" }}>
+                            <span style={{
+                              fontFamily: "monospace", fontSize: 10,
+                              background: i === 0 || i === pathFind.path.length - 1 ? "#1d4ed822" : "#1e293b",
+                              border: `1px solid ${i === 0 || i === pathFind.path.length - 1 ? "#3b82f6" : "#334155"}`,
+                              borderRadius: 5, padding: "3px 7px", color: i === 0 || i === pathFind.path.length - 1 ? "#93c5fd" : "#94a3b8",
+                              whiteSpace: "nowrap",
+                            }}>
+                              {addr.slice(0, 6)}…{addr.slice(-4)}
+                            </span>
+                            {i < pathFind.path.length - 1 && (
+                              <span style={{ color: "#475569", fontSize: 13, padding: "0 4px" }}>→</span>
+                            )}
+                          </span>
+                        ))}
+                      </div>
+                      <div style={{ marginTop: 6, fontSize: 10, color: "#60a5fa88" }}>
+                        Each arrow = ≥1 SOL or ≥$100 USDC transferred between those wallets.
+                      </div>
+                    </div>
+                  )}
+                  {!pathFind.running && isPathTarget && pathFind.path === null && pathFind.status && (
+                    <div style={{ marginTop: 6, fontSize: 11, color: "#ef4444aa" }}>{pathFind.status}</div>
                   )}
                 </div>
               );
