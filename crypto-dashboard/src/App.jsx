@@ -1609,6 +1609,7 @@ function RelatedWallets({ relatedWallets, trackedAddrs, loading, onTrack, wallet
     // Check each related wallet for holdings — batch 5 at a time to avoid rate limits
     const BATCH = 5;
     const found = [];
+    let errCount = 0;
     for (let i = 0; i < relatedWallets.length; i += BATCH) {
       const batch = relatedWallets.slice(i, i + BATCH);
       const results = await Promise.all(batch.map(async (w) => {
@@ -1623,17 +1624,29 @@ function RelatedWallets({ relatedWallets, trackedAddrs, loading, onTrack, wallet
             }),
           });
           const json = await res.json();
+          if (json?.error) { errCount++; return null; }
           const accounts = json?.result?.value || [];
-          const amount = accounts.reduce(
-            (sum, a) => sum + (a.account?.data?.parsed?.info?.tokenAmount?.uiAmount || 0), 0
-          );
-          return amount > 0 ? { ...w, tokenAmount: amount } : null;
-        } catch (_) { return null; }
+          // Use uiAmount when available; fall back to raw amount / 10^decimals
+          // (uiAmount can be null for very large token supplies)
+          const tokenAmount = accounts.reduce((sum, a) => {
+            const info = a.account?.data?.parsed?.info?.tokenAmount;
+            if (!info) return sum;
+            const ui = info.uiAmount;
+            if (ui != null && ui > 0) return sum + ui;
+            const raw = parseInt(info.amount || "0", 10);
+            if (raw > 0) return sum + raw / Math.pow(10, info.decimals ?? 0);
+            return sum;
+          }, 0);
+          return tokenAmount > 0 ? { ...w, tokenAmount } : null;
+        } catch (_) { errCount++; return null; }
       }));
       found.push(...results.filter(Boolean));
       setFilterResults([...found]); // update incrementally
     }
 
+    if (errCount > 0 && found.length === 0) {
+      setFilterError(`Could not check ${errCount} wallet${errCount > 1 ? "s" : ""} — RPC error. Try again.`);
+    }
     setFilterLoading(false);
   };
 
