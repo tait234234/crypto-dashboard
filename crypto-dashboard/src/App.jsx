@@ -1902,9 +1902,14 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
   const runPathFinder = useCallback(async (targetAddress) => {
     setPathFind({ running: true, target: targetAddress, path: null, status: "Starting…" });
 
-    // Aggregate significant transfers per counterparty across a set of txs
-    const getSignificantCPs = (txs, ownAddr, minSol = 1.0, minUsdc = 100) => {
-      const totals = new Map(); // address → { sol, usdc }
+    const USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+    const STABLES = new Set([USDC_MINT, USDT_MINT]);
+
+    // Aggregate significant transfers per counterparty across a set of txs.
+    // Tracks SOL, stablecoins (USDC+USDT), and any other token transfers.
+    const getSignificantCPs = (txs, ownAddr, minSol = 1.0, minStable = 100) => {
+      const totals = new Map(); // address → { sol, stable, tokenTxs }
+      const ensure = (a) => { if (!totals.has(a)) totals.set(a, { sol: 0, stable: 0, tokenTxs: 0 }); return totals.get(a); };
       txs.forEach((tx) => {
         const excluded = buildExcluded(tx);
         const ok = (a) => a && a !== ownAddr && !excluded.has(a);
@@ -1912,29 +1917,29 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
           const sol = (t.amount || 0) / 1e9;
           if (sol <= 0) return;
           [t.fromUserAccount, t.toUserAccount].forEach((a) => {
-            if (!ok(a)) return;
-            if (!totals.has(a)) totals.set(a, { sol: 0, usdc: 0 });
-            totals.get(a).sol += sol;
+            if (ok(a)) ensure(a).sol += sol;
           });
         });
         (tx.tokenTransfers || []).forEach((t) => {
-          if (t.mint !== USDC_MINT) return;
-          const usdc = t.tokenAmount || 0;
-          if (usdc <= 0) return;
+          const amt = t.tokenAmount || 0;
+          if (amt <= 0) return;
+          const isStable = STABLES.has(t.mint);
           [t.fromUserAccount, t.toUserAccount].forEach((a) => {
             if (!ok(a)) return;
-            if (!totals.has(a)) totals.set(a, { sol: 0, usdc: 0 });
-            totals.get(a).usdc += usdc;
+            const e = ensure(a);
+            if (isStable) e.stable += amt;
+            else e.tokenTxs++;
           });
         });
       });
       return [...totals.entries()]
-        .filter(([, v]) => v.sol >= minSol || v.usdc >= minUsdc)
-        .sort((a, b) => (b[1].sol + b[1].usdc / 150) - (a[1].sol + a[1].usdc / 150))
-        .map(([addr, v]) => ({ address: addr, sol: Math.round(v.sol * 100) / 100, usdc: Math.round(v.usdc) }));
+        // Significant = ≥ minSol SOL, OR ≥ minStable stablecoins, OR ≥ 2 other-token interactions
+        .filter(([, v]) => v.sol >= minSol || v.stable >= minStable || v.tokenTxs >= 2)
+        .sort((a, b) => (b[1].sol + b[1].stable / 150 + b[1].tokenTxs * 0.1) - (a[1].sol + a[1].stable / 150 + a[1].tokenTxs * 0.1))
+        .map(([addr, v]) => ({ address: addr, sol: Math.round(v.sol * 100) / 100, stable: Math.round(v.stable), tokenTxs: v.tokenTxs }));
     };
 
-    // BFS config per hop: [max nodes to expand, txs to fetch per node]
+    // BFS config per hop — fetch ALL tx types (no TRANSFER filter)
     const HOP_CONFIG = [
       { maxNodes: 15, txLimit: 500 }, // hop 1: deep scan of tracked wallets
       { maxNodes: 12, txLimit: 200 }, // hop 2: intermediaries
@@ -1944,20 +1949,19 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
 
     const visited = new Set([...trackedAddrs]);
     let found = null;
-    // BFS queue: each node = { address, path: [addr, …] }
     let queue = [...trackedAddrs].map((a) => ({ address: a, path: [a] }));
 
     for (let hop = 0; hop < HOP_CONFIG.length && !found; hop++) {
       const { maxNodes, txLimit } = HOP_CONFIG[hop];
       const batch = queue.slice(0, maxNodes);
       if (!batch.length) break;
-      setPathFind((p) => ({ ...p, status: `Hop ${hop + 1} — scanning ${batch.length} wallet${batch.length !== 1 ? "s" : ""} for ≥1 SOL / ≥$100 transfers…` }));
+      setPathFind((p) => ({ ...p, status: `Hop ${hop + 1} — scanning ${batch.length} wallet${batch.length !== 1 ? "s" : ""} (all tx types, ≥1 SOL / ≥$100 stable)…` }));
 
       const nextQueue = [];
       await Promise.all(batch.map(async (node) => {
         if (found) return;
         try {
-          const txs = await fetchWalletTxs(node.address, txLimit, "TRANSFER");
+          const txs = await fetchWalletTxs(node.address, txLimit); // ALL tx types
           if (found) return;
           const cps = getSignificantCPs(txs, node.address);
           for (const cp of cps) {
@@ -1974,15 +1978,14 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
       }));
 
       if (!found) {
-        // Sort next queue so highest-value nodes get explored first
-        queue = nextQueue.sort((a, b) => (b.edge?.sol || 0) - (a.edge?.sol || 0));
+        queue = nextQueue.sort((a, b) => (b.edge?.sol || 0) + (b.edge?.stable || 0) / 150 - (a.edge?.sol || 0) - (a.edge?.stable || 0) / 150);
       }
     }
 
     if (found) {
       setPathFind({ running: false, target: targetAddress, path: found.path, status: "Path found!" });
     } else {
-      setPathFind({ running: false, target: targetAddress, path: null, status: `No path found within ${HOP_CONFIG.length} hops via transfers ≥1 SOL or ≥$100 USDC.` });
+      setPathFind({ running: false, target: targetAddress, path: null, status: `No path found within ${HOP_CONFIG.length} hops via significant transfers.` });
     }
   }, [trackedAddrs]);
 
