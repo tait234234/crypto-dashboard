@@ -1860,6 +1860,7 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
   const DEFAULT_SHOWN = 15;
   const [showLimit, setShowLimit] = useState(DEFAULT_SHOWN);
   const [tracked, setTracked] = useState(new Set());
+  const [addrSearch, setAddrSearch] = useState(""); // direct wallet address search
 
   // ── Portfolio overlap scoring ──
   // For each related wallet, fetch all their SPL token mints and count overlap
@@ -2229,9 +2230,54 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
 
       {renderFundingSection()}
 
+      {/* Direct address lookup — check if any specific wallet was detected */}
       {relatedWallets.length > 0 && (
-        <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", margin: "4px 0 6px", letterSpacing: 0.3 }}>
-          Transaction History Connections
+        <div style={{ marginBottom: 10 }}>
+          {/* Section label + search bar on same row */}
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 11, fontWeight: 700, color: "#64748b", letterSpacing: 0.3 }}>
+              Transaction History Connections
+            </span>
+            <div style={{ display: "flex", gap: 6, alignItems: "center", flex: 1, minWidth: 220 }}>
+              <input
+                value={addrSearch}
+                onChange={(e) => setAddrSearch(e.target.value.trim())}
+                placeholder="Search detected wallets by address…"
+                style={{ flex: 1, padding: "4px 8px", background: "#111827", border: "1px solid #1e293b", borderRadius: 6, color: "#e2e8f0", fontSize: 11, outline: "none", fontFamily: "monospace" }}
+              />
+              {addrSearch && (
+                <button onClick={() => setAddrSearch("")}
+                  style={{ background: "transparent", border: "none", color: "#475569", fontSize: 12, cursor: "pointer", padding: "0 4px" }}>✕</button>
+              )}
+            </div>
+          </div>
+
+          {/* Search result */}
+          {addrSearch.length > 10 && (() => {
+            const rank = relatedWallets.findIndex((r) => r.address === addrSearch);
+            if (rank === -1) {
+              return (
+                <div style={{ background: "#7f1d1d22", border: "1px solid #991b1b44", borderRadius: 8, padding: "9px 14px", fontSize: 12, color: "#fca5a5", marginBottom: 8 }}>
+                  <strong>Not detected</strong> — <code style={{ fontSize: 11 }}>{addrSearch.slice(0, 16)}…</code> did not appear in the transaction history of your tracked wallet(s) within the fetched range.
+                  <span style={{ display: "block", fontSize: 11, color: "#ef4444aa", marginTop: 4 }}>Try clicking ↺ Rescan — it runs a fresh fetch. If still missing, the interaction may predate the current history window.</span>
+                </div>
+              );
+            }
+            const r = relatedWallets[rank];
+            const isShown = rank < showLimit;
+            return (
+              <div style={{ background: "#14532d22", border: "1px solid #16a34a44", borderRadius: 8, padding: "9px 14px", fontSize: 12, color: "#86efac", marginBottom: 8 }}>
+                <strong>Found</strong> at rank #{rank + 1} of {relatedWallets.length}
+                {!isShown && <span style={{ color: "#4ade80", fontWeight: 700 }}> (hidden — click "Show more" to reveal)</span>}
+                <span style={{ display: "flex", gap: 10, marginTop: 5, flexWrap: "wrap", fontSize: 11 }}>
+                  <span>Degree: <strong>{r.degree === 2 ? "2nd°" : "1st°"}</strong></span>
+                  <span>Tx appearances: <strong>{r.txCount}</strong></span>
+                  <span>Linked to: <strong>{r.sharedWithLabels?.join(", ") || "—"}</strong></span>
+                  {r.via?.length > 0 && <span>Via: <strong>{r.via[0].slice(0, 8)}…</strong></span>}
+                </span>
+              </div>
+            );
+          })()}
         </div>
       )}
 
