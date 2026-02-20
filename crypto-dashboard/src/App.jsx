@@ -2936,18 +2936,21 @@ const AddWalletPanel = ({ onAdd, onClose }) => {
   );
 };
 
-// ─── Wallet Monitor Engine ───
-// Detects fresh wallets (< N days old / < N total txs) and dormant wallets
-// (no activity for N days then suddenly active). Sends alerts via Discord webhook,
-// Telegram bot, and browser notifications.
+// ─── Wallet Monitor Engine (Autonomous Discovery) ───
+// Discovers wallets autonomously by scanning recent transactions on watched tokens
+// (pinned CAs + optionally trending). Flags fresh wallets (new/low-activity) and
+// dormant wallets (inactive for N+ days then suddenly active).
+// Sends alerts via Discord webhook, Telegram bot, and browser notifications.
 
 const MONITOR_DEFAULTS = {
   enabled: true,
-  intervalSec: 120,           // check every 2 minutes
-  freshMaxAgeDays: 7,         // wallet younger than 7 days = fresh
-  freshMaxTxs: 10,            // wallet with fewer than 10 txs = fresh
-  dormantMinDays: 30,         // no activity for 30 days = dormant
-  minSolValue: 0.1,           // minimum SOL value to trigger alert
+  intervalSec: 180,           // scan every 3 minutes
+  freshMaxAgeDays: 7,         // wallet with history < N days = fresh
+  freshMaxTxs: 15,            // wallet with < N total txs = fresh
+  dormantMinDays: 30,         // gap of N+ days between txs = dormant
+  maxTxsPerToken: 25,         // recent txs to pull per source token
+  maxWalletsPerScan: 6,       // max new wallets to deeply analyze per cycle
+  includeTrending: false,     // also scan trending tokens (noisier)
   discordWebhook: "",
   telegramBotToken: "",
   telegramChatId: "",
@@ -2965,76 +2968,80 @@ function loadMonitorAlerts() {
   try { return JSON.parse(localStorage.getItem("monitorAlerts") || "[]"); } catch { return []; }
 }
 function saveMonitorAlerts(alerts) {
-  try { localStorage.setItem("monitorAlerts", JSON.stringify(alerts.slice(0, 200))); } catch {}
+  try { localStorage.setItem("monitorAlerts", JSON.stringify(alerts.slice(0, 300))); } catch {}
 }
-function loadWalletMeta() {
-  try { return JSON.parse(localStorage.getItem("walletMeta") || "{}"); } catch { return {}; }
+// scannedWallets: { address → { checkedAt, type } } — prevents re-analyzing wallets this session
+function loadScannedWallets() {
+  try { return JSON.parse(localStorage.getItem("monitorScanned") || "{}"); } catch { return {}; }
 }
-function saveWalletMeta(m) {
-  try { localStorage.setItem("walletMeta", JSON.stringify(m)); } catch {}
+function saveScannedWallets(m) {
+  try { localStorage.setItem("monitorScanned", JSON.stringify(m)); } catch {}
 }
 
-async function getWalletAge(address) {
-  // Get earliest transaction via Helius — fetch 1 tx with no "before" cursor, ascending
+// Fetch recent transactions for a token mint or any address via Helius.
+// Returns array of tx objects. Used both to discover wallets (mint) and to analyze them (wallet addr).
+async function fetchHeliusTxs(address, limit = 25) {
   try {
     const res = await fetch(
-      `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_KEY}&limit=1&sort-order=asc`
+      `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_KEY}&limit=${limit}`
     );
-    if (!res.ok) return null;
-    const txs = await res.json();
-    if (!Array.isArray(txs) || txs.length === 0) return null;
-    const ts = txs[0].timestamp;
-    if (!ts) return null;
-    return { firstTxTime: ts * 1000, ageDays: (Date.now() - ts * 1000) / 86400000 };
-  } catch { return null; }
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  } catch { return []; }
 }
 
-async function getWalletTxCount(address) {
-  try {
-    const res = await fetch(
-      `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_KEY}&limit=100`
-    );
-    if (!res.ok) return null;
-    const txs = await res.json();
-    return Array.isArray(txs) ? txs.length : null;
-  } catch { return null; }
+// Given an address and its recent transactions (newest first), determine if it's fresh or dormant.
+// Returns { type: "fresh"|"dormant"|null, txCount, ageDays, inactiveDays, latestTs }
+function analyzeWalletTxs(txs, settings) {
+  if (!txs.length) return null;
+
+  const latestTs = txs[0].timestamp * 1000;
+  const txCount = txs.length; // 0–limit; if < freshMaxTxs it's a strong signal
+
+  // Fresh: low tx count relative to threshold
+  if (txCount < settings.freshMaxTxs) {
+    // Approximate age from oldest tx we have
+    const oldestTs = txs[txs.length - 1].timestamp * 1000;
+    const ageDays = (Date.now() - oldestTs) / 86400000;
+    return { type: "fresh", txCount, ageDays, latestTs };
+  }
+
+  // Dormant: long gap between the most recent tx and the one before it
+  if (txs.length >= 2) {
+    const prevTs = txs[1].timestamp * 1000;
+    const gapDays = (latestTs - prevTs) / 86400000;
+    if (gapDays >= settings.dormantMinDays) {
+      return { type: "dormant", txCount, inactiveDays: gapDays, latestTs };
+    }
+  }
+
+  return null;
 }
 
-async function getLastActivity(address) {
-  try {
-    const res = await fetch(
-      `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_KEY}&limit=1`
-    );
-    if (!res.ok) return null;
-    const txs = await res.json();
-    if (!Array.isArray(txs) || txs.length === 0) return null;
-    const ts = txs[0].timestamp;
-    return ts ? ts * 1000 : null;
-  } catch { return null; }
-}
-
-// Dispatch alert to configured channels
+// Dispatch alert to all configured channels
 async function dispatchAlert(alert, settings) {
-  const msg = `[${alert.type.toUpperCase()}] ${alert.label || alert.address.slice(0, 8) + "…"}\n${alert.message}`;
+  const label = alert.sourceSymbol ? `${alert.sourceSymbol} trader` : alert.address.slice(0, 8) + "…";
 
   // Discord webhook
   if (settings.discordWebhook) {
     try {
+      const color = alert.type === "fresh" ? 0x60a5fa : 0xf59e0b;
+      const fields = [
+        { name: "Wallet", value: `\`${alert.address}\``, inline: false },
+        ...(alert.sourceSymbol ? [{ name: "Found via token", value: alert.sourceSymbol, inline: true }] : []),
+        ...(alert.txCount != null ? [{ name: "Transactions", value: String(alert.txCount) + (alert.txCount >= 50 ? "+" : ""), inline: true }] : []),
+        ...(alert.ageDays != null ? [{ name: "Approx age", value: `${alert.ageDays.toFixed(1)} days`, inline: true }] : []),
+        ...(alert.inactiveDays != null ? [{ name: "Inactive for", value: `${alert.inactiveDays.toFixed(0)} days`, inline: true }] : []),
+      ];
       await fetch(settings.discordWebhook, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           embeds: [{
-            title: alert.type === "fresh" ? "Fresh Wallet Detected" : "Dormant Wallet Woke Up",
+            title: alert.type === "fresh" ? "🆕 Fresh Wallet Detected" : "💤 Dormant Wallet Woke Up",
             description: alert.message,
-            color: alert.type === "fresh" ? 0x60a5fa : 0xf59e0b,
-            fields: [
-              { name: "Wallet", value: `\`${alert.address}\``, inline: false },
-              ...(alert.label ? [{ name: "Label", value: alert.label, inline: true }] : []),
-              ...(alert.ageDays != null ? [{ name: "Age", value: `${alert.ageDays.toFixed(1)} days`, inline: true }] : []),
-              ...(alert.txCount != null ? [{ name: "Transactions", value: String(alert.txCount), inline: true }] : []),
-              ...(alert.inactiveDays != null ? [{ name: "Inactive For", value: `${alert.inactiveDays.toFixed(0)} days`, inline: true }] : []),
-            ],
+            color, fields,
             timestamp: new Date(alert.time).toISOString(),
             footer: { text: "CryptoDawn Monitor" },
           }],
@@ -3046,180 +3053,169 @@ async function dispatchAlert(alert, settings) {
   // Telegram
   if (settings.telegramBotToken && settings.telegramChatId) {
     try {
+      const icon = alert.type === "fresh" ? "🆕" : "💤";
+      const text = `${icon} *${alert.type === "fresh" ? "Fresh Wallet" : "Dormant Wallet Active"}*\n${alert.message}\n\`${alert.address}\`${alert.sourceSymbol ? `\n_Found via: ${alert.sourceSymbol}_` : ""}`;
       await fetch(`https://api.telegram.org/bot${settings.telegramBotToken}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: settings.telegramChatId,
-          text: msg,
-          parse_mode: "Markdown",
-        }),
+        body: JSON.stringify({ chat_id: settings.telegramChatId, text, parse_mode: "Markdown" }),
       });
     } catch {}
   }
 
-  // Browser notification
+  // Browser
   if (settings.browserNotifications && typeof Notification !== "undefined" && Notification.permission === "granted") {
-    try { new Notification(alert.type === "fresh" ? "Fresh Wallet" : "Dormant Wallet Active", { body: alert.message, icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔔</text></svg>" }); } catch {}
+    try {
+      new Notification(alert.type === "fresh" ? "Fresh Wallet Detected" : "Dormant Wallet Active", {
+        body: `${label} — ${alert.message}`,
+        icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📡</text></svg>",
+      });
+    } catch {}
   }
 }
 
-function useWalletMonitor(wallets) {
+// ─── Autonomous Wallet Monitor Hook ───
+// Discovers wallets from recent token transactions, analyzes them, and fires alerts.
+function useWalletMonitor(pinnedCAs, trendingTokens) {
   const [settings, setSettings] = useState(loadMonitorSettings);
   const [alerts, setAlerts] = useState(loadMonitorAlerts);
   const [scanning, setScanning] = useState(false);
   const [lastScan, setLastScan] = useState(null);
-  const walletMetaRef = useRef(loadWalletMeta());
+  const [stats, setStats] = useState({ discovered: 0, analyzed: 0 });
+  const scannedRef = useRef(loadScannedWallets());
   const timerRef = useRef(null);
   const scanningRef = useRef(false);
 
   const updateSettings = useCallback((patch) => {
-    setSettings((prev) => {
-      const next = { ...prev, ...patch };
-      saveMonitorSettings(next);
-      return next;
-    });
+    setSettings((prev) => { const next = { ...prev, ...patch }; saveMonitorSettings(next); return next; });
   }, []);
 
   const addAlert = useCallback((alert) => {
-    setAlerts((prev) => {
-      const next = [alert, ...prev].slice(0, 200);
-      saveMonitorAlerts(next);
-      return next;
-    });
+    setAlerts((prev) => { const next = [alert, ...prev].slice(0, 300); saveMonitorAlerts(next); return next; });
   }, []);
 
-  const clearAlerts = useCallback(() => {
-    setAlerts([]);
-    saveMonitorAlerts([]);
+  const clearAlerts = useCallback(() => { setAlerts([]); saveMonitorAlerts([]); }, []);
+
+  const clearScanned = useCallback(() => {
+    scannedRef.current = {};
+    saveScannedWallets({});
+    setStats({ discovered: 0, analyzed: 0 });
   }, []);
 
   const runScan = useCallback(async () => {
-    if (scanningRef.current || wallets.length === 0) return;
-    scanningRef.current = true;
-    setScanning(true);
-    const meta = walletMetaRef.current;
-    const now = Date.now();
+    if (scanningRef.current) return;
+    const settingsSnap = loadMonitorSettings();
+    if (!settingsSnap.enabled) return;
 
-    for (const w of wallets) {
-      const addr = w.address;
-      const existing = meta[addr] || {};
-      const settingsSnap = loadMonitorSettings();
+    // Build source token list: pinned CAs (Solana only) + optionally trending Solana tokens
+    const sourceCAs = pinnedCAs
+      .filter((p) => p.chainId === "solana" || !p.chainId)
+      .map((p) => ({ ca: p.ca, symbol: p.ca.slice(0, 6) }));
 
-      try {
-        // 1. Get latest activity
-        const lastAct = await getLastActivity(addr);
-        await delay(300); // rate limit buffer
-
-        // 2. If we have prior data, check for dormant → active transition
-        if (existing.lastActivity && lastAct && lastAct > existing.lastActivity) {
-          const inactiveDays = (lastAct - existing.lastActivity) / 86400000;
-          if (inactiveDays >= settingsSnap.dormantMinDays) {
-            const alert = {
-              id: `dormant-${addr}-${now}`,
-              type: "dormant",
-              address: addr,
-              label: w.label || "",
-              message: `Dormant wallet woke up after ${inactiveDays.toFixed(0)} days of inactivity. Previously last seen ${new Date(existing.lastActivity).toLocaleDateString()}.`,
-              inactiveDays,
-              time: now,
-            };
-            addAlert(alert);
-            dispatchAlert(alert, settingsSnap);
-          }
-        }
-
-        // 3. Check if wallet is fresh (only on first scan of this wallet)
-        if (!existing.checkedFresh) {
-          const ageInfo = await getWalletAge(addr);
-          await delay(300);
-          const txCount = await getWalletTxCount(addr);
-          await delay(300);
-
-          if (ageInfo && ageInfo.ageDays <= settingsSnap.freshMaxAgeDays) {
-            const alert = {
-              id: `fresh-${addr}-${now}`,
-              type: "fresh",
-              address: addr,
-              label: w.label || "",
-              message: `Fresh wallet detected — only ${ageInfo.ageDays.toFixed(1)} days old with ${txCount ?? "?"} transactions.`,
-              ageDays: ageInfo.ageDays,
-              txCount,
-              time: now,
-            };
-            addAlert(alert);
-            dispatchAlert(alert, settingsSnap);
-          } else if (txCount != null && txCount <= settingsSnap.freshMaxTxs && (!ageInfo || ageInfo.ageDays <= settingsSnap.freshMaxAgeDays * 2)) {
-            const alert = {
-              id: `fresh-${addr}-${now}`,
-              type: "fresh",
-              address: addr,
-              label: w.label || "",
-              message: `Low-activity wallet — ${txCount} total transactions${ageInfo ? `, ${ageInfo.ageDays.toFixed(1)} days old` : ""}.`,
-              ageDays: ageInfo?.ageDays,
-              txCount,
-              time: now,
-            };
-            addAlert(alert);
-            dispatchAlert(alert, settingsSnap);
-          }
-
-          meta[addr] = { ...existing, checkedFresh: true, firstTxTime: ageInfo?.firstTxTime, txCount, lastActivity: lastAct || existing.lastActivity };
-        } else {
-          meta[addr] = { ...existing, lastActivity: lastAct || existing.lastActivity };
-        }
-      } catch {
-        // skip wallet on error
-      }
+    if (settingsSnap.includeTrending) {
+      const trendingSolana = (trendingTokens || []).filter((t) => t.chainId === "solana").slice(0, 5);
+      trendingSolana.forEach((t) => sourceCAs.push({ ca: t.baseToken.address, symbol: t.baseToken.symbol }));
     }
 
-    // Clean up meta for removed wallets
-    const addrSet = new Set(wallets.map((w) => w.address));
-    Object.keys(meta).forEach((k) => { if (!addrSet.has(k)) delete meta[k]; });
+    if (sourceCAs.length === 0) return;
 
-    walletMetaRef.current = meta;
-    saveWalletMeta(meta);
+    scanningRef.current = true;
+    setScanning(true);
+    const scanned = scannedRef.current;
+    const now = Date.now();
+    // Expire scanned entries older than 24h so wallets can be re-checked next day
+    Object.keys(scanned).forEach((addr) => {
+      if (now - (scanned[addr].checkedAt || 0) > 86400000) delete scanned[addr];
+    });
+
+    let newDiscovered = 0;
+    let newAnalyzed = 0;
+    const newWalletsToAnalyze = []; // { address, sourceSymbol }
+
+    // Step 1: Collect new wallet addresses from token transaction history
+    for (const src of sourceCAs) {
+      try {
+        const txs = await fetchHeliusTxs(src.ca, settingsSnap.maxTxsPerToken);
+        await delay(250);
+        for (const tx of txs) {
+          const addr = tx.feePayer;
+          if (!addr || PROTOCOL_BLACKLIST.has(addr) || scanned[addr]) continue;
+          newWalletsToAnalyze.push({ address: addr, sourceSymbol: src.symbol, sourceCa: src.ca });
+          scanned[addr] = { checkedAt: now }; // mark as seen so we don't queue twice
+        }
+      } catch { /* skip this source on error */ }
+    }
+
+    newDiscovered = newWalletsToAnalyze.length;
+
+    // Step 2: Analyze up to maxWalletsPerScan new wallets
+    const toAnalyze = newWalletsToAnalyze.slice(0, settingsSnap.maxWalletsPerScan);
+    for (const { address, sourceSymbol } of toAnalyze) {
+      try {
+        // Fetch wallet's own tx history to classify it
+        const walletTxs = await fetchHeliusTxs(address, 50);
+        await delay(300);
+
+        const result = analyzeWalletTxs(walletTxs, settingsSnap);
+        scanned[address] = { checkedAt: now, type: result?.type || "normal" };
+        newAnalyzed++;
+
+        if (result?.type) {
+          const isFresh = result.type === "fresh";
+          const alert = {
+            id: `${result.type}-${address}-${now}`,
+            type: result.type,
+            address,
+            sourceSymbol,
+            message: isFresh
+              ? `Fresh wallet — only ${result.txCount} recorded transactions (approx ${result.ageDays?.toFixed(1) ?? "?"} days old). Spotted trading ${sourceSymbol}.`
+              : `Dormant wallet woke up after ${result.inactiveDays?.toFixed(0) ?? "?"} days of inactivity. Now trading ${sourceSymbol}.`,
+            txCount: result.txCount,
+            ageDays: result.ageDays ?? null,
+            inactiveDays: result.inactiveDays ?? null,
+            latestTs: result.latestTs,
+            time: now,
+          };
+          addAlert(alert);
+          dispatchAlert(alert, settingsSnap);
+        }
+      } catch { /* skip this wallet */ }
+    }
+
+    scannedRef.current = scanned;
+    saveScannedWallets(scanned);
+    setStats((prev) => ({
+      discovered: prev.discovered + newDiscovered,
+      analyzed: prev.analyzed + newAnalyzed,
+    }));
     setLastScan(now);
     scanningRef.current = false;
     setScanning(false);
-  }, [wallets, addAlert]);
-
-  // Reset fresh-check when a new wallet is added
-  useEffect(() => {
-    const meta = walletMetaRef.current;
-    wallets.forEach((w) => {
-      if (!meta[w.address]) {
-        meta[w.address] = {};
-      }
-    });
-    walletMetaRef.current = meta;
-  }, [wallets]);
+  }, [pinnedCAs, trendingTokens, addAlert]);
 
   // Auto-scan on interval
   useEffect(() => {
-    if (!settings.enabled || wallets.length === 0) {
-      if (timerRef.current) clearInterval(timerRef.current);
-      return;
-    }
-    // Initial scan after a short delay
-    const initTimer = setTimeout(runScan, 3000);
-    timerRef.current = setInterval(runScan, Math.max(settings.intervalSec, 30) * 1000);
+    const settingsSnap = loadMonitorSettings();
+    if (!settingsSnap.enabled) { clearInterval(timerRef.current); return; }
+    const initTimer = setTimeout(runScan, 4000); // short delay on mount
+    timerRef.current = setInterval(runScan, Math.max(settingsSnap.intervalSec, 60) * 1000);
     return () => { clearTimeout(initTimer); clearInterval(timerRef.current); };
-  }, [settings.enabled, settings.intervalSec, wallets.length, runScan]);
+  }, [settings.enabled, settings.intervalSec, runScan]);
 
-  return { settings, updateSettings, alerts, clearAlerts, scanning, lastScan, runScan };
+  return { settings, updateSettings, alerts, clearAlerts, scanning, lastScan, stats, clearScanned, runScan };
 }
 
 // ─── Monitor Panel Component ───
-const MonitorPanel = ({ wallets, monitor }) => {
-  const { settings, updateSettings, alerts, clearAlerts, scanning, lastScan, runScan } = monitor;
+const MonitorPanel = ({ pinnedCAs, pinnedTokens, trendingTokens, monitor }) => {
+  const { settings, updateSettings, alerts, clearAlerts, scanning, lastScan, stats, clearScanned, runScan } = monitor;
   const [showSettings, setShowSettings] = useState(false);
-  const [testStatus, setTestStatus] = useState(null); // null | "sending" | "ok" | "fail"
+  const [testStatus, setTestStatus] = useState(null);
+
+  const hasSources = pinnedCAs.filter((p) => p.chainId === "solana" || !p.chainId).length > 0
+    || (settings.includeTrending && (trendingTokens || []).some((t) => t.chainId === "solana"));
 
   const requestNotifPermission = () => {
-    if (typeof Notification !== "undefined" && Notification.permission === "default") {
-      Notification.requestPermission();
-    }
+    if (typeof Notification !== "undefined" && Notification.permission === "default") Notification.requestPermission();
   };
 
   const testDiscord = async () => {
@@ -3227,9 +3223,8 @@ const MonitorPanel = ({ wallets, monitor }) => {
     setTestStatus("sending");
     try {
       const res = await fetch(settings.discordWebhook, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ embeds: [{ title: "CryptoDawn Test", description: "Monitor connection successful!", color: 0x4ade80 }] }),
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ embeds: [{ title: "CryptoDawn Monitor — Test", description: "Connection successful!", color: 0x4ade80 }] }),
       });
       setTestStatus(res.ok ? "ok" : "fail");
     } catch { setTestStatus("fail"); }
@@ -3241,8 +3236,7 @@ const MonitorPanel = ({ wallets, monitor }) => {
     setTestStatus("sending");
     try {
       const res = await fetch(`https://api.telegram.org/bot${settings.telegramBotToken}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
+        method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chat_id: settings.telegramChatId, text: "CryptoDawn Monitor — test message!" }),
       });
       setTestStatus(res.ok ? "ok" : "fail");
@@ -3253,13 +3247,8 @@ const MonitorPanel = ({ wallets, monitor }) => {
   const freshAlerts = alerts.filter((a) => a.type === "fresh");
   const dormantAlerts = alerts.filter((a) => a.type === "dormant");
 
-  const inputStyle = {
-    width: "100%", padding: "8px 12px", borderRadius: 8,
-    border: "1px solid #1e293b", background: "#0d1321",
-    color: "#e2e8f0", fontSize: 13, outline: "none",
-  };
-  const labelStyle = { fontSize: 11, fontWeight: 700, color: "#94a3b8", letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 4, display: "block" };
-  const numInputStyle = { ...inputStyle, width: 80, textAlign: "center" };
+  const iStyle = { width: "100%", padding: "8px 12px", borderRadius: 8, border: "1px solid #1e293b", background: "#0d1321", color: "#e2e8f0", fontSize: 13, outline: "none" };
+  const lStyle = { fontSize: 11, fontWeight: 700, color: "#94a3b8", letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 4, display: "block" };
 
   return (
     <>
@@ -3268,7 +3257,7 @@ const MonitorPanel = ({ wallets, monitor }) => {
         <div>
           <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#f59e0b", margin: 0 }}>Wallet Monitor</h2>
           <p style={{ color: "#475569", fontSize: 12, margin: "4px 0 0" }}>
-            Detect fresh & dormant wallets — get alerts on Discord, Telegram, or browser
+            Autonomously discovers wallets from token transactions — flags fresh &amp; dormant activity
           </p>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -3279,25 +3268,14 @@ const MonitorPanel = ({ wallets, monitor }) => {
           )}
           <button
             onClick={runScan}
-            disabled={scanning || wallets.length === 0}
-            style={{
-              padding: "7px 14px", borderRadius: 8, border: "1px solid #f59e0b44",
-              background: "transparent", color: "#f59e0b", fontSize: 12, fontWeight: 600,
-              cursor: scanning || wallets.length === 0 ? "not-allowed" : "pointer",
-              opacity: scanning || wallets.length === 0 ? 0.5 : 1,
-            }}
+            disabled={scanning || !hasSources}
+            style={{ padding: "7px 14px", borderRadius: 8, border: "1px solid #f59e0b44", background: "transparent", color: "#f59e0b", fontSize: 12, fontWeight: 600, cursor: scanning || !hasSources ? "not-allowed" : "pointer", opacity: scanning || !hasSources ? 0.5 : 1 }}
           >
             Scan Now
           </button>
           <button
             onClick={() => setShowSettings(!showSettings)}
-            style={{
-              padding: "7px 14px", borderRadius: 8,
-              border: `1px solid ${showSettings ? "#f59e0b44" : "#334155"}`,
-              background: showSettings ? "#f59e0b11" : "transparent",
-              color: showSettings ? "#f59e0b" : "#64748b",
-              fontSize: 12, fontWeight: 600, cursor: "pointer",
-            }}
+            style={{ padding: "7px 14px", borderRadius: 8, border: `1px solid ${showSettings ? "#f59e0b44" : "#334155"}`, background: showSettings ? "#f59e0b11" : "transparent", color: showSettings ? "#f59e0b" : "#64748b", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
           >
             Settings
           </button>
@@ -3305,113 +3283,75 @@ const MonitorPanel = ({ wallets, monitor }) => {
       </div>
 
       {/* Status bar */}
-      <div style={{
-        display: "flex", gap: 16, marginBottom: 20, flexWrap: "wrap",
-        background: "#111827", border: "1px solid #1e293b", borderRadius: 12, padding: "14px 18px",
-      }}>
+      <div style={{ display: "flex", gap: 16, marginBottom: 20, flexWrap: "wrap", background: "#111827", border: "1px solid #1e293b", borderRadius: 12, padding: "14px 18px" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <div style={{
             width: 8, height: 8, borderRadius: "50%",
-            background: settings.enabled && wallets.length > 0 ? "#4ade80" : "#475569",
-            boxShadow: settings.enabled && wallets.length > 0 ? "0 0 8px #4ade8066" : "none",
-            animation: settings.enabled && wallets.length > 0 ? "pulse-dot 2s ease-in-out infinite" : "none",
+            background: settings.enabled && hasSources ? "#4ade80" : "#475569",
+            boxShadow: settings.enabled && hasSources ? "0 0 8px #4ade8066" : "none",
+            animation: settings.enabled && hasSources ? "pulse-dot 2s ease-in-out infinite" : "none",
           }} />
-          <span style={{ fontSize: 12, color: settings.enabled ? "#4ade80" : "#64748b", fontWeight: 600 }}>
-            {settings.enabled && wallets.length > 0 ? "Active" : "Inactive"}
+          <span style={{ fontSize: 12, fontWeight: 600, color: settings.enabled && hasSources ? "#4ade80" : "#64748b" }}>
+            {settings.enabled && hasSources ? "Active" : settings.enabled ? "No sources" : "Disabled"}
           </span>
         </div>
-        <div style={{ fontSize: 12, color: "#64748b" }}>
-          Tracking: <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{wallets.length}</span> wallets
-        </div>
-        <div style={{ fontSize: 12, color: "#64748b" }}>
-          Interval: <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{settings.intervalSec}s</span>
-        </div>
+        <div style={{ fontSize: 12, color: "#64748b" }}>Sources: <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{pinnedCAs.filter((p) => p.chainId === "solana" || !p.chainId).length} pinned{settings.includeTrending ? " + trending" : ""}</span></div>
+        <div style={{ fontSize: 12, color: "#64748b" }}>Discovered: <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{stats.discovered}</span></div>
+        <div style={{ fontSize: 12, color: "#64748b" }}>Analyzed: <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{stats.analyzed}</span></div>
         {lastScan && (
-          <div style={{ fontSize: 12, color: "#64748b" }}>
-            Last scan: <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{new Date(lastScan).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
-          </div>
+          <div style={{ fontSize: 12, color: "#64748b" }}>Last scan: <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{new Date(lastScan).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span></div>
         )}
         <div style={{ fontSize: 12, color: "#64748b" }}>
-          Alerts: <span style={{ color: "#60a5fa", fontWeight: 600 }}>{freshAlerts.length} fresh</span>
+          <span style={{ color: "#60a5fa", fontWeight: 600 }}>{freshAlerts.length} fresh</span>
           {" / "}
           <span style={{ color: "#f59e0b", fontWeight: 600 }}>{dormantAlerts.length} dormant</span>
         </div>
       </div>
 
-      {/* Settings Panel */}
+      {/* Settings */}
       {showSettings && (
-        <div style={{
-          background: "#111827", border: "1px solid #1e293b", borderRadius: 14,
-          padding: 20, marginBottom: 20,
-        }}>
-          <h3 style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0", margin: "0 0 16px", letterSpacing: 0.3 }}>Monitor Settings</h3>
+        <div style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 14, padding: 20, marginBottom: 20 }}>
+          <h3 style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0", margin: "0 0 16px" }}>Monitor Settings</h3>
 
-          {/* Toggle row */}
           <div style={{ display: "flex", gap: 24, flexWrap: "wrap", marginBottom: 20 }}>
-            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-              <input
-                type="checkbox" checked={settings.enabled}
-                onChange={(e) => updateSettings({ enabled: e.target.checked })}
-                style={{ accentColor: "#f59e0b" }}
-              />
-              <span style={{ fontSize: 13, color: "#e2e8f0", fontWeight: 600 }}>Enable monitoring</span>
-            </label>
-            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-              <input
-                type="checkbox" checked={settings.browserNotifications}
-                onChange={(e) => { updateSettings({ browserNotifications: e.target.checked }); if (e.target.checked) requestNotifPermission(); }}
-                style={{ accentColor: "#60a5fa" }}
-              />
-              <span style={{ fontSize: 13, color: "#e2e8f0", fontWeight: 600 }}>Browser notifications</span>
-            </label>
+            {[
+              { label: "Enable monitoring", key: "enabled", color: "#f59e0b" },
+              { label: "Include trending tokens", key: "includeTrending", color: "#a78bfa" },
+              { label: "Browser notifications", key: "browserNotifications", color: "#60a5fa", extra: () => requestNotifPermission() },
+            ].map(({ label, key, color, extra }) => (
+              <label key={key} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                <input type="checkbox" checked={!!settings[key]}
+                  onChange={(e) => { updateSettings({ [key]: e.target.checked }); extra?.(); }}
+                  style={{ accentColor: color }} />
+                <span style={{ fontSize: 13, color: "#e2e8f0", fontWeight: 600 }}>{label}</span>
+              </label>
+            ))}
           </div>
 
-          {/* Threshold row */}
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 16, marginBottom: 20 }}>
-            <div>
-              <label style={labelStyle}>Scan interval (sec)</label>
-              <input
-                type="number" min={30} max={3600} value={settings.intervalSec}
-                onChange={(e) => updateSettings({ intervalSec: Math.max(30, parseInt(e.target.value) || 120) })}
-                style={numInputStyle}
-              />
-            </div>
-            <div>
-              <label style={labelStyle}>Fresh max age (days)</label>
-              <input
-                type="number" min={1} max={90} value={settings.freshMaxAgeDays}
-                onChange={(e) => updateSettings({ freshMaxAgeDays: Math.max(1, parseInt(e.target.value) || 7) })}
-                style={numInputStyle}
-              />
-            </div>
-            <div>
-              <label style={labelStyle}>Fresh max TXs</label>
-              <input
-                type="number" min={1} max={1000} value={settings.freshMaxTxs}
-                onChange={(e) => updateSettings({ freshMaxTxs: Math.max(1, parseInt(e.target.value) || 10) })}
-                style={numInputStyle}
-              />
-            </div>
-            <div>
-              <label style={labelStyle}>Dormant min days</label>
-              <input
-                type="number" min={1} max={365} value={settings.dormantMinDays}
-                onChange={(e) => updateSettings({ dormantMinDays: Math.max(1, parseInt(e.target.value) || 30) })}
-                style={numInputStyle}
-              />
-            </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(155px, 1fr))", gap: 16, marginBottom: 20 }}>
+            {[
+              { label: "Scan interval (sec)", key: "intervalSec", min: 60, max: 3600, def: 180 },
+              { label: "Fresh max age (days)", key: "freshMaxAgeDays", min: 1, max: 90, def: 7 },
+              { label: "Fresh max TXs", key: "freshMaxTxs", min: 1, max: 500, def: 15 },
+              { label: "Dormant min days", key: "dormantMinDays", min: 1, max: 365, def: 30 },
+              { label: "TXs per token", key: "maxTxsPerToken", min: 5, max: 100, def: 25 },
+              { label: "Wallets per scan", key: "maxWalletsPerScan", min: 1, max: 20, def: 6 },
+            ].map(({ label, key, min, max, def }) => (
+              <div key={key}>
+                <label style={lStyle}>{label}</label>
+                <input type="number" min={min} max={max} value={settings[key]}
+                  onChange={(e) => updateSettings({ [key]: Math.max(min, parseInt(e.target.value) || def) })}
+                  style={{ ...iStyle, width: 90, textAlign: "center" }} />
+              </div>
+            ))}
           </div>
 
-          {/* Discord */}
           <div style={{ marginBottom: 16 }}>
-            <label style={labelStyle}>Discord Webhook URL</label>
+            <label style={lStyle}>Discord Webhook URL</label>
             <div style={{ display: "flex", gap: 8 }}>
-              <input
-                type="text" placeholder="https://discord.com/api/webhooks/..."
-                value={settings.discordWebhook}
+              <input type="text" placeholder="https://discord.com/api/webhooks/…" value={settings.discordWebhook}
                 onChange={(e) => updateSettings({ discordWebhook: e.target.value.trim() })}
-                style={{ ...inputStyle, flex: 1 }}
-              />
+                style={{ ...iStyle, flex: 1 }} />
               {settings.discordWebhook && (
                 <button onClick={testDiscord} disabled={testStatus === "sending"}
                   style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid #7c3aed44", background: "transparent", color: "#a78bfa", fontSize: 12, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>
@@ -3421,25 +3361,18 @@ const MonitorPanel = ({ wallets, monitor }) => {
             </div>
           </div>
 
-          {/* Telegram */}
           <div style={{ marginBottom: 16 }}>
-            <label style={labelStyle}>Telegram Bot Token</label>
-            <input
-              type="text" placeholder="123456:ABCdef..."
-              value={settings.telegramBotToken}
-              onChange={(e) => updateSettings({ telegramBotToken: e.target.value.trim() })}
-              style={inputStyle}
-            />
+            <label style={lStyle}>Telegram Bot Token</label>
+            <input type="text" placeholder="123456:ABCdef…" value={settings.telegramBotToken}
+              onChange={(e) => updateSettings({ telegramBotToken: e.target.value.trim() })} style={iStyle} />
           </div>
+
           <div style={{ marginBottom: 8 }}>
-            <label style={labelStyle}>Telegram Chat ID</label>
+            <label style={lStyle}>Telegram Chat ID</label>
             <div style={{ display: "flex", gap: 8 }}>
-              <input
-                type="text" placeholder="-1001234567890"
-                value={settings.telegramChatId}
+              <input type="text" placeholder="-1001234567890" value={settings.telegramChatId}
                 onChange={(e) => updateSettings({ telegramChatId: e.target.value.trim() })}
-                style={{ ...inputStyle, flex: 1 }}
-              />
+                style={{ ...iStyle, flex: 1 }} />
               {settings.telegramBotToken && settings.telegramChatId && (
                 <button onClick={testTelegram} disabled={testStatus === "sending"}
                   style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid #0ea5e944", background: "transparent", color: "#38bdf8", fontSize: 12, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>
@@ -3448,18 +3381,51 @@ const MonitorPanel = ({ wallets, monitor }) => {
               )}
             </div>
           </div>
-          <div style={{ fontSize: 11, color: "#475569", marginTop: 12 }}>
-            Credentials are stored locally in your browser only — never sent to any server except Discord/Telegram when dispatching alerts.
+
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 16, paddingTop: 14, borderTop: "1px solid #1e293b" }}>
+            <span style={{ fontSize: 11, color: "#475569" }}>Credentials stored locally only — never sent to any server except Discord/Telegram.</span>
+            <button onClick={clearScanned}
+              style={{ padding: "5px 12px", borderRadius: 6, border: "1px solid #334155", background: "transparent", color: "#64748b", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+              Reset seen wallets
+            </button>
           </div>
         </div>
       )}
 
-      {/* No wallets state */}
-      {wallets.length === 0 && (
+      {/* No sources state */}
+      {!hasSources && (
         <div style={{ textAlign: "center", color: "#475569", padding: 64, fontSize: 14, border: "1px dashed #1e293b", borderRadius: 14 }}>
           <div style={{ fontSize: 32, marginBottom: 12 }}>📡</div>
-          <div style={{ fontWeight: 600, marginBottom: 6, color: "#64748b" }}>No wallets to monitor</div>
-          <div>Add wallets in the Wallets tab, then come back here to monitor them</div>
+          <div style={{ fontWeight: 600, marginBottom: 6, color: "#64748b" }}>No Solana tokens pinned</div>
+          <div>Pin a Solana token in the Discover tab — the monitor will scan its recent transactions for suspicious wallets</div>
+        </div>
+      )}
+
+      {/* Source tokens */}
+      {hasSources && (
+        <div style={{ marginBottom: 20 }}>
+          <h3 style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0", margin: "0 0 10px" }}>Scanning Transactions For</h3>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {pinnedCAs.filter((p) => p.chainId === "solana" || !p.chainId).map((p) => {
+              const meta = pinnedTokens?.find((t) => t.baseToken?.address === p.ca);
+              const sym = meta?.baseToken?.symbol || p.ca.slice(0, 6) + "…";
+              const icon = meta?.icon || meta?.info?.imageUrl || null;
+              return (
+                <div key={p.ca} style={{ display: "flex", alignItems: "center", gap: 6, background: "#111827", border: "1px solid #1e293b", borderRadius: 8, padding: "5px 10px" }}>
+                  {icon && <img src={icon} alt="" style={{ width: 16, height: 16, borderRadius: "50%", objectFit: "cover" }} onError={(e) => { e.target.style.display = "none"; }} />}
+                  <span style={{ fontSize: 12, fontWeight: 600, color: "#e2e8f0" }}>{sym}</span>
+                  <span style={{ fontSize: 10, color: "#475569" }}>pinned</span>
+                </div>
+              );
+            })}
+            {settings.includeTrending && (trendingTokens || []).filter((t) => t.chainId === "solana").slice(0, 5).map((t) => (
+              <div key={t.baseToken.address} style={{ display: "flex", alignItems: "center", gap: 6, background: "#111827", border: "1px solid #7c3aed33", borderRadius: 8, padding: "5px 10px" }}>
+                {t.icon && <img src={t.icon} alt="" style={{ width: 16, height: 16, borderRadius: "50%", objectFit: "cover" }} onError={(e) => { e.target.style.display = "none"; }} />}
+                <span style={{ fontSize: 12, fontWeight: 600, color: "#c4b5fd" }}>{t.baseToken.symbol}</span>
+                <span style={{ fontSize: 10, color: "#5b21b6" }}>trending</span>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
@@ -3467,72 +3433,45 @@ const MonitorPanel = ({ wallets, monitor }) => {
       {alerts.length > 0 && (
         <div style={{ marginBottom: 20 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-            <h3 style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0", margin: 0, letterSpacing: 0.3 }}>Alert Feed</h3>
+            <h3 style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0", margin: 0 }}>Alert Feed</h3>
             <button onClick={clearAlerts}
               style={{ padding: "5px 12px", borderRadius: 6, border: "1px solid #334155", background: "transparent", color: "#64748b", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
               Clear All
             </button>
           </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 480, overflowY: "auto" }}>
-            {alerts.map((a) => (
-              <div key={a.id} style={{
-                background: "#111827", border: `1px solid ${a.type === "fresh" ? "#3b82f633" : "#f59e0b33"}`,
-                borderRadius: 10, padding: "12px 16px",
-                borderLeft: `3px solid ${a.type === "fresh" ? "#60a5fa" : "#f59e0b"}`,
-              }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <span style={{
-                      fontSize: 10, fontWeight: 800, letterSpacing: 0.5, textTransform: "uppercase",
-                      color: a.type === "fresh" ? "#60a5fa" : "#f59e0b",
-                      background: a.type === "fresh" ? "#3b82f622" : "#f59e0b22",
-                      padding: "2px 8px", borderRadius: 4,
-                    }}>
-                      {a.type === "fresh" ? "FRESH" : "DORMANT"}
-                    </span>
-                    {a.label && <span style={{ fontSize: 13, fontWeight: 600, color: "#e2e8f0" }}>{a.label}</span>}
-                  </div>
-                  <span style={{ fontSize: 11, color: "#475569" }}>
-                    {new Date(a.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                    {" · "}
-                    {new Date(a.time).toLocaleDateString([], { month: "short", day: "numeric" })}
-                  </span>
-                </div>
-                <div style={{ fontSize: 12, color: "#94a3b8", lineHeight: 1.4, marginBottom: 4 }}>{a.message}</div>
-                <div style={{ fontSize: 11, color: "#475569", fontFamily: "monospace" }}>{a.address}</div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Wallet Status Summary */}
-      {wallets.length > 0 && (
-        <div>
-          <h3 style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0", margin: "0 0 12px", letterSpacing: 0.3 }}>Tracked Wallets</h3>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 10 }}>
-            {wallets.map((w) => {
-              const meta = loadWalletMeta()[w.address] || {};
-              const walletAlerts = alerts.filter((a) => a.address === w.address);
-              const hasFresh = walletAlerts.some((a) => a.type === "fresh");
-              const hasDormant = walletAlerts.some((a) => a.type === "dormant");
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 520, overflowY: "auto" }}>
+            {alerts.map((a) => {
+              const isFresh = a.type === "fresh";
               return (
-                <div key={w.address} style={{
-                  background: "#111827", border: "1px solid #1e293b", borderRadius: 10, padding: "12px 16px",
+                <div key={a.id} style={{
+                  background: "#111827",
+                  border: `1px solid ${isFresh ? "#3b82f622" : "#f59e0b22"}`,
+                  borderLeft: `3px solid ${isFresh ? "#60a5fa" : "#f59e0b"}`,
+                  borderRadius: 10, padding: "12px 16px",
                 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-                    <span style={{ fontSize: 13, fontWeight: 600, color: "#e2e8f0" }}>{w.label || w.address.slice(0, 8) + "…"}</span>
-                    <div style={{ display: "flex", gap: 4 }}>
-                      {hasFresh && <span style={{ fontSize: 9, fontWeight: 800, color: "#60a5fa", background: "#3b82f622", padding: "2px 6px", borderRadius: 4, letterSpacing: 0.5 }}>FRESH</span>}
-                      {hasDormant && <span style={{ fontSize: 9, fontWeight: 800, color: "#f59e0b", background: "#f59e0b22", padding: "2px 6px", borderRadius: 4, letterSpacing: 0.5 }}>DORMANT</span>}
-                      {!hasFresh && !hasDormant && <span style={{ fontSize: 9, fontWeight: 800, color: "#4ade80", background: "#4ade8022", padding: "2px 6px", borderRadius: 4, letterSpacing: 0.5 }}>NORMAL</span>}
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{
+                        fontSize: 10, fontWeight: 800, letterSpacing: 0.5, textTransform: "uppercase",
+                        color: isFresh ? "#60a5fa" : "#f59e0b",
+                        background: isFresh ? "#3b82f622" : "#f59e0b22",
+                        padding: "2px 8px", borderRadius: 4,
+                      }}>
+                        {isFresh ? "FRESH" : "DORMANT"}
+                      </span>
+                      {a.sourceSymbol && (
+                        <span style={{ fontSize: 11, color: "#64748b" }}>via <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{a.sourceSymbol}</span></span>
+                      )}
                     </div>
+                    <span style={{ fontSize: 11, color: "#475569" }}>
+                      {new Date(a.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · {new Date(a.time).toLocaleDateString([], { month: "short", day: "numeric" })}
+                    </span>
                   </div>
-                  <div style={{ fontSize: 11, color: "#475569", fontFamily: "monospace", marginBottom: 4 }}>{w.address}</div>
-                  <div style={{ display: "flex", gap: 12, fontSize: 11, color: "#64748b" }}>
-                    {meta.txCount != null && <span>TXs: {meta.txCount >= 100 ? "100+" : meta.txCount}</span>}
-                    {meta.firstTxTime && <span>Created: {new Date(meta.firstTxTime).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })}</span>}
-                    {meta.lastActivity && <span>Last active: {new Date(meta.lastActivity).toLocaleDateString([], { month: "short", day: "numeric" })}</span>}
+                  <div style={{ fontSize: 12, color: "#94a3b8", lineHeight: 1.45, marginBottom: 5 }}>{a.message}</div>
+                  <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                    <span style={{ fontSize: 11, color: "#475569", fontFamily: "monospace" }}>{a.address}</span>
+                    <a href={`https://solscan.io/account/${a.address}`} target="_blank" rel="noopener noreferrer"
+                      style={{ fontSize: 10, color: "#6366f1", fontWeight: 600, textDecoration: "none" }}>Solscan ↗</a>
                   </div>
                 </div>
               );
@@ -3541,9 +3480,15 @@ const MonitorPanel = ({ wallets, monitor }) => {
         </div>
       )}
 
-      {wallets.length > 0 && (
-        <div style={{ color: "#334155", fontSize: 11, marginTop: 16, textAlign: "center" }}>
-          Monitor checks wallet activity via Helius API • Alerts sent to configured channels • Data stored locally
+      {alerts.length === 0 && hasSources && (
+        <div style={{ textAlign: "center", color: "#475569", padding: "32px 0", fontSize: 13 }}>
+          No suspicious wallets found yet — the monitor will alert you when fresh or dormant wallets are detected.
+        </div>
+      )}
+
+      {hasSources && (
+        <div style={{ color: "#334155", fontSize: 11, marginTop: 12, textAlign: "center" }}>
+          Discovers wallets from token transaction history via Helius API • Analyzes up to {settings.maxWalletsPerScan} new wallets per scan
         </div>
       )}
     </>
@@ -3576,8 +3521,8 @@ export default function App() {
   const [showAddCA, setShowAddCA] = useState(false);
   const [showAddWallet, setShowAddWallet] = useState(false);
 
-  // Wallet Monitor
-  const monitor = useWalletMonitor(wallets);
+  // Wallet Monitor — discovers wallets from pinned CA token transactions
+  const monitor = useWalletMonitor(pinnedCAs, tokens);
 
   // mint → [{address, label, amount, usdValue}] across all tracked wallets
   const [walletMintMap, setWalletMintMap] = useState({});
@@ -3992,7 +3937,7 @@ export default function App() {
 
       {/* ─── Monitor Section ─── */}
       {activeSection === "monitor" && (
-        <MonitorPanel wallets={wallets} monitor={monitor} />
+        <MonitorPanel pinnedCAs={pinnedCAs} pinnedTokens={pinnedTokens} trendingTokens={tokens} monitor={monitor} />
       )}
 
       <div className="gradient-divider" style={{ marginTop: 40, marginBottom: 16 }} />
