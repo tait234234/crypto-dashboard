@@ -1503,7 +1503,9 @@ function useWalletLinks(wallets, walletMintMap) {
           address: extAddr,
           sharedWith: [...walletSet],
           txCount,
-          mints: [...mints], // token mints transferred to/from this address
+          mints: [...mints],
+          degree: 1,
+          via: [],
           sharedWithLabels: [...walletSet].map((a) => {
             const w = wallets.find((x) => x.address === a);
             return w?.label || `${a.slice(0, 4)}…${a.slice(-4)}`;
@@ -1511,6 +1513,66 @@ function useWalletLinks(wallets, walletMintMap) {
         });
       });
       related.sort((a, b) => b.sharedWith.length - a.sharedWith.length || b.txCount - a.txCount);
+
+      // ── 2nd-degree discovery: probe top intermediary wallets ──
+      // For each top 1st-degree wallet, fetch THEIR transfer history and surface
+      // addresses they interacted with — so tracking wallet A finds B through C.
+      const probeTargets = related
+        .filter((r) => r.txCount >= 2)
+        .slice(0, 10);
+
+      if (probeTargets.length > 0 && !cancelled) {
+        const knownAddrs = new Set([...addrSet, ...externalMap.keys()]);
+        const secondDegree = new Map(); // addr → { via, trackedLinks, txCount }
+
+        await Promise.all(
+          probeTargets.map(async (intermediary) => {
+            try {
+              const txs = await fetchWalletTxs(intermediary.address, 100, "TRANSFER");
+              if (cancelled) return;
+              txs.forEach((tx) => {
+                extractCounterparties(tx, intermediary.address).forEach((cp) => {
+                  if (addrSet.has(cp) || cp === intermediary.address) return;
+                  if (knownAddrs.has(cp)) return; // already 1st-degree, skip
+                  if (!secondDegree.has(cp)) secondDegree.set(cp, { via: new Set(), trackedLinks: new Set(), txCount: 0 });
+                  const entry = secondDegree.get(cp);
+                  entry.via.add(intermediary.address);
+                  entry.txCount++;
+                  intermediary.sharedWith.forEach((w) => entry.trackedLinks.add(w));
+                });
+              });
+            } catch {}
+          })
+        );
+
+        // Add 2nd-degree wallets to related list (those with 2+ txs through intermediary)
+        secondDegree.forEach(({ via, trackedLinks, txCount }, addr) => {
+          if (txCount < 2) return; // filter noise — require at least 2 txs with an intermediary
+          const viaLabels = [...via].map((v) => {
+            const r = related.find((x) => x.address === v);
+            return r ? `${v.slice(0, 4)}…${v.slice(-4)}` : `${v.slice(0, 4)}…${v.slice(-4)}`;
+          });
+          related.push({
+            address: addr,
+            sharedWith: [...trackedLinks],
+            txCount,
+            mints: [],
+            degree: 2,
+            via: [...via],
+            viaLabels,
+            sharedWithLabels: [...trackedLinks].map((a) => {
+              const w = wallets.find((x) => x.address === a);
+              return w?.label || `${a.slice(0, 4)}…${a.slice(-4)}`;
+            }),
+          });
+        });
+
+        // Re-sort: 1st degree first (by sharedWith then txCount), then 2nd degree
+        related.sort((a, b) => {
+          if (a.degree !== b.degree) return a.degree - b.degree;
+          return b.sharedWith.length - a.sharedWith.length || b.txCount - a.txCount;
+        });
+      }
 
       // ── Funding detection ──
       // Find wallets that sent meaningful SOL or USDC inbound to tracked wallets
@@ -1571,7 +1633,7 @@ function useWalletLinks(wallets, walletMintMap) {
           });
         });
         setLinks(result);
-        setRelatedWallets(related.slice(0, 20));
+        setRelatedWallets(related.slice(0, 30));
         setFundingWallets(fundingArr.slice(0, 15));
         setLoading(false);
       }
@@ -2131,9 +2193,11 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
   }
 
 
-  const strong = relatedWallets.filter((r) => r.sharedWith.length >= 2);
-  const weak   = relatedWallets.filter((r) => r.sharedWith.length < 2);
-  const shown  = expanded ? relatedWallets : strong.length > 0 ? strong : weak.slice(0, 5);
+  const strong = relatedWallets.filter((r) => r.sharedWith.length >= 2 && r.degree !== 2);
+  const second = relatedWallets.filter((r) => r.degree === 2);
+  const weak   = relatedWallets.filter((r) => r.sharedWith.length < 2 && r.degree !== 2);
+  // Always show strong + 2nd-degree; collapse weak unless expanded
+  const shown  = expanded ? relatedWallets : [...strong, ...second, ...(strong.length + second.length > 0 ? [] : weak.slice(0, 5))];
 
   return (
     <div style={{ background: "#0d1321", border: "1px solid #1e293b", borderRadius: 14, padding: "16px 20px", marginBottom: 20 }}>
@@ -2144,7 +2208,7 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
             <span style={{ marginLeft: 8, background: "#f59e0b22", color: "#f59e0b", border: "1px solid #f59e0b44", borderRadius: 4, fontSize: 10, fontWeight: 700, padding: "1px 6px" }}>{relatedWallets.length}</span>
           </h3>
           <div style={{ fontSize: 11, color: "#475569", marginTop: 2 }}>
-            Addresses that transacted with your tracked wallets — not yet added to tracker
+            1st &amp; 2nd degree connections — addresses that transacted with your wallets or their counterparties
           </div>
         </div>
         {renderCAFilter()}
@@ -2162,6 +2226,7 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
         {shown.map((r) => {
           const isAlreadyTracked = trackedAddrs.has(r.address) || tracked.has(r.address);
           const isStrong = r.sharedWith.length >= 2;
+          const is2nd = r.degree === 2;
 
           // Resolve token icons for mints this address transacted with
           const tokenIcons = (r.mints || [])
@@ -2170,11 +2235,11 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
             .slice(0, 6);
 
           return (
-            <div key={r.address} style={{ background: "#111827", borderRadius: 8, border: `1px solid ${isStrong ? "#f59e0b33" : "#1e293b"}`, overflow: "hidden" }}>
+            <div key={r.address} style={{ background: "#111827", borderRadius: 8, border: `1px solid ${is2nd ? "#a78bfa33" : isStrong ? "#f59e0b33" : "#1e293b"}`, overflow: "hidden" }}>
               {/* Main row */}
               <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px" }}>
                 {/* Signal dot */}
-                <div style={{ flexShrink: 0, width: 6, height: 6, borderRadius: "50%", background: isStrong ? "#f59e0b" : "#334155" }} title={isStrong ? "Linked to multiple tracked wallets" : "Linked to 1 tracked wallet"} />
+                <div style={{ flexShrink: 0, width: 6, height: 6, borderRadius: "50%", background: is2nd ? "#a78bfa" : isStrong ? "#f59e0b" : "#334155" }} title={is2nd ? "2nd-degree connection (via intermediary)" : isStrong ? "Linked to multiple tracked wallets" : "Linked to 1 tracked wallet"} />
 
                 {/* Address */}
                 <span style={{ fontFamily: "monospace", fontSize: 11, color: "#94a3b8", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -2183,6 +2248,11 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
 
                 {/* Tags */}
                 <div style={{ display: "flex", gap: 4, flexShrink: 0, alignItems: "center" }}>
+                  {is2nd && (
+                    <span title={r.via?.length ? `Via: ${r.via.map((v) => v.slice(0, 6) + "…").join(", ")}` : "2nd-degree connection"} style={{ background: "#a78bfa22", color: "#a78bfa", border: "1px solid #a78bfa44", borderRadius: 4, fontSize: 9, fontWeight: 700, padding: "1px 5px", whiteSpace: "nowrap" }}>
+                      2nd°
+                    </span>
+                  )}
                   {isStrong && (
                     <span style={{ background: "#f59e0b22", color: "#f59e0b", border: "1px solid #f59e0b44", borderRadius: 4, fontSize: 9, fontWeight: 700, padding: "1px 5px", whiteSpace: "nowrap" }}>
                       {r.sharedWith.length} wallets
@@ -2259,7 +2329,7 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
       {activeCA && renderTokenHolders()}
 
       <div style={{ fontSize: 10, color: "#1e293b", marginTop: 8 }}>
-        Based on up to 200 recent txs + 200 transfer-only txs per wallet via Helius • Amber dot = linked to 2+ of your wallets
+        200 recent + 200 transfer txs per wallet + 2nd-degree probing via Helius • Amber = 2+ wallets • Purple = 2nd degree
       </div>
     </div>
   );
