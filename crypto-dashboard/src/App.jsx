@@ -1198,27 +1198,110 @@ async function fetchWalletTxs(address, maxTxs = 200) {
   return all;
 }
 
+// ── Blacklist: program IDs, pool vaults, and fee collectors that are NOT user wallets ──
+// These appear as counterparties in swaps/transfers but belong to protocols, not people.
+const PROTOCOL_BLACKLIST = new Set([
+  // Solana system / token infrastructure
+  "11111111111111111111111111111111",
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",   // SPL Token
+  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",   // Token-2022
+  "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bxbc", // Associated Token
+  "ComputeBudget111111111111111111111111111111",
+  "SysvarRent111111111111111111111111111111111",
+  "SysvarC1ock11111111111111111111111111111111",
+  "Vote111111111111111111111111111111111111111h",
+  "Stake11111111111111111111111111111111111111",
+  "BPFLoaderUpgradeab1e11111111111111111111111",
+  "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",   // Memo program
+
+  // Raydium – programs + fee/authority accounts
+  "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  // AMM v4
+  "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",  // AMM authority
+  "7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5",  // Fee collector
+  "HWy1jotHpo6UqeQxx49dpYYdQB8wj9Qk9MdxwjLvDHB8",  // Fee collector v2
+  "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",  // Protocol fee
+  "EhhTKczWMGQt46ynNeRX1WfeagwwJd7ufHvCDjRxjo5Q",  // V3 fee
+  "3uaZBfHPfmpAHW7dsimC1SnyR61X4bJqQZKWmRSCXJxv",  // Staking
+  "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",  // CLMM
+  "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  // CLMM program
+
+  // Jupiter
+  "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB",
+  "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+  "jupoNjAxXgZ4rjzxzPMP4QoLQtCMY9rHwxGqsGDFFBX",
+  "D8cy77BBepLMngZx6ZukaTff5hCt1HrWyKk3Hnd9oitf",  // Jupiter fee token account
+
+  // Orca Whirlpools
+  "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+  "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP",
+
+  // Pump.fun
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBymLf5",
+  "CebN5WGQ4jvEPvsVU4EoHEpgznyKmGG8KE9W3VHwHhGZ",  // Fee wallet
+
+  // Meteora
+  "Eo7WjKq67rjJQDd81erLuyWJloaZBMUMbAMhLHa1S4zp",  // DLMM
+  "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",   // LB pair
+
+  // OpenBook / Serum
+  "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX",
+  "opnb2LAfJYbRMAHHvqjCwQxanZn7n7BS2qDGGRNxNEy",
+  "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",  // Serum v2
+
+  // Moonshot
+  "MoonCVVNZFSYkqNXP6bxHLPL6QQXiMbNtjfTYDHCB1h",
+]);
+
+// DEX/AMM program IDs whose owned accounts (vaults, positions) are pool contracts, not user wallets.
+// Used to dynamically filter pool addresses from accountData without needing every pool address.
+const DEX_PROGRAM_OWNERS = new Set([
+  "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  // Raydium AMM v4
+  "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",  // Raydium CLMM
+  "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  // Raydium CLMM program
+  "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",   // Orca Whirlpools
+  "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP",  // Orca v2
+  "Eo7WjKq67rjJQDd81erLuyWJloaZBMUMbAMhLHa1S4zp",  // Meteora DLMM
+  "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",   // Meteora LB
+  "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX",   // Serum v3
+  "opnb2LAfJYbRMAHHvqjCwQxanZn7n7BS2qDGGRNxNEy",   // OpenBook
+]);
+
+// Build the set of addresses to exclude for a given transaction.
+// Combines the static blacklist with any pool-owned accounts found in accountData.
+function buildExcluded(tx) {
+  const excluded = new Set(PROTOCOL_BLACKLIST);
+  (tx.accountData || []).forEach((a) => {
+    if (a.programOwner && DEX_PROGRAM_OWNERS.has(a.programOwner) && a.account) {
+      excluded.add(a.account);
+    }
+  });
+  return excluded;
+}
+
 // Extract all counterparty addresses from a Helius enhanced transaction
 function extractCounterparties(tx, ownAddress) {
+  const excluded = buildExcluded(tx);
   const addrs = new Set();
+  const ok = (addr) => addr && addr !== ownAddress && !excluded.has(addr);
   (tx.nativeTransfers || []).forEach((t) => {
-    if (t.fromUserAccount && t.fromUserAccount !== ownAddress) addrs.add(t.fromUserAccount);
-    if (t.toUserAccount && t.toUserAccount !== ownAddress) addrs.add(t.toUserAccount);
+    if (ok(t.fromUserAccount)) addrs.add(t.fromUserAccount);
+    if (ok(t.toUserAccount)) addrs.add(t.toUserAccount);
   });
   (tx.tokenTransfers || []).forEach((t) => {
-    if (t.fromUserAccount && t.fromUserAccount !== ownAddress) addrs.add(t.fromUserAccount);
-    if (t.toUserAccount && t.toUserAccount !== ownAddress) addrs.add(t.toUserAccount);
+    if (ok(t.fromUserAccount)) addrs.add(t.fromUserAccount);
+    if (ok(t.toUserAccount)) addrs.add(t.toUserAccount);
   });
   return [...addrs];
 }
 
 // Extract {counterpartyAddress → Set<mint>} from a transaction
 function extractCounterpartyMints(tx, ownAddress) {
+  const excluded = buildExcluded(tx);
   const map = new Map(); // counterparty → Set<mint>
   (tx.tokenTransfers || []).forEach((t) => {
     if (!t.mint) return;
     [t.fromUserAccount, t.toUserAccount].forEach((acct) => {
-      if (acct && acct !== ownAddress) {
+      if (acct && acct !== ownAddress && !excluded.has(acct)) {
         if (!map.has(acct)) map.set(acct, new Set());
         map.get(acct).add(t.mint);
       }
@@ -1349,12 +1432,13 @@ function useWalletLinks(wallets, walletMintMap) {
       const fundingMap = new Map(); // funderAddr → { walletsFunded: Set, totalSol, totalUsdc, txCount }
       addrs.forEach((addr) => {
         (txsByWallet.get(addr) || []).forEach((tx) => {
+          const excluded = buildExcluded(tx);
+          const isValidFunder = (f) => f && f !== addr && !addrSet.has(f) && !excluded.has(f);
           // SOL funding: inbound native transfer ≥ MIN_FUNDING_SOL
           (tx.nativeTransfers || []).forEach((t) => {
             const solAmt = (t.amount || 0) / 1e9;
-            if (t.toUserAccount === addr && t.fromUserAccount && t.fromUserAccount !== addr && solAmt >= MIN_FUNDING_SOL) {
+            if (t.toUserAccount === addr && isValidFunder(t.fromUserAccount) && solAmt >= MIN_FUNDING_SOL) {
               const f = t.fromUserAccount;
-              if (addrSet.has(f)) return; // skip other tracked wallets
               if (!fundingMap.has(f)) fundingMap.set(f, { walletsFunded: new Set(), totalSol: 0, totalUsdc: 0, txCount: 0 });
               const e = fundingMap.get(f);
               e.walletsFunded.add(addr);
@@ -1364,9 +1448,8 @@ function useWalletLinks(wallets, walletMintMap) {
           });
           // USDC funding: inbound token transfer ≥ MIN_FUNDING_USDC
           (tx.tokenTransfers || []).forEach((t) => {
-            if (t.toUserAccount === addr && t.fromUserAccount && t.fromUserAccount !== addr && t.mint === USDC_MINT && (t.tokenAmount || 0) >= MIN_FUNDING_USDC) {
+            if (t.toUserAccount === addr && isValidFunder(t.fromUserAccount) && t.mint === USDC_MINT && (t.tokenAmount || 0) >= MIN_FUNDING_USDC) {
               const f = t.fromUserAccount;
-              if (addrSet.has(f)) return;
               if (!fundingMap.has(f)) fundingMap.set(f, { walletsFunded: new Set(), totalSol: 0, totalUsdc: 0, txCount: 0 });
               const e = fundingMap.get(f);
               e.walletsFunded.add(addr);
