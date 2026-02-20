@@ -2936,11 +2936,625 @@ const AddWalletPanel = ({ onAdd, onClose }) => {
   );
 };
 
+// ─── Wallet Monitor Engine ───
+// Detects fresh wallets (< N days old / < N total txs) and dormant wallets
+// (no activity for N days then suddenly active). Sends alerts via Discord webhook,
+// Telegram bot, and browser notifications.
+
+const MONITOR_DEFAULTS = {
+  enabled: true,
+  intervalSec: 120,           // check every 2 minutes
+  freshMaxAgeDays: 7,         // wallet younger than 7 days = fresh
+  freshMaxTxs: 10,            // wallet with fewer than 10 txs = fresh
+  dormantMinDays: 30,         // no activity for 30 days = dormant
+  minSolValue: 0.1,           // minimum SOL value to trigger alert
+  discordWebhook: "",
+  telegramBotToken: "",
+  telegramChatId: "",
+  browserNotifications: true,
+};
+
+function loadMonitorSettings() {
+  try { return { ...MONITOR_DEFAULTS, ...JSON.parse(localStorage.getItem("monitorSettings") || "{}") }; }
+  catch { return { ...MONITOR_DEFAULTS }; }
+}
+function saveMonitorSettings(s) {
+  try { localStorage.setItem("monitorSettings", JSON.stringify(s)); } catch {}
+}
+function loadMonitorAlerts() {
+  try { return JSON.parse(localStorage.getItem("monitorAlerts") || "[]"); } catch { return []; }
+}
+function saveMonitorAlerts(alerts) {
+  try { localStorage.setItem("monitorAlerts", JSON.stringify(alerts.slice(0, 200))); } catch {}
+}
+function loadWalletMeta() {
+  try { return JSON.parse(localStorage.getItem("walletMeta") || "{}"); } catch { return {}; }
+}
+function saveWalletMeta(m) {
+  try { localStorage.setItem("walletMeta", JSON.stringify(m)); } catch {}
+}
+
+async function getWalletAge(address) {
+  // Get earliest transaction via Helius — fetch 1 tx with no "before" cursor, ascending
+  try {
+    const res = await fetch(
+      `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_KEY}&limit=1&sort-order=asc`
+    );
+    if (!res.ok) return null;
+    const txs = await res.json();
+    if (!Array.isArray(txs) || txs.length === 0) return null;
+    const ts = txs[0].timestamp;
+    if (!ts) return null;
+    return { firstTxTime: ts * 1000, ageDays: (Date.now() - ts * 1000) / 86400000 };
+  } catch { return null; }
+}
+
+async function getWalletTxCount(address) {
+  try {
+    const res = await fetch(
+      `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_KEY}&limit=100`
+    );
+    if (!res.ok) return null;
+    const txs = await res.json();
+    return Array.isArray(txs) ? txs.length : null;
+  } catch { return null; }
+}
+
+async function getLastActivity(address) {
+  try {
+    const res = await fetch(
+      `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_KEY}&limit=1`
+    );
+    if (!res.ok) return null;
+    const txs = await res.json();
+    if (!Array.isArray(txs) || txs.length === 0) return null;
+    const ts = txs[0].timestamp;
+    return ts ? ts * 1000 : null;
+  } catch { return null; }
+}
+
+// Dispatch alert to configured channels
+async function dispatchAlert(alert, settings) {
+  const msg = `[${alert.type.toUpperCase()}] ${alert.label || alert.address.slice(0, 8) + "…"}\n${alert.message}`;
+
+  // Discord webhook
+  if (settings.discordWebhook) {
+    try {
+      await fetch(settings.discordWebhook, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          embeds: [{
+            title: alert.type === "fresh" ? "Fresh Wallet Detected" : "Dormant Wallet Woke Up",
+            description: alert.message,
+            color: alert.type === "fresh" ? 0x60a5fa : 0xf59e0b,
+            fields: [
+              { name: "Wallet", value: `\`${alert.address}\``, inline: false },
+              ...(alert.label ? [{ name: "Label", value: alert.label, inline: true }] : []),
+              ...(alert.ageDays != null ? [{ name: "Age", value: `${alert.ageDays.toFixed(1)} days`, inline: true }] : []),
+              ...(alert.txCount != null ? [{ name: "Transactions", value: String(alert.txCount), inline: true }] : []),
+              ...(alert.inactiveDays != null ? [{ name: "Inactive For", value: `${alert.inactiveDays.toFixed(0)} days`, inline: true }] : []),
+            ],
+            timestamp: new Date(alert.time).toISOString(),
+            footer: { text: "CryptoDawn Monitor" },
+          }],
+        }),
+      });
+    } catch {}
+  }
+
+  // Telegram
+  if (settings.telegramBotToken && settings.telegramChatId) {
+    try {
+      await fetch(`https://api.telegram.org/bot${settings.telegramBotToken}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: settings.telegramChatId,
+          text: msg,
+          parse_mode: "Markdown",
+        }),
+      });
+    } catch {}
+  }
+
+  // Browser notification
+  if (settings.browserNotifications && typeof Notification !== "undefined" && Notification.permission === "granted") {
+    try { new Notification(alert.type === "fresh" ? "Fresh Wallet" : "Dormant Wallet Active", { body: alert.message, icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔔</text></svg>" }); } catch {}
+  }
+}
+
+function useWalletMonitor(wallets) {
+  const [settings, setSettings] = useState(loadMonitorSettings);
+  const [alerts, setAlerts] = useState(loadMonitorAlerts);
+  const [scanning, setScanning] = useState(false);
+  const [lastScan, setLastScan] = useState(null);
+  const walletMetaRef = useRef(loadWalletMeta());
+  const timerRef = useRef(null);
+  const scanningRef = useRef(false);
+
+  const updateSettings = useCallback((patch) => {
+    setSettings((prev) => {
+      const next = { ...prev, ...patch };
+      saveMonitorSettings(next);
+      return next;
+    });
+  }, []);
+
+  const addAlert = useCallback((alert) => {
+    setAlerts((prev) => {
+      const next = [alert, ...prev].slice(0, 200);
+      saveMonitorAlerts(next);
+      return next;
+    });
+  }, []);
+
+  const clearAlerts = useCallback(() => {
+    setAlerts([]);
+    saveMonitorAlerts([]);
+  }, []);
+
+  const runScan = useCallback(async () => {
+    if (scanningRef.current || wallets.length === 0) return;
+    scanningRef.current = true;
+    setScanning(true);
+    const meta = walletMetaRef.current;
+    const now = Date.now();
+
+    for (const w of wallets) {
+      const addr = w.address;
+      const existing = meta[addr] || {};
+      const settingsSnap = loadMonitorSettings();
+
+      try {
+        // 1. Get latest activity
+        const lastAct = await getLastActivity(addr);
+        await delay(300); // rate limit buffer
+
+        // 2. If we have prior data, check for dormant → active transition
+        if (existing.lastActivity && lastAct && lastAct > existing.lastActivity) {
+          const inactiveDays = (lastAct - existing.lastActivity) / 86400000;
+          if (inactiveDays >= settingsSnap.dormantMinDays) {
+            const alert = {
+              id: `dormant-${addr}-${now}`,
+              type: "dormant",
+              address: addr,
+              label: w.label || "",
+              message: `Dormant wallet woke up after ${inactiveDays.toFixed(0)} days of inactivity. Previously last seen ${new Date(existing.lastActivity).toLocaleDateString()}.`,
+              inactiveDays,
+              time: now,
+            };
+            addAlert(alert);
+            dispatchAlert(alert, settingsSnap);
+          }
+        }
+
+        // 3. Check if wallet is fresh (only on first scan of this wallet)
+        if (!existing.checkedFresh) {
+          const ageInfo = await getWalletAge(addr);
+          await delay(300);
+          const txCount = await getWalletTxCount(addr);
+          await delay(300);
+
+          if (ageInfo && ageInfo.ageDays <= settingsSnap.freshMaxAgeDays) {
+            const alert = {
+              id: `fresh-${addr}-${now}`,
+              type: "fresh",
+              address: addr,
+              label: w.label || "",
+              message: `Fresh wallet detected — only ${ageInfo.ageDays.toFixed(1)} days old with ${txCount ?? "?"} transactions.`,
+              ageDays: ageInfo.ageDays,
+              txCount,
+              time: now,
+            };
+            addAlert(alert);
+            dispatchAlert(alert, settingsSnap);
+          } else if (txCount != null && txCount <= settingsSnap.freshMaxTxs && (!ageInfo || ageInfo.ageDays <= settingsSnap.freshMaxAgeDays * 2)) {
+            const alert = {
+              id: `fresh-${addr}-${now}`,
+              type: "fresh",
+              address: addr,
+              label: w.label || "",
+              message: `Low-activity wallet — ${txCount} total transactions${ageInfo ? `, ${ageInfo.ageDays.toFixed(1)} days old` : ""}.`,
+              ageDays: ageInfo?.ageDays,
+              txCount,
+              time: now,
+            };
+            addAlert(alert);
+            dispatchAlert(alert, settingsSnap);
+          }
+
+          meta[addr] = { ...existing, checkedFresh: true, firstTxTime: ageInfo?.firstTxTime, txCount, lastActivity: lastAct || existing.lastActivity };
+        } else {
+          meta[addr] = { ...existing, lastActivity: lastAct || existing.lastActivity };
+        }
+      } catch {
+        // skip wallet on error
+      }
+    }
+
+    // Clean up meta for removed wallets
+    const addrSet = new Set(wallets.map((w) => w.address));
+    Object.keys(meta).forEach((k) => { if (!addrSet.has(k)) delete meta[k]; });
+
+    walletMetaRef.current = meta;
+    saveWalletMeta(meta);
+    setLastScan(now);
+    scanningRef.current = false;
+    setScanning(false);
+  }, [wallets, addAlert]);
+
+  // Reset fresh-check when a new wallet is added
+  useEffect(() => {
+    const meta = walletMetaRef.current;
+    wallets.forEach((w) => {
+      if (!meta[w.address]) {
+        meta[w.address] = {};
+      }
+    });
+    walletMetaRef.current = meta;
+  }, [wallets]);
+
+  // Auto-scan on interval
+  useEffect(() => {
+    if (!settings.enabled || wallets.length === 0) {
+      if (timerRef.current) clearInterval(timerRef.current);
+      return;
+    }
+    // Initial scan after a short delay
+    const initTimer = setTimeout(runScan, 3000);
+    timerRef.current = setInterval(runScan, Math.max(settings.intervalSec, 30) * 1000);
+    return () => { clearTimeout(initTimer); clearInterval(timerRef.current); };
+  }, [settings.enabled, settings.intervalSec, wallets.length, runScan]);
+
+  return { settings, updateSettings, alerts, clearAlerts, scanning, lastScan, runScan };
+}
+
+// ─── Monitor Panel Component ───
+const MonitorPanel = ({ wallets, monitor }) => {
+  const { settings, updateSettings, alerts, clearAlerts, scanning, lastScan, runScan } = monitor;
+  const [showSettings, setShowSettings] = useState(false);
+  const [testStatus, setTestStatus] = useState(null); // null | "sending" | "ok" | "fail"
+
+  const requestNotifPermission = () => {
+    if (typeof Notification !== "undefined" && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+  };
+
+  const testDiscord = async () => {
+    if (!settings.discordWebhook) return;
+    setTestStatus("sending");
+    try {
+      const res = await fetch(settings.discordWebhook, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ embeds: [{ title: "CryptoDawn Test", description: "Monitor connection successful!", color: 0x4ade80 }] }),
+      });
+      setTestStatus(res.ok ? "ok" : "fail");
+    } catch { setTestStatus("fail"); }
+    setTimeout(() => setTestStatus(null), 3000);
+  };
+
+  const testTelegram = async () => {
+    if (!settings.telegramBotToken || !settings.telegramChatId) return;
+    setTestStatus("sending");
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${settings.telegramBotToken}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: settings.telegramChatId, text: "CryptoDawn Monitor — test message!" }),
+      });
+      setTestStatus(res.ok ? "ok" : "fail");
+    } catch { setTestStatus("fail"); }
+    setTimeout(() => setTestStatus(null), 3000);
+  };
+
+  const freshAlerts = alerts.filter((a) => a.type === "fresh");
+  const dormantAlerts = alerts.filter((a) => a.type === "dormant");
+
+  const inputStyle = {
+    width: "100%", padding: "8px 12px", borderRadius: 8,
+    border: "1px solid #1e293b", background: "#0d1321",
+    color: "#e2e8f0", fontSize: 13, outline: "none",
+  };
+  const labelStyle = { fontSize: 11, fontWeight: 700, color: "#94a3b8", letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 4, display: "block" };
+  const numInputStyle = { ...inputStyle, width: 80, textAlign: "center" };
+
+  return (
+    <>
+      {/* Header */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+        <div>
+          <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#f59e0b", margin: 0 }}>Wallet Monitor</h2>
+          <p style={{ color: "#475569", fontSize: 12, margin: "4px 0 0" }}>
+            Detect fresh & dormant wallets — get alerts on Discord, Telegram, or browser
+          </p>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          {scanning && (
+            <span style={{ color: "#f59e0b", fontSize: 12, display: "flex", alignItems: "center", gap: 4 }}>
+              <span style={{ display: "inline-block", animation: "spin 1s linear infinite" }}>↺</span> Scanning…
+            </span>
+          )}
+          <button
+            onClick={runScan}
+            disabled={scanning || wallets.length === 0}
+            style={{
+              padding: "7px 14px", borderRadius: 8, border: "1px solid #f59e0b44",
+              background: "transparent", color: "#f59e0b", fontSize: 12, fontWeight: 600,
+              cursor: scanning || wallets.length === 0 ? "not-allowed" : "pointer",
+              opacity: scanning || wallets.length === 0 ? 0.5 : 1,
+            }}
+          >
+            Scan Now
+          </button>
+          <button
+            onClick={() => setShowSettings(!showSettings)}
+            style={{
+              padding: "7px 14px", borderRadius: 8,
+              border: `1px solid ${showSettings ? "#f59e0b44" : "#334155"}`,
+              background: showSettings ? "#f59e0b11" : "transparent",
+              color: showSettings ? "#f59e0b" : "#64748b",
+              fontSize: 12, fontWeight: 600, cursor: "pointer",
+            }}
+          >
+            Settings
+          </button>
+        </div>
+      </div>
+
+      {/* Status bar */}
+      <div style={{
+        display: "flex", gap: 16, marginBottom: 20, flexWrap: "wrap",
+        background: "#111827", border: "1px solid #1e293b", borderRadius: 12, padding: "14px 18px",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{
+            width: 8, height: 8, borderRadius: "50%",
+            background: settings.enabled && wallets.length > 0 ? "#4ade80" : "#475569",
+            boxShadow: settings.enabled && wallets.length > 0 ? "0 0 8px #4ade8066" : "none",
+            animation: settings.enabled && wallets.length > 0 ? "pulse-dot 2s ease-in-out infinite" : "none",
+          }} />
+          <span style={{ fontSize: 12, color: settings.enabled ? "#4ade80" : "#64748b", fontWeight: 600 }}>
+            {settings.enabled && wallets.length > 0 ? "Active" : "Inactive"}
+          </span>
+        </div>
+        <div style={{ fontSize: 12, color: "#64748b" }}>
+          Tracking: <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{wallets.length}</span> wallets
+        </div>
+        <div style={{ fontSize: 12, color: "#64748b" }}>
+          Interval: <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{settings.intervalSec}s</span>
+        </div>
+        {lastScan && (
+          <div style={{ fontSize: 12, color: "#64748b" }}>
+            Last scan: <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{new Date(lastScan).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
+          </div>
+        )}
+        <div style={{ fontSize: 12, color: "#64748b" }}>
+          Alerts: <span style={{ color: "#60a5fa", fontWeight: 600 }}>{freshAlerts.length} fresh</span>
+          {" / "}
+          <span style={{ color: "#f59e0b", fontWeight: 600 }}>{dormantAlerts.length} dormant</span>
+        </div>
+      </div>
+
+      {/* Settings Panel */}
+      {showSettings && (
+        <div style={{
+          background: "#111827", border: "1px solid #1e293b", borderRadius: 14,
+          padding: 20, marginBottom: 20,
+        }}>
+          <h3 style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0", margin: "0 0 16px", letterSpacing: 0.3 }}>Monitor Settings</h3>
+
+          {/* Toggle row */}
+          <div style={{ display: "flex", gap: 24, flexWrap: "wrap", marginBottom: 20 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+              <input
+                type="checkbox" checked={settings.enabled}
+                onChange={(e) => updateSettings({ enabled: e.target.checked })}
+                style={{ accentColor: "#f59e0b" }}
+              />
+              <span style={{ fontSize: 13, color: "#e2e8f0", fontWeight: 600 }}>Enable monitoring</span>
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+              <input
+                type="checkbox" checked={settings.browserNotifications}
+                onChange={(e) => { updateSettings({ browserNotifications: e.target.checked }); if (e.target.checked) requestNotifPermission(); }}
+                style={{ accentColor: "#60a5fa" }}
+              />
+              <span style={{ fontSize: 13, color: "#e2e8f0", fontWeight: 600 }}>Browser notifications</span>
+            </label>
+          </div>
+
+          {/* Threshold row */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 16, marginBottom: 20 }}>
+            <div>
+              <label style={labelStyle}>Scan interval (sec)</label>
+              <input
+                type="number" min={30} max={3600} value={settings.intervalSec}
+                onChange={(e) => updateSettings({ intervalSec: Math.max(30, parseInt(e.target.value) || 120) })}
+                style={numInputStyle}
+              />
+            </div>
+            <div>
+              <label style={labelStyle}>Fresh max age (days)</label>
+              <input
+                type="number" min={1} max={90} value={settings.freshMaxAgeDays}
+                onChange={(e) => updateSettings({ freshMaxAgeDays: Math.max(1, parseInt(e.target.value) || 7) })}
+                style={numInputStyle}
+              />
+            </div>
+            <div>
+              <label style={labelStyle}>Fresh max TXs</label>
+              <input
+                type="number" min={1} max={1000} value={settings.freshMaxTxs}
+                onChange={(e) => updateSettings({ freshMaxTxs: Math.max(1, parseInt(e.target.value) || 10) })}
+                style={numInputStyle}
+              />
+            </div>
+            <div>
+              <label style={labelStyle}>Dormant min days</label>
+              <input
+                type="number" min={1} max={365} value={settings.dormantMinDays}
+                onChange={(e) => updateSettings({ dormantMinDays: Math.max(1, parseInt(e.target.value) || 30) })}
+                style={numInputStyle}
+              />
+            </div>
+          </div>
+
+          {/* Discord */}
+          <div style={{ marginBottom: 16 }}>
+            <label style={labelStyle}>Discord Webhook URL</label>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input
+                type="text" placeholder="https://discord.com/api/webhooks/..."
+                value={settings.discordWebhook}
+                onChange={(e) => updateSettings({ discordWebhook: e.target.value.trim() })}
+                style={{ ...inputStyle, flex: 1 }}
+              />
+              {settings.discordWebhook && (
+                <button onClick={testDiscord} disabled={testStatus === "sending"}
+                  style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid #7c3aed44", background: "transparent", color: "#a78bfa", fontSize: 12, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>
+                  {testStatus === "sending" ? "…" : testStatus === "ok" ? "Sent!" : testStatus === "fail" ? "Failed" : "Test"}
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Telegram */}
+          <div style={{ marginBottom: 16 }}>
+            <label style={labelStyle}>Telegram Bot Token</label>
+            <input
+              type="text" placeholder="123456:ABCdef..."
+              value={settings.telegramBotToken}
+              onChange={(e) => updateSettings({ telegramBotToken: e.target.value.trim() })}
+              style={inputStyle}
+            />
+          </div>
+          <div style={{ marginBottom: 8 }}>
+            <label style={labelStyle}>Telegram Chat ID</label>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input
+                type="text" placeholder="-1001234567890"
+                value={settings.telegramChatId}
+                onChange={(e) => updateSettings({ telegramChatId: e.target.value.trim() })}
+                style={{ ...inputStyle, flex: 1 }}
+              />
+              {settings.telegramBotToken && settings.telegramChatId && (
+                <button onClick={testTelegram} disabled={testStatus === "sending"}
+                  style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid #0ea5e944", background: "transparent", color: "#38bdf8", fontSize: 12, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>
+                  {testStatus === "sending" ? "…" : testStatus === "ok" ? "Sent!" : testStatus === "fail" ? "Failed" : "Test"}
+                </button>
+              )}
+            </div>
+          </div>
+          <div style={{ fontSize: 11, color: "#475569", marginTop: 12 }}>
+            Credentials are stored locally in your browser only — never sent to any server except Discord/Telegram when dispatching alerts.
+          </div>
+        </div>
+      )}
+
+      {/* No wallets state */}
+      {wallets.length === 0 && (
+        <div style={{ textAlign: "center", color: "#475569", padding: 64, fontSize: 14, border: "1px dashed #1e293b", borderRadius: 14 }}>
+          <div style={{ fontSize: 32, marginBottom: 12 }}>📡</div>
+          <div style={{ fontWeight: 600, marginBottom: 6, color: "#64748b" }}>No wallets to monitor</div>
+          <div>Add wallets in the Wallets tab, then come back here to monitor them</div>
+        </div>
+      )}
+
+      {/* Alert Feed */}
+      {alerts.length > 0 && (
+        <div style={{ marginBottom: 20 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <h3 style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0", margin: 0, letterSpacing: 0.3 }}>Alert Feed</h3>
+            <button onClick={clearAlerts}
+              style={{ padding: "5px 12px", borderRadius: 6, border: "1px solid #334155", background: "transparent", color: "#64748b", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+              Clear All
+            </button>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 480, overflowY: "auto" }}>
+            {alerts.map((a) => (
+              <div key={a.id} style={{
+                background: "#111827", border: `1px solid ${a.type === "fresh" ? "#3b82f633" : "#f59e0b33"}`,
+                borderRadius: 10, padding: "12px 16px",
+                borderLeft: `3px solid ${a.type === "fresh" ? "#60a5fa" : "#f59e0b"}`,
+              }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{
+                      fontSize: 10, fontWeight: 800, letterSpacing: 0.5, textTransform: "uppercase",
+                      color: a.type === "fresh" ? "#60a5fa" : "#f59e0b",
+                      background: a.type === "fresh" ? "#3b82f622" : "#f59e0b22",
+                      padding: "2px 8px", borderRadius: 4,
+                    }}>
+                      {a.type === "fresh" ? "FRESH" : "DORMANT"}
+                    </span>
+                    {a.label && <span style={{ fontSize: 13, fontWeight: 600, color: "#e2e8f0" }}>{a.label}</span>}
+                  </div>
+                  <span style={{ fontSize: 11, color: "#475569" }}>
+                    {new Date(a.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                    {" · "}
+                    {new Date(a.time).toLocaleDateString([], { month: "short", day: "numeric" })}
+                  </span>
+                </div>
+                <div style={{ fontSize: 12, color: "#94a3b8", lineHeight: 1.4, marginBottom: 4 }}>{a.message}</div>
+                <div style={{ fontSize: 11, color: "#475569", fontFamily: "monospace" }}>{a.address}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Wallet Status Summary */}
+      {wallets.length > 0 && (
+        <div>
+          <h3 style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0", margin: "0 0 12px", letterSpacing: 0.3 }}>Tracked Wallets</h3>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 10 }}>
+            {wallets.map((w) => {
+              const meta = loadWalletMeta()[w.address] || {};
+              const walletAlerts = alerts.filter((a) => a.address === w.address);
+              const hasFresh = walletAlerts.some((a) => a.type === "fresh");
+              const hasDormant = walletAlerts.some((a) => a.type === "dormant");
+              return (
+                <div key={w.address} style={{
+                  background: "#111827", border: "1px solid #1e293b", borderRadius: 10, padding: "12px 16px",
+                }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: "#e2e8f0" }}>{w.label || w.address.slice(0, 8) + "…"}</span>
+                    <div style={{ display: "flex", gap: 4 }}>
+                      {hasFresh && <span style={{ fontSize: 9, fontWeight: 800, color: "#60a5fa", background: "#3b82f622", padding: "2px 6px", borderRadius: 4, letterSpacing: 0.5 }}>FRESH</span>}
+                      {hasDormant && <span style={{ fontSize: 9, fontWeight: 800, color: "#f59e0b", background: "#f59e0b22", padding: "2px 6px", borderRadius: 4, letterSpacing: 0.5 }}>DORMANT</span>}
+                      {!hasFresh && !hasDormant && <span style={{ fontSize: 9, fontWeight: 800, color: "#4ade80", background: "#4ade8022", padding: "2px 6px", borderRadius: 4, letterSpacing: 0.5 }}>NORMAL</span>}
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 11, color: "#475569", fontFamily: "monospace", marginBottom: 4 }}>{w.address}</div>
+                  <div style={{ display: "flex", gap: 12, fontSize: 11, color: "#64748b" }}>
+                    {meta.txCount != null && <span>TXs: {meta.txCount >= 100 ? "100+" : meta.txCount}</span>}
+                    {meta.firstTxTime && <span>Created: {new Date(meta.firstTxTime).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })}</span>}
+                    {meta.lastActivity && <span>Last active: {new Date(meta.lastActivity).toLocaleDateString([], { month: "short", day: "numeric" })}</span>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {wallets.length > 0 && (
+        <div style={{ color: "#334155", fontSize: 11, marginTop: 16, textAlign: "center" }}>
+          Monitor checks wallet activity via Helius API • Alerts sent to configured channels • Data stored locally
+        </div>
+      )}
+    </>
+  );
+};
+
 // ─── Main App ───
 export default function App() {
   const greeting = getGreeting();
   const [activeChain, setActiveChain] = useState("All Chains");
-  const [activeSection, setActiveSection] = useState("discover"); // "discover" | "wallets"
+  const [activeSection, setActiveSection] = useState("discover"); // "discover" | "wallets" | "monitor"
   const chains = ["All Chains", "Solana", "Base"];
 
   const { prices, sparklines, loading: priceLoading, error: priceError } = useCryptoPrices();
@@ -2961,6 +3575,9 @@ export default function App() {
 
   const [showAddCA, setShowAddCA] = useState(false);
   const [showAddWallet, setShowAddWallet] = useState(false);
+
+  // Wallet Monitor
+  const monitor = useWalletMonitor(wallets);
 
   // mint → [{address, label, amount, usdValue}] across all tracked wallets
   const [walletMintMap, setWalletMintMap] = useState({});
@@ -3182,6 +3799,7 @@ export default function App() {
           {[
             { key: "discover", label: "🔥 Discover" },
             { key: "wallets",  label: `👜 Wallets${wallets.length > 0 ? ` (${wallets.length})` : ""}` },
+            { key: "monitor",  label: `📡 Monitor${monitor.alerts.length > 0 ? ` (${monitor.alerts.length})` : ""}` },
           ].map((s) => (
             <button
               key={s.key}
@@ -3370,6 +3988,11 @@ export default function App() {
             </div>
           )}
         </>
+      )}
+
+      {/* ─── Monitor Section ─── */}
+      {activeSection === "monitor" && (
+        <MonitorPanel wallets={wallets} monitor={monitor} />
       )}
 
       <div className="gradient-divider" style={{ marginTop: 40, marginBottom: 16 }} />
