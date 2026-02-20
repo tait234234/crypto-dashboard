@@ -1387,9 +1387,12 @@ const USDC_MINT          = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 function useWalletLinks(wallets, walletMintMap) {
   const [links, setLinks] = useState([]);
   const [relatedWallets, setRelatedWallets] = useState([]);
-  const [fundingWallets, setFundingWallets] = useState([]); // [{address, walletsFunded, totalSol, totalUsdc, txCount}]
+  const [fundingWallets, setFundingWallets] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [scanKey, setScanKey] = useState(0); // increment to force rescan
   const addrs = wallets.map((w) => w.address);
+
+  const rescan = useCallback(() => setScanKey((k) => k + 1), []);
 
   useEffect(() => {
     if (wallets.length < 1) { setLinks([]); setRelatedWallets([]); setFundingWallets([]); return; }
@@ -1413,24 +1416,25 @@ function useWalletLinks(wallets, walletMintMap) {
           for (let j = i + 1; j < holdingAddrs.length; j++) {
             const edge = ensureEdge(holdingAddrs[i], holdingAddrs[j]);
             edge.types.add("shared_token");
-            const mintEntry = holders[0]; // get symbol from first holder's pair data
-            if (mintEntry?.pair?.baseToken?.symbol) edge.sharedTokens.push(mintEntry.pair.baseToken.symbol);
+            // Bug fix: walletMintMap entries are {address, label, amount, usdValue, icon, symbol}
+            // — access .symbol directly, not via .pair.baseToken.symbol
+            const sym = holders.find((h) => h.symbol)?.symbol;
+            if (sym) edge.sharedTokens.push(sym);
           }
         }
       });
 
-      // ── Signal 2: transaction-level links (direct transfers + common funder) ──
-      // Pass A: 200 recent txs of any type (catches swaps for shared-token detection)
-      // Pass B: 200 TRANSFER-only txs (reaches much deeper into history for funding links)
+      // ── Signal 2: transaction-level links ──
+      // Fetch a broad set of recent txs + a deep TRANSFER-only set to maximise coverage.
+      // TRANSFER set is deeper (500) so we can catch older funding/wallet-to-wallet transfers.
       const txsByWallet = new Map();
       await Promise.all(
         addrs.map(async (addr) => {
           const [allTxs, transferTxs] = await Promise.all([
-            fetchWalletTxs(addr, 200),
-            fetchWalletTxs(addr, 200, "TRANSFER"),
+            fetchWalletTxs(addr, 200),           // recent activity — all types
+            fetchWalletTxs(addr, 500, "TRANSFER"), // deeper history — direct transfers & funding
           ]);
           if (!cancelled) {
-            // Merge and deduplicate by signature
             const seen = new Set();
             const merged = [];
             for (const tx of [...allTxs, ...transferTxs]) {
@@ -1461,12 +1465,10 @@ function useWalletLinks(wallets, walletMintMap) {
       });
 
       // Common funder + related wallet discovery:
-      // Build: externalAddr → { wallets: Set<trackedAddr>, txCount, mints: Set<mint> }
       const externalMap = new Map();
       addrs.forEach((addr) => {
         const txs = txsByWallet.get(addr) || [];
         txs.forEach((tx) => {
-          // Accumulate counterparty → mints from token transfers
           const mintMap = extractCounterpartyMints(tx, addr);
           extractCounterparties(tx, addr).forEach((cp) => {
             if (!addrSet.has(cp)) {
@@ -1474,15 +1476,14 @@ function useWalletLinks(wallets, walletMintMap) {
               const entry = externalMap.get(cp);
               entry.wallets.add(addr);
               entry.txCount++;
-              // Collect mints transferred to/from this counterparty
               (mintMap.get(cp) || []).forEach((m) => entry.mints.add(m));
             }
           });
         });
       });
 
-      // Common funder edges (external addr appeared in 2+ tracked wallets)
-      externalMap.forEach(({ wallets: walletSet, txCount }, funder) => {
+      // Common funder edges
+      externalMap.forEach(({ wallets: walletSet }, funder) => {
         if (walletSet.size < 2) return;
         const arr = [...walletSet];
         for (let i = 0; i < arr.length; i++) {
@@ -1495,8 +1496,7 @@ function useWalletLinks(wallets, walletMintMap) {
         }
       });
 
-      // Related wallet discovery: external addresses that interacted with ANY tracked wallet
-      // Sort by: (number of distinct tracked wallets it touched) desc, then txCount desc
+      // 1st-degree related wallet list
       const related = [];
       externalMap.forEach(({ wallets: walletSet, txCount, mints }, extAddr) => {
         related.push({
@@ -1515,15 +1515,14 @@ function useWalletLinks(wallets, walletMintMap) {
       related.sort((a, b) => b.sharedWith.length - a.sharedWith.length || b.txCount - a.txCount);
 
       // ── 2nd-degree discovery: probe top intermediary wallets ──
-      // For each top 1st-degree wallet, fetch THEIR transfer history and surface
-      // addresses they interacted with — so tracking wallet A finds B through C.
+      // Increased from 10 → 20 targets, lowered min txCount from 2 → 1
       const probeTargets = related
-        .filter((r) => r.txCount >= 2)
-        .slice(0, 10);
+        .filter((r) => r.txCount >= 1)
+        .slice(0, 20);
 
       if (probeTargets.length > 0 && !cancelled) {
         const knownAddrs = new Set([...addrSet, ...externalMap.keys()]);
-        const secondDegree = new Map(); // addr → { via, trackedLinks, txCount }
+        const secondDegree = new Map();
 
         await Promise.all(
           probeTargets.map(async (intermediary) => {
@@ -1533,7 +1532,7 @@ function useWalletLinks(wallets, walletMintMap) {
               txs.forEach((tx) => {
                 extractCounterparties(tx, intermediary.address).forEach((cp) => {
                   if (addrSet.has(cp) || cp === intermediary.address) return;
-                  if (knownAddrs.has(cp)) return; // already 1st-degree, skip
+                  if (knownAddrs.has(cp)) return;
                   if (!secondDegree.has(cp)) secondDegree.set(cp, { via: new Set(), trackedLinks: new Set(), txCount: 0 });
                   const entry = secondDegree.get(cp);
                   entry.via.add(intermediary.address);
@@ -1545,13 +1544,9 @@ function useWalletLinks(wallets, walletMintMap) {
           })
         );
 
-        // Add 2nd-degree wallets to related list (those with 2+ txs through intermediary)
+        // Add 2nd-degree wallets — lowered from txCount >= 2 to >= 1
         secondDegree.forEach(({ via, trackedLinks, txCount }, addr) => {
-          if (txCount < 2) return; // filter noise — require at least 2 txs with an intermediary
-          const viaLabels = [...via].map((v) => {
-            const r = related.find((x) => x.address === v);
-            return r ? `${v.slice(0, 4)}…${v.slice(-4)}` : `${v.slice(0, 4)}…${v.slice(-4)}`;
-          });
+          if (txCount < 1) return;
           related.push({
             address: addr,
             sharedWith: [...trackedLinks],
@@ -1559,7 +1554,7 @@ function useWalletLinks(wallets, walletMintMap) {
             mints: [],
             degree: 2,
             via: [...via],
-            viaLabels,
+            viaLabels: [...via].map((v) => `${v.slice(0, 4)}…${v.slice(-4)}`),
             sharedWithLabels: [...trackedLinks].map((a) => {
               const w = wallets.find((x) => x.address === a);
               return w?.label || `${a.slice(0, 4)}…${a.slice(-4)}`;
@@ -1567,7 +1562,6 @@ function useWalletLinks(wallets, walletMintMap) {
           });
         });
 
-        // Re-sort: 1st degree first (by sharedWith then txCount), then 2nd degree
         related.sort((a, b) => {
           if (a.degree !== b.degree) return a.degree - b.degree;
           return b.sharedWith.length - a.sharedWith.length || b.txCount - a.txCount;
@@ -1575,13 +1569,11 @@ function useWalletLinks(wallets, walletMintMap) {
       }
 
       // ── Funding detection ──
-      // Find wallets that sent meaningful SOL or USDC inbound to tracked wallets
-      const fundingMap = new Map(); // funderAddr → { walletsFunded: Set, totalSol, totalUsdc, txCount }
+      const fundingMap = new Map();
       addrs.forEach((addr) => {
         (txsByWallet.get(addr) || []).forEach((tx) => {
           const excluded = buildExcluded(tx);
           const isValidFunder = (f) => f && f !== addr && !addrSet.has(f) && !excluded.has(f);
-          // SOL funding: inbound native transfer ≥ MIN_FUNDING_SOL
           (tx.nativeTransfers || []).forEach((t) => {
             const solAmt = (t.amount || 0) / 1e9;
             if (t.toUserAccount === addr && isValidFunder(t.fromUserAccount) && solAmt >= MIN_FUNDING_SOL) {
@@ -1593,7 +1585,6 @@ function useWalletLinks(wallets, walletMintMap) {
               e.txCount++;
             }
           });
-          // USDC funding: inbound token transfer ≥ MIN_FUNDING_USDC
           (tx.tokenTransfers || []).forEach((t) => {
             if (t.toUserAccount === addr && isValidFunder(t.fromUserAccount) && t.mint === USDC_MINT && (t.tokenAmount || 0) >= MIN_FUNDING_USDC) {
               const f = t.fromUserAccount;
@@ -1622,7 +1613,6 @@ function useWalletLinks(wallets, walletMintMap) {
       fundingArr.sort((a, b) => (b.totalSol + b.totalUsdc / 150) - (a.totalSol + a.totalUsdc / 150));
 
       if (!cancelled) {
-        // Deduplicate sharedTokens and commonFunders per edge
         const result = [];
         edgeMap.forEach((edge) => {
           result.push({
@@ -1633,8 +1623,8 @@ function useWalletLinks(wallets, walletMintMap) {
           });
         });
         setLinks(result);
-        setRelatedWallets(related.slice(0, 30));
-        setFundingWallets(fundingArr.slice(0, 15));
+        setRelatedWallets(related.slice(0, 100)); // increased from 30
+        setFundingWallets(fundingArr.slice(0, 20)); // increased from 15
         setLoading(false);
       }
     };
@@ -1642,9 +1632,9 @@ function useWalletLinks(wallets, walletMintMap) {
     run();
     return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wallets.length, JSON.stringify(addrs), Object.keys(walletMintMap).length]);
+  }, [wallets.length, JSON.stringify(addrs), Object.keys(walletMintMap).length, scanKey]);
 
-  return { links, relatedWallets, fundingWallets, loading };
+  return { links, relatedWallets, fundingWallets, loading, rescan };
 }
 
 // Tiny force-layout: push nodes apart, pull linked nodes together
@@ -1721,7 +1711,7 @@ const LINK_LABELS = {
   common_funder:   "Common funder",
 };
 
-function WalletGraph({ wallets, links, loading }) {
+function WalletGraph({ wallets, links, loading, onRescan }) {
   const W = 640, H = 320;
   const [tooltip, setTooltip] = useState(null); // {x,y,edge}
 
@@ -1751,7 +1741,16 @@ function WalletGraph({ wallets, links, loading }) {
           <h3 style={{ margin: 0, fontSize: 13, fontWeight: 800, color: "#e2e8f0", letterSpacing: 0.5 }}>Wallet Connection Graph</h3>
           <div style={{ fontSize: 11, color: "#475569", marginTop: 2 }}>Links between tracked wallets — based on shared tokens, direct transfers &amp; common funders</div>
         </div>
-        {loading && <div style={{ fontSize: 11, color: "#38bdf8", animation: "pulse-dot 1.5s infinite" }}>Analysing…</div>}
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          {loading && <div style={{ fontSize: 11, color: "#38bdf8", animation: "pulse-dot 1.5s infinite" }}>Analysing…</div>}
+          {onRescan && !loading && (
+            <button onClick={onRescan}
+              title="Re-scan transactions to find connections"
+              style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid #334155", background: "transparent", color: "#64748b", fontSize: 10, fontWeight: 600, cursor: "pointer" }}>
+              ↺ Rescan
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Legend */}
@@ -1857,8 +1856,9 @@ function WalletGraph({ wallets, links, loading }) {
 }
 
 // ─── Related Wallets Panel ───
-function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loading, onTrack, walletMintMap }) {
-  const [expanded, setExpanded] = useState(false);
+function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loading, onTrack, walletMintMap, onRescan }) {
+  const DEFAULT_SHOWN = 15;
+  const [showLimit, setShowLimit] = useState(DEFAULT_SHOWN);
   const [tracked, setTracked] = useState(new Set());
 
   // ── Portfolio overlap scoring ──
@@ -2041,12 +2041,16 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
                   )}
                 </div>
 
-                {/* Copy + Track */}
+                {/* Copy + Solscan + Track */}
                 <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
                   <button onClick={() => navigator.clipboard?.writeText(f.address)} title="Copy address"
                     style={{ width: 24, height: 24, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", color: "#64748b", fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
                     ⎘
                   </button>
+                  <a href={`https://solscan.io/account/${f.address}`} target="_blank" rel="noopener noreferrer" title="View on Solscan"
+                    style={{ width: 24, height: 24, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", color: "#64748b", fontSize: 9, display: "flex", alignItems: "center", justifyContent: "center", textDecoration: "none", fontWeight: 700 }}>
+                    ↗
+                  </a>
                   <button
                     onClick={() => { onTrack(f.address, ""); setTracked((prev) => new Set([...prev, f.address])); }}
                     disabled={isAlreadyTracked}
@@ -2193,22 +2197,31 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
   }
 
 
-  const strong = relatedWallets.filter((r) => r.sharedWith.length >= 2 && r.degree !== 2);
-  const second = relatedWallets.filter((r) => r.degree === 2);
-  const weak   = relatedWallets.filter((r) => r.sharedWith.length < 2 && r.degree !== 2);
-  // Always show strong + 2nd-degree; collapse weak unless expanded
-  const shown  = expanded ? relatedWallets : [...strong, ...second, ...(strong.length + second.length > 0 ? [] : weak.slice(0, 5))];
+  // Show all wallets — no hiding based on signal strength.
+  // Sort: direct links first (sharedWith.length desc), then by txCount.
+  // Collapse to showLimit rows; "Show more" reveals the rest.
+  const shown = relatedWallets.slice(0, showLimit);
+  const hiddenCount = relatedWallets.length - shown.length;
 
   return (
     <div style={{ background: "#0d1321", border: "1px solid #1e293b", borderRadius: 14, padding: "16px 20px", marginBottom: 20 }}>
-      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 10, gap: 12 }}>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 10, gap: 12, flexWrap: "wrap" }}>
         <div style={{ flexShrink: 0 }}>
-          <h3 style={{ margin: 0, fontSize: 13, fontWeight: 800, color: "#e2e8f0", letterSpacing: 0.5 }}>
-            Potentially Related Wallets
-            <span style={{ marginLeft: 8, background: "#f59e0b22", color: "#f59e0b", border: "1px solid #f59e0b44", borderRadius: 4, fontSize: 10, fontWeight: 700, padding: "1px 6px" }}>{relatedWallets.length}</span>
-          </h3>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <h3 style={{ margin: 0, fontSize: 13, fontWeight: 800, color: "#e2e8f0", letterSpacing: 0.5 }}>
+              Potentially Related Wallets
+            </h3>
+            <span style={{ background: "#f59e0b22", color: "#f59e0b", border: "1px solid #f59e0b44", borderRadius: 4, fontSize: 10, fontWeight: 700, padding: "1px 6px" }}>{relatedWallets.length}</span>
+            {onRescan && (
+              <button onClick={onRescan}
+                title="Re-scan with deeper transaction history"
+                style={{ padding: "2px 8px", borderRadius: 5, border: "1px solid #334155", background: "transparent", color: "#64748b", fontSize: 10, fontWeight: 600, cursor: "pointer" }}>
+                ↺ Rescan
+              </button>
+            )}
+          </div>
           <div style={{ fontSize: 11, color: "#475569", marginTop: 2 }}>
-            1st &amp; 2nd degree connections — addresses that transacted with your wallets or their counterparties
+            1st &amp; 2nd degree connections — 200 recent + 500 TRANSFER txs per wallet · Deeper scan available via Rescan
           </div>
         </div>
         {renderCAFilter()}
@@ -2274,7 +2287,7 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
                   )}
                 </div>
 
-                {/* Copy + Track */}
+                {/* Copy + Solscan + Track */}
                 <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
                   <button
                     onClick={() => navigator.clipboard?.writeText(r.address)}
@@ -2283,6 +2296,11 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
                   >
                     ⎘
                   </button>
+                  <a href={`https://solscan.io/account/${r.address}`} target="_blank" rel="noopener noreferrer"
+                    title="View on Solscan"
+                    style={{ width: 24, height: 24, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", color: "#64748b", fontSize: 9, display: "flex", alignItems: "center", justifyContent: "center", textDecoration: "none", fontWeight: 700 }}>
+                    ↗
+                  </a>
                   <button
                     onClick={() => { onTrack(r.address, ""); setTracked((prev) => new Set([...prev, r.address])); }}
                     disabled={isAlreadyTracked}
@@ -2316,20 +2334,28 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
         })}
       </div>
 
-      {(weak.length > 0 || (strong.length === 0 && weak.length > 5)) && (
+      {hiddenCount > 0 && (
         <button
-          onClick={() => setExpanded((v) => !v)}
+          onClick={() => setShowLimit((v) => v + 25)}
           style={{ marginTop: 10, width: "100%", padding: "6px 0", background: "transparent", border: "1px dashed #1e293b", borderRadius: 6, color: "#475569", fontSize: 11, cursor: "pointer" }}
         >
-          {expanded ? "Show less" : `Show ${weak.length} more (weaker signal)`}
+          Show {Math.min(hiddenCount, 25)} more ({hiddenCount} remaining)
+        </button>
+      )}
+      {showLimit > DEFAULT_SHOWN && (
+        <button
+          onClick={() => setShowLimit(DEFAULT_SHOWN)}
+          style={{ marginTop: 4, width: "100%", padding: "4px 0", background: "transparent", border: "none", color: "#334155", fontSize: 10, cursor: "pointer" }}
+        >
+          Collapse
         </button>
       )}
 
       {/* Token holder filter results */}
       {activeCA && renderTokenHolders()}
 
-      <div style={{ fontSize: 10, color: "#1e293b", marginTop: 8 }}>
-        200 recent + 200 transfer txs per wallet + 2nd-degree probing via Helius • Amber = 2+ wallets • Purple = 2nd degree
+      <div style={{ fontSize: 10, color: "#334155", marginTop: 8 }}>
+        200 recent + 500 TRANSFER txs per wallet + 2nd-degree probing via Helius • Amber = 2+ wallets • Purple = 2nd° • Use Rescan for deeper history
       </div>
     </div>
   );
@@ -3526,7 +3552,7 @@ export default function App() {
 
   // mint → [{address, label, amount, usdValue}] across all tracked wallets
   const [walletMintMap, setWalletMintMap] = useState({});
-  const { links: walletLinks, relatedWallets: relatedWalletList, fundingWallets: fundingWalletList, loading: walletLinksLoading } = useWalletLinks(wallets, walletMintMap);
+  const { links: walletLinks, relatedWallets: relatedWalletList, fundingWallets: fundingWalletList, loading: walletLinksLoading, rescan: rescanWalletLinks } = useWalletLinks(wallets, walletMintMap);
   const handleHoldingsLoaded = useCallback((walletAddr, walletLabel, holdings) => {
     setWalletMintMap((prev) => {
       const next = { ...prev };
@@ -3912,7 +3938,7 @@ export default function App() {
             </div>
           )}
 
-          <WalletGraph wallets={wallets} links={walletLinks} loading={walletLinksLoading} />
+          <WalletGraph wallets={wallets} links={walletLinks} loading={walletLinksLoading} onRescan={rescanWalletLinks} />
 
           <RelatedWallets
             relatedWallets={relatedWalletList}
@@ -3921,6 +3947,7 @@ export default function App() {
             loading={walletLinksLoading}
             onTrack={addWallet}
             walletMintMap={walletMintMap}
+            onRescan={rescanWalletLinks}
           />
 
           {wallets.map((wallet) => (
