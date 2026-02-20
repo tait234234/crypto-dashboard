@@ -1174,17 +1174,25 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank, a
 // ─── Wallet Link Graph ───
 const HELIUS_KEY = "0dd8f0ec-f2a5-4f9e-b275-379afa3e73cd";
 
-// Fetch last N transaction signatures for a wallet via Helius enhanced API
-async function fetchWalletTxs(address, limit = 40) {
-  try {
-    const res = await fetch(
-      `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_KEY}&limit=${limit}&type=TRANSFER`
-    );
-    if (!res.ok) return [];
-    return await res.json();
-  } catch {
-    return [];
+// Fetch up to maxTxs transactions for a wallet via Helius enhanced API (paginated)
+async function fetchWalletTxs(address, maxTxs = 200) {
+  const PER_PAGE = 100;
+  const all = [];
+  let before = undefined;
+  while (all.length < maxTxs) {
+    const toFetch = Math.min(PER_PAGE, maxTxs - all.length);
+    const url = `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_KEY}&limit=${toFetch}&type=TRANSFER${before ? `&before=${before}` : ""}`;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) break;
+      const page = await res.json();
+      if (!Array.isArray(page) || !page.length) break;
+      all.push(...page);
+      if (page.length < toFetch) break; // no more pages
+      before = page[page.length - 1].signature;
+    } catch { break; }
   }
+  return all;
 }
 
 // Extract all counterparty addresses from a Helius enhanced transaction
@@ -1217,14 +1225,19 @@ function extractCounterpartyMints(tx, ownAddress) {
 }
 
 // Hook: given walletMintMap + wallets, compute all link edges + discover related untracked wallets
+const MIN_FUNDING_SOL    = 0.01;          // ignore SOL transfers below this (lamports: 10_000_000)
+const MIN_FUNDING_USDC   = 5;             // ignore USDC transfers below $5
+const USDC_MINT          = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
 function useWalletLinks(wallets, walletMintMap) {
   const [links, setLinks] = useState([]);
-  const [relatedWallets, setRelatedWallets] = useState([]); // [{address, sharedWith: [addr], txCount, reason}]
+  const [relatedWallets, setRelatedWallets] = useState([]);
+  const [fundingWallets, setFundingWallets] = useState([]); // [{address, walletsFunded, totalSol, totalUsdc, txCount}]
   const [loading, setLoading] = useState(false);
   const addrs = wallets.map((w) => w.address);
 
   useEffect(() => {
-    if (wallets.length < 2) { setLinks([]); return; }
+    if (wallets.length < 1) { setLinks([]); setRelatedWallets([]); setFundingWallets([]); return; }
     const addrSet = new Set(addrs);
     let cancelled = false;
 
@@ -1328,6 +1341,53 @@ function useWalletLinks(wallets, walletMintMap) {
       });
       related.sort((a, b) => b.sharedWith.length - a.sharedWith.length || b.txCount - a.txCount);
 
+      // ── Funding detection ──
+      // Find wallets that sent meaningful SOL or USDC inbound to tracked wallets
+      const fundingMap = new Map(); // funderAddr → { walletsFunded: Set, totalSol, totalUsdc, txCount }
+      addrs.forEach((addr) => {
+        (txsByWallet.get(addr) || []).forEach((tx) => {
+          // SOL funding: inbound native transfer ≥ MIN_FUNDING_SOL
+          (tx.nativeTransfers || []).forEach((t) => {
+            const solAmt = (t.amount || 0) / 1e9;
+            if (t.toUserAccount === addr && t.fromUserAccount && t.fromUserAccount !== addr && solAmt >= MIN_FUNDING_SOL) {
+              const f = t.fromUserAccount;
+              if (addrSet.has(f)) return; // skip other tracked wallets
+              if (!fundingMap.has(f)) fundingMap.set(f, { walletsFunded: new Set(), totalSol: 0, totalUsdc: 0, txCount: 0 });
+              const e = fundingMap.get(f);
+              e.walletsFunded.add(addr);
+              e.totalSol += solAmt;
+              e.txCount++;
+            }
+          });
+          // USDC funding: inbound token transfer ≥ MIN_FUNDING_USDC
+          (tx.tokenTransfers || []).forEach((t) => {
+            if (t.toUserAccount === addr && t.fromUserAccount && t.fromUserAccount !== addr && t.mint === USDC_MINT && (t.tokenAmount || 0) >= MIN_FUNDING_USDC) {
+              const f = t.fromUserAccount;
+              if (addrSet.has(f)) return;
+              if (!fundingMap.has(f)) fundingMap.set(f, { walletsFunded: new Set(), totalSol: 0, totalUsdc: 0, txCount: 0 });
+              const e = fundingMap.get(f);
+              e.walletsFunded.add(addr);
+              e.totalUsdc += t.tokenAmount;
+              e.txCount++;
+            }
+          });
+        });
+      });
+      const fundingArr = [];
+      fundingMap.forEach(({ walletsFunded, totalSol, totalUsdc, txCount }, funder) => {
+        fundingArr.push({
+          address: funder,
+          walletsFunded: [...walletsFunded].map((a) => {
+            const w = wallets.find((x) => x.address === a);
+            return w?.label || `${a.slice(0, 4)}…${a.slice(-4)}`;
+          }),
+          totalSol: Math.round(totalSol * 1000) / 1000,
+          totalUsdc: Math.round(totalUsdc * 100) / 100,
+          txCount,
+        });
+      });
+      fundingArr.sort((a, b) => (b.totalSol + b.totalUsdc / 150) - (a.totalSol + a.totalUsdc / 150));
+
       if (!cancelled) {
         // Deduplicate sharedTokens and commonFunders per edge
         const result = [];
@@ -1340,7 +1400,8 @@ function useWalletLinks(wallets, walletMintMap) {
           });
         });
         setLinks(result);
-        setRelatedWallets(related.slice(0, 20)); // top 20 related wallets
+        setRelatedWallets(related.slice(0, 20));
+        setFundingWallets(fundingArr.slice(0, 15));
         setLoading(false);
       }
     };
@@ -1350,7 +1411,7 @@ function useWalletLinks(wallets, walletMintMap) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wallets.length, JSON.stringify(addrs), Object.keys(walletMintMap).length]);
 
-  return { links, relatedWallets, loading };
+  return { links, relatedWallets, fundingWallets, loading };
 }
 
 // Tiny force-layout: push nodes apart, pull linked nodes together
@@ -1563,9 +1624,58 @@ function WalletGraph({ wallets, links, loading }) {
 }
 
 // ─── Related Wallets Panel ───
-function RelatedWallets({ relatedWallets, trackedAddrs, loading, onTrack, walletMintMap }) {
+function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loading, onTrack, walletMintMap }) {
   const [expanded, setExpanded] = useState(false);
   const [tracked, setTracked] = useState(new Set());
+
+  // ── Portfolio overlap scoring ──
+  // For each related wallet, fetch all their SPL token mints and count overlap
+  // with the set of mints held by any tracked wallet.
+  const [overlapScores, setOverlapScores] = useState({}); // address → number
+
+  const trackedMints = useMemo(() => new Set(Object.keys(walletMintMap || {})), [walletMintMap]);
+
+  useEffect(() => {
+    if (!relatedWallets.length || !trackedMints.size) return;
+    let cancelled = false;
+    const scores = {};
+
+    const run = async () => {
+      const BATCH = 5;
+      for (let i = 0; i < relatedWallets.length; i += BATCH) {
+        if (cancelled) return;
+        const batch = relatedWallets.slice(i, i + BATCH);
+        await Promise.all(batch.map(async (w) => {
+          try {
+            const res = await fetch(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                jsonrpc: "2.0", id: w.address,
+                method: "getTokenAccountsByOwner",
+                params: [w.address, { programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" }, { encoding: "jsonParsed" }],
+              }),
+            });
+            const json = await res.json();
+            const mints = new Set(
+              (json?.result?.value || [])
+                .map((a) => a.account?.data?.parsed?.info?.mint)
+                .filter(Boolean)
+            );
+            let overlap = 0;
+            mints.forEach((m) => { if (trackedMints.has(m)) overlap++; });
+            scores[w.address] = overlap;
+          } catch (_) {}
+        }));
+        if (!cancelled) setOverlapScores((prev) => ({ ...prev, ...scores }));
+      }
+    };
+
+    run();
+    return () => { cancelled = true; };
+  // rerun when the list of related wallets changes
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [relatedWallets.map((r) => r.address).join(","), trackedMints.size]);
 
   // ── Token CA filter state ──
   const [caInput, setCaInput] = useState("");
@@ -1653,7 +1763,72 @@ function RelatedWallets({ relatedWallets, trackedAddrs, loading, onTrack, wallet
   const clearSearch = () => { setActiveCA(null); setCaInput(""); setFilterResults([]); setFilterMeta(null); setFilterError(null); };
 
   if (loading) return null;
-  if (!relatedWallets.length && !activeCA) return null;
+  if (!relatedWallets.length && !fundingWallets.length && !activeCA) return null;
+
+  function renderFundingSection() {
+    if (!fundingWallets.length) return null;
+    return (
+      <div style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+          <span style={{ fontSize: 11, fontWeight: 800, color: "#e2e8f0", letterSpacing: 0.3 }}>Funding Sources</span>
+          <span style={{ background: "#f59e0b22", color: "#f59e0b", border: "1px solid #f59e0b44", borderRadius: 4, fontSize: 10, fontWeight: 700, padding: "1px 6px" }}>
+            {fundingWallets.length}
+          </span>
+          <span style={{ fontSize: 10, color: "#475569" }}>≥0.01 SOL or ≥$5 USDC inbound</span>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+          {fundingWallets.map((f) => {
+            const isAlreadyTracked = trackedAddrs.has(f.address) || tracked.has(f.address);
+            return (
+              <div key={f.address} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px", background: "#111827", borderRadius: 8, border: "1px solid #f59e0b22" }}>
+                {/* Funding dot */}
+                <div style={{ width: 7, height: 7, borderRadius: "50%", background: "#f59e0b", flexShrink: 0 }} />
+
+                {/* Address */}
+                <span style={{ fontFamily: "monospace", fontSize: 11, color: "#94a3b8", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {f.address}
+                </span>
+
+                {/* Amounts */}
+                <div style={{ display: "flex", gap: 4, flexShrink: 0, alignItems: "center" }}>
+                  {f.totalSol > 0 && (
+                    <span style={{ background: "#6366f122", color: "#818cf8", border: "1px solid #6366f133", borderRadius: 4, fontSize: 9, fontWeight: 700, padding: "1px 6px", whiteSpace: "nowrap" }}>
+                      {f.totalSol} SOL
+                    </span>
+                  )}
+                  {f.totalUsdc > 0 && (
+                    <span style={{ background: "#4ade8022", color: "#4ade80", border: "1px solid #4ade8044", borderRadius: 4, fontSize: 9, fontWeight: 700, padding: "1px 6px", whiteSpace: "nowrap" }}>
+                      ${f.totalUsdc} USDC
+                    </span>
+                  )}
+                  {f.walletsFunded.length > 0 && (
+                    <span style={{ background: "#f59e0b11", color: "#f59e0b", borderRadius: 4, fontSize: 9, padding: "1px 5px", whiteSpace: "nowrap" }}>
+                      → {f.walletsFunded.join(", ")}
+                    </span>
+                  )}
+                </div>
+
+                {/* Copy + Track */}
+                <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                  <button onClick={() => navigator.clipboard?.writeText(f.address)} title="Copy address"
+                    style={{ width: 24, height: 24, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", color: "#64748b", fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    ⎘
+                  </button>
+                  <button
+                    onClick={() => { onTrack(f.address, ""); setTracked((prev) => new Set([...prev, f.address])); }}
+                    disabled={isAlreadyTracked}
+                    style={{ padding: "2px 8px", height: 24, borderRadius: 5, background: isAlreadyTracked ? "#1e293b" : "#4ade8022", border: `1px solid ${isAlreadyTracked ? "#334155" : "#4ade8044"}`, color: isAlreadyTracked ? "#334155" : "#4ade80", fontSize: 10, fontWeight: 700, cursor: isAlreadyTracked ? "default" : "pointer", whiteSpace: "nowrap" }}
+                  >
+                    {isAlreadyTracked ? "✓ tracked" : "+ Track"}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
 
   function renderCAFilter() {
     const meta = filterMeta || (activeCA ? mintMeta.get(activeCA) : null);
@@ -1804,6 +1979,14 @@ function RelatedWallets({ relatedWallets, trackedAddrs, loading, onTrack, wallet
         {renderCAFilter()}
       </div>
 
+      {renderFundingSection()}
+
+      {relatedWallets.length > 0 && (
+        <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", margin: "4px 0 6px", letterSpacing: 0.3 }}>
+          Transaction History Connections
+        </div>
+      )}
+
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
         {shown.map((r) => {
           const isAlreadyTracked = trackedAddrs.has(r.address) || tracked.has(r.address);
@@ -1842,6 +2025,12 @@ function RelatedWallets({ relatedWallets, trackedAddrs, loading, onTrack, wallet
                       {lbl}
                     </span>
                   ))}
+                  {/* Portfolio overlap badge */}
+                  {overlapScores[r.address] > 0 && (
+                    <span title="Shared tokens with your tracked wallet(s)" style={{ background: "#f59e0b22", color: "#fbbf24", border: "1px solid #f59e0b44", borderRadius: 4, fontSize: 9, fontWeight: 700, padding: "1px 5px", whiteSpace: "nowrap" }}>
+                      {overlapScores[r.address]} shared tokens
+                    </span>
+                  )}
                 </div>
 
                 {/* Copy + Track */}
@@ -2524,7 +2713,7 @@ export default function App() {
 
   // mint → [{address, label, amount, usdValue}] across all tracked wallets
   const [walletMintMap, setWalletMintMap] = useState({});
-  const { links: walletLinks, relatedWallets: relatedWalletList, loading: walletLinksLoading } = useWalletLinks(wallets, walletMintMap);
+  const { links: walletLinks, relatedWallets: relatedWalletList, fundingWallets: fundingWalletList, loading: walletLinksLoading } = useWalletLinks(wallets, walletMintMap);
   const handleHoldingsLoaded = useCallback((walletAddr, walletLabel, holdings) => {
     setWalletMintMap((prev) => {
       const next = { ...prev };
@@ -2913,6 +3102,7 @@ export default function App() {
 
           <RelatedWallets
             relatedWallets={relatedWalletList}
+            fundingWallets={fundingWalletList}
             trackedAddrs={new Set(wallets.map((w) => w.address))}
             loading={walletLinksLoading}
             onTrack={addWallet}
