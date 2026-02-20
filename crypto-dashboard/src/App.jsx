@@ -1384,7 +1384,7 @@ const MIN_FUNDING_SOL    = 0.01;          // ignore SOL transfers below this (la
 const MIN_FUNDING_USDC   = 5;             // ignore USDC transfers below $5
 const USDC_MINT          = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
-function useWalletLinks(wallets, walletMintMap) {
+function useWalletLinks(wallets, walletMintMap, manualLinks = []) {
   const [links, setLinks] = useState([]);
   const [relatedWallets, setRelatedWallets] = useState([]);
   const [fundingWallets, setFundingWallets] = useState([]); // [{address, walletsFunded, totalSol, totalUsdc, txCount}]
@@ -1423,7 +1423,7 @@ function useWalletLinks(wallets, walletMintMap) {
       const txsByWallet = new Map();
       await Promise.all(
         addrs.map(async (addr) => {
-          const txs = await fetchWalletTxs(addr, 50);
+          const txs = await fetchWalletTxs(addr, 200);
           if (!cancelled) txsByWallet.set(addr, txs);
         })
       );
@@ -1544,6 +1544,14 @@ function useWalletLinks(wallets, walletMintMap) {
       fundingArr.sort((a, b) => (b.totalSol + b.totalUsdc / 150) - (a.totalSol + a.totalUsdc / 150));
 
       if (!cancelled) {
+        // Inject manual links from user
+        manualLinks.forEach(([addrA, addrB]) => {
+          if (addrSet.has(addrA) && addrSet.has(addrB)) {
+            const edge = ensureEdge(addrA, addrB);
+            edge.types.add("manual");
+          }
+        });
+
         // Deduplicate sharedTokens and commonFunders per edge
         const result = [];
         edgeMap.forEach((edge) => {
@@ -1564,7 +1572,7 @@ function useWalletLinks(wallets, walletMintMap) {
     run();
     return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wallets.length, JSON.stringify(addrs), Object.keys(walletMintMap).length]);
+  }, [wallets.length, JSON.stringify(addrs), Object.keys(walletMintMap).length, manualLinks.length]);
 
   return { links, relatedWallets, fundingWallets, loading };
 }
@@ -1632,15 +1640,71 @@ function useForceLayout(nodeCount, edges, width, height) {
   return positions;
 }
 
+// ─── Manual Link Wallets Panel ───
+const LinkWalletsPanel = ({ wallets, manualLinks, onLink, onUnlink, onClose }) => {
+  const [walletA, setWalletA] = useState("");
+  const [walletB, setWalletB] = useState("");
+
+  const handleLink = () => {
+    if (!walletA || !walletB || walletA === walletB) return;
+    onLink(walletA, walletB);
+    setWalletA(""); setWalletB("");
+  };
+  const truncAddr = (a) => `${a.slice(0, 4)}…${a.slice(-4)}`;
+
+  return (
+    <div style={{ background: "#111827", border: "1px solid #e879f9", borderRadius: 12, padding: "16px 20px", marginBottom: 20 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <span style={{ color: "#e879f9", fontWeight: 700, fontSize: 14 }}>Link Wallets Manually</span>
+        <button onClick={onClose} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 16 }}>✕</button>
+      </div>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <select value={walletA} onChange={(e) => setWalletA(e.target.value)} style={{ flex: 1, minWidth: 120, background: "#0d1321", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 12, padding: "8px 10px" }}>
+          <option value="">Wallet 1…</option>
+          {wallets.map((w) => <option key={w.address} value={w.address}>{w.label || truncAddr(w.address)}</option>)}
+        </select>
+        <span style={{ color: "#475569", fontSize: 16 }}>⟷</span>
+        <select value={walletB} onChange={(e) => setWalletB(e.target.value)} style={{ flex: 1, minWidth: 120, background: "#0d1321", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 12, padding: "8px 10px" }}>
+          <option value="">Wallet 2…</option>
+          {wallets.filter((w) => w.address !== walletA).map((w) => <option key={w.address} value={w.address}>{w.label || truncAddr(w.address)}</option>)}
+        </select>
+        <button onClick={handleLink} disabled={!walletA || !walletB || walletA === walletB} style={{ background: "#e879f9", border: "none", borderRadius: 8, color: "#fff", fontSize: 13, fontWeight: 600, padding: "8px 14px", cursor: !walletA || !walletB ? "not-allowed" : "pointer", opacity: !walletA || !walletB ? 0.5 : 1 }}>
+          Link
+        </button>
+      </div>
+      {manualLinks.length > 0 && (
+        <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ fontSize: 11, color: "#64748b", fontWeight: 600, marginBottom: 2 }}>Manual links:</div>
+          {manualLinks.map(([a, b], i) => {
+            const labelA = wallets.find((w) => w.address === a)?.label || truncAddr(a);
+            const labelB = wallets.find((w) => w.address === b)?.label || truncAddr(b);
+            return (
+              <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#e2e8f0" }}>
+                <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#e879f9" }} />
+                <span>{labelA}</span>
+                <span style={{ color: "#475569" }}>⟷</span>
+                <span>{labelB}</span>
+                <button onClick={() => onUnlink(a, b)} style={{ background: "none", border: "none", color: "#ef4444", cursor: "pointer", fontSize: 11, marginLeft: "auto" }}>remove</button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const LINK_COLORS = {
   direct_transfer: "#4ade80",
   shared_token:    "#38bdf8",
   common_funder:   "#f59e0b",
+  manual:          "#e879f9",
 };
 const LINK_LABELS = {
   direct_transfer: "Direct tx",
   shared_token:    "Shared token",
   common_funder:   "Common funder",
+  manual:          "Manual link",
 };
 
 function WalletGraph({ wallets, links, loading }) {
@@ -2354,10 +2418,20 @@ const AddCAPanel = ({ onAdd, onClose }) => {
     if (!trimmed) return;
     setStatus("loading");
     try {
-      const res = await fetch(`https://api.dexscreener.com/tokens/v1/${chainId}/${trimmed}`);
-      if (!res.ok) throw new Error("Not found");
-      const pairs = await res.json();
-      if (!Array.isArray(pairs) || pairs.length === 0) throw new Error("Token not found on DexScreener");
+      // Try new endpoint first, then legacy — pump.fun tokens often only on legacy
+      let found = false;
+      const r1 = await fetch(`https://api.dexscreener.com/tokens/v1/${chainId}/${trimmed}`);
+      if (r1.ok) { const d = await r1.json(); if (Array.isArray(d) && d.length > 0) found = true; }
+      if (!found) {
+        const r2 = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${trimmed}`);
+        if (r2.ok) { const d = await r2.json(); if (Array.isArray(d?.pairs) && d.pairs.length > 0) found = true; }
+      }
+      // If neither returned data, validate address format before allowing the pin
+      if (!found) {
+        const validSolana = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(trimmed);
+        const validEvm    = /^0x[0-9a-fA-F]{40}$/.test(trimmed);
+        if (!validSolana && !validEvm) throw new Error("Address not recognised — check the CA and chain");
+      }
       onAdd(trimmed, chainId);
       setStatus("ok");
       setTimeout(onClose, 1200);
@@ -2865,10 +2939,29 @@ export default function App() {
 
   const [showAddCA, setShowAddCA] = useState(false);
   const [showAddWallet, setShowAddWallet] = useState(false);
+  const [showLinkWallets, setShowLinkWallets] = useState(false);
+
+  // Manual wallet links: [[addrA, addrB], ...]
+  const [manualLinks, setManualLinks] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("manualWalletLinks") || "[]"); } catch { return []; }
+  });
+  useEffect(() => { localStorage.setItem("manualWalletLinks", JSON.stringify(manualLinks)); }, [manualLinks]);
+
+  const linkWallets = (a, b) => {
+    const key = [a, b].sort();
+    setManualLinks((prev) => {
+      if (prev.some(([x, y]) => [x, y].sort().join() === key.join())) return prev;
+      return [...prev, key];
+    });
+  };
+  const unlinkWallets = (a, b) => {
+    const key = [a, b].sort().join();
+    setManualLinks((prev) => prev.filter(([x, y]) => [x, y].sort().join() !== key));
+  };
 
   // mint → [{address, label, amount, usdValue}] across all tracked wallets
   const [walletMintMap, setWalletMintMap] = useState({});
-  const { links: walletLinks, relatedWallets: relatedWalletList, fundingWallets: fundingWalletList, loading: walletLinksLoading } = useWalletLinks(wallets, walletMintMap);
+  const { links: walletLinks, relatedWallets: relatedWalletList, fundingWallets: fundingWalletList, loading: walletLinksLoading } = useWalletLinks(wallets, walletMintMap, manualLinks);
   const handleHoldingsLoaded = useCallback((walletAddr, walletLabel, holdings) => {
     setWalletMintMap((prev) => {
       const next = { ...prev };
@@ -3240,10 +3333,19 @@ export default function App() {
               >
                 + Add Wallet
               </button>
+              {wallets.length >= 2 && (
+                <button
+                  onClick={() => setShowLinkWallets(!showLinkWallets)}
+                  style={{ padding: "8px 16px", borderRadius: 8, border: "1px solid #e879f944", background: showLinkWallets ? "#e879f922" : "transparent", color: "#e879f9", fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+                >
+                  Link Wallets
+                </button>
+              )}
             </div>
           </div>
 
           {showAddWallet && <AddWalletPanel onAdd={addWallet} onClose={() => setShowAddWallet(false)} />}
+          {showLinkWallets && <LinkWalletsPanel wallets={wallets} manualLinks={manualLinks} onLink={linkWallets} onUnlink={unlinkWallets} onClose={() => setShowLinkWallets(false)} />}
 
           {wallets.length === 0 && !showAddWallet && (
             <div style={{ textAlign: "center", color: "#475569", padding: 64, fontSize: 14, border: "1px dashed #1e293b", borderRadius: 14 }}>
