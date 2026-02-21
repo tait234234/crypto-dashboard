@@ -1407,6 +1407,7 @@ function useWalletLinks(wallets, walletMintMap) {
   const [relatedWallets, setRelatedWallets] = useState([]);
   const [fundingWallets, setFundingWallets] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [scanStatus, setScanStatus] = useState(""); // human-readable scan phase
   const [scanKey, setScanKey] = useState(0); // increment to force rescan
   const addrs = wallets.map((w) => w.address);
 
@@ -1419,6 +1420,19 @@ function useWalletLinks(wallets, walletMintMap) {
 
     const run = async () => {
       setLoading(true);
+      setScanStatus("Fetching transactions…");
+
+      // Run items in small batches with a delay between batches to avoid rate limits.
+      const runBatched = async (items, fn, batchSize = 3, delayMs = 400) => {
+        for (let i = 0; i < items.length; i += batchSize) {
+          if (cancelled) break;
+          await Promise.all(items.slice(i, i + batchSize).map(fn));
+          if (i + batchSize < items.length && !cancelled) {
+            await new Promise((r) => setTimeout(r, delayMs));
+          }
+        }
+      };
+
       const edgeMap = new Map(); // key: "addrA:addrB" (sorted) → {types, sharedTokens, directTxCount}
 
       const ensureEdge = (a, b) => {
@@ -1485,6 +1499,7 @@ function useWalletLinks(wallets, walletMintMap) {
       // Common funder + related wallet discovery:
       // Also track SOL/stablecoin transfer amounts per counterparty so we can
       // prioritise high-value intermediaries for 2nd-degree probing.
+      if (!cancelled) setScanStatus("Building 1st-degree connections…");
       const USDT_MINT_LOCAL = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
       const STABLES_LOCAL = new Set([USDC_MINT, USDT_MINT_LOCAL]);
       const externalMap = new Map();
@@ -1576,9 +1591,9 @@ function useWalletLinks(wallets, walletMintMap) {
       if (probeTargets.length > 0 && !cancelled) {
         const knownAddrs = new Set([...addrSet, ...externalMap.keys()]);
         const secondDegree = new Map();
+        setScanStatus(`Scanning 2nd-degree connections (${probeTargets.length} wallets, 3 at a time)…`);
 
-        await Promise.all(
-          probeTargets.map(async (intermediary) => {
+        await runBatched(probeTargets, async (intermediary) => {
             try {
               // High-value intermediaries (≥$100 stables or ≥1 SOL) get a deeper probe
               const isHighValue = (intermediary.stable || 0) >= 100 || (intermediary.sol || 0) >= 1;
@@ -1613,8 +1628,7 @@ function useWalletLinks(wallets, walletMintMap) {
                 });
               });
             } catch {}
-          })
-        );
+        });
 
         // Add 2nd-degree wallets with transfer amounts
         secondDegree.forEach(({ via, trackedLinks, txCount, sol, stable }, addr) => {
@@ -1658,54 +1672,63 @@ function useWalletLinks(wallets, walletMintMap) {
 
           if (thirdDegreeTargets.length > 0) {
             const thirdDegree = new Map();
+            // Keep a reference map so we can build the full via-chain later:
+            // 3rd-degree wallet → which 2nd-degree wallet discovered it
+            const thirdViaIntermediary = new Map();
 
-            await Promise.all(
-              thirdDegreeTargets.map(async (intermediary) => {
-                try {
-                  const txs = await fetchWalletTxs(intermediary.address, 150, "TRANSFER");
-                  if (cancelled) return;
-                  txs.forEach((tx) => {
-                    extractCounterparties(tx, intermediary.address).forEach((cp) => {
-                      if (cp === intermediary.address) return;
-                      if (allKnown.has(cp)) return;
-                      if (!thirdDegree.has(cp)) thirdDegree.set(cp, { via: new Set(), trackedLinks: new Set(), txCount: 0, sol: 0, stable: 0 });
-                      const entry = thirdDegree.get(cp);
-                      entry.via.add(intermediary.address);
-                      entry.txCount++;
-                      intermediary.trackedLinks.forEach((w) => entry.trackedLinks.add(w));
-                    });
-                    // Track amounts for 3rd-degree counterparties
-                    (tx.nativeTransfers || []).forEach((t) => {
-                      const solAmt = (t.amount || 0) / 1e9;
-                      if (solAmt <= 0) return;
-                      [t.fromUserAccount, t.toUserAccount].forEach((a) => {
-                        if (a && thirdDegree.has(a)) thirdDegree.get(a).sol += solAmt;
-                      });
-                    });
-                    (tx.tokenTransfers || []).forEach((t) => {
-                      const amt = t.tokenAmount || 0;
-                      if (amt <= 0 || !STABLES_LOCAL.has(t.mint)) return;
-                      [t.fromUserAccount, t.toUserAccount].forEach((a) => {
-                        if (a && thirdDegree.has(a)) thirdDegree.get(a).stable += amt;
-                      });
+            setScanStatus(`Scanning 3rd-degree connections (${thirdDegreeTargets.length} wallets, 3 at a time)…`);
+
+            await runBatched(thirdDegreeTargets, async (intermediary) => {
+              try {
+                const txs = await fetchWalletTxs(intermediary.address, 150, "TRANSFER");
+                if (cancelled) return;
+                txs.forEach((tx) => {
+                  extractCounterparties(tx, intermediary.address).forEach((cp) => {
+                    if (cp === intermediary.address) return;
+                    if (allKnown.has(cp)) return;
+                    if (!thirdDegree.has(cp)) thirdDegree.set(cp, { via: new Set(), trackedLinks: new Set(), txCount: 0, sol: 0, stable: 0 });
+                    const entry = thirdDegree.get(cp);
+                    entry.via.add(intermediary.address);
+                    entry.txCount++;
+                    intermediary.trackedLinks.forEach((w) => entry.trackedLinks.add(w));
+                    // Store the 2nd-degree intermediary so we can build the full chain
+                    if (!thirdViaIntermediary.has(cp)) thirdViaIntermediary.set(cp, intermediary);
+                  });
+                  // Track amounts for 3rd-degree counterparties
+                  (tx.nativeTransfers || []).forEach((t) => {
+                    const solAmt = (t.amount || 0) / 1e9;
+                    if (solAmt <= 0) return;
+                    [t.fromUserAccount, t.toUserAccount].forEach((a) => {
+                      if (a && thirdDegree.has(a)) thirdDegree.get(a).sol += solAmt;
                     });
                   });
-                } catch {}
-              })
-            );
+                  (tx.tokenTransfers || []).forEach((t) => {
+                    const amt = t.tokenAmount || 0;
+                    if (amt <= 0 || !STABLES_LOCAL.has(t.mint)) return;
+                    [t.fromUserAccount, t.toUserAccount].forEach((a) => {
+                      if (a && thirdDegree.has(a)) thirdDegree.get(a).stable += amt;
+                    });
+                  });
+                });
+              } catch {}
+            }, 3, 300);
 
             thirdDegree.forEach(({ via, trackedLinks, txCount, sol, stable }, addr) => {
               if (txCount < 1) return;
+              // Build the full hop chain: [1st-hop, 2nd-hop] so UI can show tracked→hop1→hop2→addr
+              const secondHopIntermediary = thirdViaIntermediary.get(addr);
+              const firstHops = secondHopIntermediary ? [...(secondHopIntermediary.via || [])] : [];
+              const fullVia = [...firstHops, ...[...via]];
               related.push({
                 address: addr,
                 sharedWith: [...trackedLinks],
                 txCount,
                 mints: [],
                 degree: 3,
-                via: [...via],
+                via: fullVia,
                 sol: Math.round(sol * 1000) / 1000,
                 stable: Math.round(stable * 100) / 100,
-                viaLabels: [...via].map((v) => `${v.slice(0, 4)}…${v.slice(-4)}`),
+                viaLabels: fullVia.map((v) => `${v.slice(0, 4)}…${v.slice(-4)}`),
                 sharedWithLabels: [...trackedLinks].map((a) => {
                   const w = wallets.find((x) => x.address === a);
                   return w?.label || `${a.slice(0, 4)}…${a.slice(-4)}`;
@@ -1725,6 +1748,7 @@ function useWalletLinks(wallets, walletMintMap) {
       }
 
       // ── Funding detection ──
+      if (!cancelled) setScanStatus("Detecting funding sources…");
       const fundingMap = new Map();
       addrs.forEach((addr) => {
         (txsByWallet.get(addr) || []).forEach((tx) => {
@@ -1779,9 +1803,10 @@ function useWalletLinks(wallets, walletMintMap) {
           });
         });
         setLinks(result);
-        setRelatedWallets(related.slice(0, 100)); // increased from 30
-        setFundingWallets(fundingArr.slice(0, 20)); // increased from 15
+        setRelatedWallets(related.slice(0, 100));
+        setFundingWallets(fundingArr.slice(0, 20));
         setLoading(false);
+        setScanStatus("");
       }
     };
 
@@ -1790,7 +1815,7 @@ function useWalletLinks(wallets, walletMintMap) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wallets.length, JSON.stringify(addrs), Object.keys(walletMintMap).length, scanKey]);
 
-  return { links, relatedWallets, fundingWallets, loading, rescan };
+  return { links, relatedWallets, fundingWallets, loading, scanStatus, rescan };
 }
 
 // Tiny force-layout: push nodes apart, pull linked nodes together
@@ -2012,7 +2037,7 @@ function WalletGraph({ wallets, links, loading, onRescan }) {
 }
 
 // ─── Related Wallets Panel ───
-function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loading, onTrack, walletMintMap, onRescan }) {
+function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loading, scanStatus = "", onTrack, walletMintMap, onRescan }) {
   const DEFAULT_SHOWN = 15;
   const [showLimit, setShowLimit] = useState(DEFAULT_SHOWN);
   const [tracked, setTracked] = useState(new Set());
@@ -2196,6 +2221,10 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
           } catch (_) {}
         }));
         if (!cancelled) setOverlapScores((prev) => ({ ...prev, ...scores }));
+        // Throttle: wait between batches to avoid hitting RPC rate limits
+        if (!cancelled && i + BATCH < relatedWallets.length) {
+          await new Promise((r) => setTimeout(r, 300));
+        }
       }
     };
 
@@ -2290,7 +2319,27 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
 
   const clearSearch = () => { setActiveCA(null); setCaInput(""); setFilterResults([]); setFilterMeta(null); setFilterError(null); };
 
-  if (loading) return null;
+  // Show a scanning panel while the hook is running so users can see progress.
+  if (loading) {
+    const phase = scanStatus || "Scanning…";
+    return (
+      <div style={{ background: "#0d1321", border: "1px solid #1e293b", borderRadius: 14, padding: "20px 24px", marginBottom: 20 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          {/* Spinner */}
+          <div style={{ width: 16, height: 16, border: "2px solid #334155", borderTopColor: "#6366f1", borderRadius: "50%", animation: "spin 0.8s linear infinite", flexShrink: 0 }} />
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0" }}>Tracing fund flows…</div>
+            <div style={{ fontSize: 11, color: "#475569", marginTop: 3 }}>{phase}</div>
+          </div>
+          {relatedWallets.length > 0 && (
+            <span style={{ marginLeft: "auto", background: "#6366f122", color: "#818cf8", border: "1px solid #6366f133", borderRadius: 4, fontSize: 10, fontWeight: 700, padding: "2px 8px" }}>
+              {relatedWallets.length} found so far
+            </span>
+          )}
+        </div>
+      </div>
+    );
+  }
   if (!relatedWallets.length && !fundingWallets.length && !activeCA) return null;
 
   function renderFundingSection() {
@@ -2761,6 +2810,21 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
                   </button>
                 </div>
               </div>
+
+              {/* Fund flow chain — show the hop path for 2nd and 3rd-degree connections */}
+              {(is2nd || is3rd) && r.via?.length > 0 && (
+                <div style={{ display: "flex", alignItems: "center", gap: 3, padding: "3px 10px 5px 22px", flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 9, color: "#334155" }}>via</span>
+                  {r.via.map((hop, i) => (
+                    <span key={hop} style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                      <span style={{ fontFamily: "monospace", fontSize: 9, color: degreeColor, background: `${degreeColor}11`, border: `1px solid ${degreeColor}33`, borderRadius: 3, padding: "1px 4px" }}>
+                        {hop.slice(0, 4)}…{hop.slice(-4)}
+                      </span>
+                      {i < r.via.length - 1 && <span style={{ fontSize: 9, color: "#334155" }}>→</span>}
+                    </span>
+                  ))}
+                </div>
+              )}
 
               {/* Token icons strip */}
               {tokenIcons.length > 0 && (
@@ -4002,7 +4066,7 @@ export default function App() {
 
   // mint → [{address, label, amount, usdValue}] across all tracked wallets
   const [walletMintMap, setWalletMintMap] = useState({});
-  const { links: walletLinks, relatedWallets: relatedWalletList, fundingWallets: fundingWalletList, loading: walletLinksLoading, rescan: rescanWalletLinks } = useWalletLinks(wallets, walletMintMap);
+  const { links: walletLinks, relatedWallets: relatedWalletList, fundingWallets: fundingWalletList, loading: walletLinksLoading, scanStatus: walletScanStatus, rescan: rescanWalletLinks } = useWalletLinks(wallets, walletMintMap);
   const handleHoldingsLoaded = useCallback((walletAddr, walletLabel, holdings) => {
     setWalletMintMap((prev) => {
       const next = { ...prev };
@@ -4395,6 +4459,7 @@ export default function App() {
             fundingWallets={fundingWalletList}
             trackedAddrs={new Set(wallets.map((w) => w.address))}
             loading={walletLinksLoading}
+            scanStatus={walletScanStatus}
             onTrack={addWallet}
             walletMintMap={walletMintMap}
             onRescan={rescanWalletLinks}
