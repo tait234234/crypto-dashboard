@@ -1644,6 +1644,84 @@ function useWalletLinks(wallets, walletMintMap) {
           if (valB !== valA) return valB - valA;
           return b.sharedWith.length - a.sharedWith.length || b.txCount - a.txCount;
         });
+
+        // ── 3rd-degree discovery: follow high-value 2nd-degree wallets further ──
+        // Only probe 2nd-degree wallets that had significant value transferred through them.
+        // This automatically traces chains like: trackedWallet → A → B → C
+        if (!cancelled) {
+          const allKnown = new Set([...addrSet, ...externalMap.keys(), ...secondDegree.keys()]);
+          const thirdDegreeTargets = [...secondDegree.entries()]
+            .filter(([, v]) => (v.stable || 0) >= 100 || (v.sol || 0) >= 1)
+            .sort(([, a], [, b]) => ((b.sol || 0) + (b.stable || 0) / 150) - ((a.sol || 0) + (a.stable || 0) / 150))
+            .slice(0, 15)
+            .map(([addr, v]) => ({ address: addr, ...v }));
+
+          if (thirdDegreeTargets.length > 0) {
+            const thirdDegree = new Map();
+
+            await Promise.all(
+              thirdDegreeTargets.map(async (intermediary) => {
+                try {
+                  const txs = await fetchWalletTxs(intermediary.address, 150, "TRANSFER");
+                  if (cancelled) return;
+                  txs.forEach((tx) => {
+                    extractCounterparties(tx, intermediary.address).forEach((cp) => {
+                      if (cp === intermediary.address) return;
+                      if (allKnown.has(cp)) return;
+                      if (!thirdDegree.has(cp)) thirdDegree.set(cp, { via: new Set(), trackedLinks: new Set(), txCount: 0, sol: 0, stable: 0 });
+                      const entry = thirdDegree.get(cp);
+                      entry.via.add(intermediary.address);
+                      entry.txCount++;
+                      intermediary.trackedLinks.forEach((w) => entry.trackedLinks.add(w));
+                    });
+                    // Track amounts for 3rd-degree counterparties
+                    (tx.nativeTransfers || []).forEach((t) => {
+                      const solAmt = (t.amount || 0) / 1e9;
+                      if (solAmt <= 0) return;
+                      [t.fromUserAccount, t.toUserAccount].forEach((a) => {
+                        if (a && thirdDegree.has(a)) thirdDegree.get(a).sol += solAmt;
+                      });
+                    });
+                    (tx.tokenTransfers || []).forEach((t) => {
+                      const amt = t.tokenAmount || 0;
+                      if (amt <= 0 || !STABLES_LOCAL.has(t.mint)) return;
+                      [t.fromUserAccount, t.toUserAccount].forEach((a) => {
+                        if (a && thirdDegree.has(a)) thirdDegree.get(a).stable += amt;
+                      });
+                    });
+                  });
+                } catch {}
+              })
+            );
+
+            thirdDegree.forEach(({ via, trackedLinks, txCount, sol, stable }, addr) => {
+              if (txCount < 1) return;
+              related.push({
+                address: addr,
+                sharedWith: [...trackedLinks],
+                txCount,
+                mints: [],
+                degree: 3,
+                via: [...via],
+                sol: Math.round(sol * 1000) / 1000,
+                stable: Math.round(stable * 100) / 100,
+                viaLabels: [...via].map((v) => `${v.slice(0, 4)}…${v.slice(-4)}`),
+                sharedWithLabels: [...trackedLinks].map((a) => {
+                  const w = wallets.find((x) => x.address === a);
+                  return w?.label || `${a.slice(0, 4)}…${a.slice(-4)}`;
+                }),
+              });
+            });
+
+            related.sort((a, b) => {
+              if (a.degree !== b.degree) return a.degree - b.degree;
+              const valA = (a.sol || 0) + (a.stable || 0) / 150;
+              const valB = (b.sol || 0) + (b.stable || 0) / 150;
+              if (valB !== valA) return valB - valA;
+              return b.sharedWith.length - a.sharedWith.length || b.txCount - a.txCount;
+            });
+          }
+        }
       }
 
       // ── Funding detection ──
@@ -2574,7 +2652,7 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
                 <strong>Found</strong> at rank #{rank + 1} of {relatedWallets.length}
                 {!isShown && <span style={{ color: "#4ade80", fontWeight: 700 }}> (hidden — click "Show more" to reveal)</span>}
                 <span style={{ display: "flex", gap: 10, marginTop: 5, flexWrap: "wrap", fontSize: 11 }}>
-                  <span>Degree: <strong>{r.degree === 2 ? "2nd°" : "1st°"}</strong></span>
+                  <span>Degree: <strong>{r.degree === 3 ? "3rd°" : r.degree === 2 ? "2nd°" : "1st°"}</strong></span>
                   <span>Tx appearances: <strong>{r.txCount}</strong></span>
                   {r.sol > 0 && <span>SOL: <strong>{r.sol}</strong></span>}
                   {r.stable > 0 && <span>Stables: <strong>${r.stable}</strong></span>}
@@ -2592,6 +2670,9 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
           const isAlreadyTracked = trackedAddrs.has(r.address) || tracked.has(r.address);
           const isStrong = r.sharedWith.length >= 2;
           const is2nd = r.degree === 2;
+          const is3rd = r.degree === 3;
+          const degreeColor = is3rd ? "#f472b6" : is2nd ? "#a78bfa" : null; // pink=3rd, purple=2nd
+          const borderColor = is3rd ? "#f472b633" : is2nd ? "#a78bfa33" : isStrong ? "#f59e0b33" : "#1e293b";
 
           // Resolve token icons for mints this address transacted with
           const tokenIcons = (r.mints || [])
@@ -2600,11 +2681,12 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
             .slice(0, 6);
 
           return (
-            <div key={r.address} style={{ background: "#111827", borderRadius: 8, border: `1px solid ${is2nd ? "#a78bfa33" : isStrong ? "#f59e0b33" : "#1e293b"}`, overflow: "hidden" }}>
+            <div key={r.address} style={{ background: "#111827", borderRadius: 8, border: `1px solid ${borderColor}`, overflow: "hidden" }}>
               {/* Main row */}
               <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px" }}>
                 {/* Signal dot */}
-                <div style={{ flexShrink: 0, width: 6, height: 6, borderRadius: "50%", background: is2nd ? "#a78bfa" : isStrong ? "#f59e0b" : "#334155" }} title={is2nd ? "2nd-degree connection (via intermediary)" : isStrong ? "Linked to multiple tracked wallets" : "Linked to 1 tracked wallet"} />
+                <div style={{ flexShrink: 0, width: 6, height: 6, borderRadius: "50%", background: degreeColor || (isStrong ? "#f59e0b" : "#334155") }}
+                  title={is3rd ? "3rd-degree connection (2 hops via intermediaries)" : is2nd ? "2nd-degree connection (via intermediary)" : isStrong ? "Linked to multiple tracked wallets" : "Linked to 1 tracked wallet"} />
 
                 {/* Address */}
                 <span style={{ fontFamily: "monospace", fontSize: 11, color: "#94a3b8", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -2613,7 +2695,12 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
 
                 {/* Tags */}
                 <div style={{ display: "flex", gap: 4, flexShrink: 0, alignItems: "center" }}>
-                  {is2nd && (
+                  {is3rd && (
+                    <span title={r.via?.length ? `Via: ${r.via.map((v) => v.slice(0, 6) + "…").join(", ")}` : "3rd-degree connection"} style={{ background: "#f472b622", color: "#f472b6", border: "1px solid #f472b644", borderRadius: 4, fontSize: 9, fontWeight: 700, padding: "1px 5px", whiteSpace: "nowrap" }}>
+                      3rd°
+                    </span>
+                  )}
+                  {is2nd && !is3rd && (
                     <span title={r.via?.length ? `Via: ${r.via.map((v) => v.slice(0, 6) + "…").join(", ")}` : "2nd-degree connection"} style={{ background: "#a78bfa22", color: "#a78bfa", border: "1px solid #a78bfa44", borderRadius: 4, fontSize: 9, fontWeight: 700, padding: "1px 5px", whiteSpace: "nowrap" }}>
                       2nd°
                     </span>
@@ -2718,7 +2805,7 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
       {activeCA && renderTokenHolders()}
 
       <div style={{ fontSize: 10, color: "#334155", marginTop: 8 }}>
-        200 recent + 500 TRANSFER txs per wallet • 2nd° probes top 30 intermediaries (high-value first, up to 300 txs) • Amber = 2+ wallets • Purple = 2nd° • Green = stablecoins
+        Auto-traces fund flow chains up to 3 hops • 200 recent + 500 TRANSFER txs per wallet • High-value intermediaries probed deeper • Amber = 2+ wallets • Purple = 2nd° • Pink = 3rd°
       </div>
     </div>
   );
