@@ -2985,13 +2985,16 @@ const WALLET_SORTS = [
   { key: "name",   label: "Name"   },
 ];
 
-const WalletCard = ({ wallet, onRemove, onHoldingsLoaded, pinnedMints, onPin }) => {
+const WalletCard = ({ wallet, onRemove, onHoldingsLoaded, pinnedMints, onPin, onUpdateLabel }) => {
   const { holdings, loading, error, lastFetchedAt, refetch } = useWalletTokens(wallet.address);
   const [expanded, setExpanded]         = useState(true);
   const [confirmingRemove, setConfirming] = useState(false);
   const [sort, setSort]                 = useState("value"); // value | change | name
   const [search, setSearch]             = useState("");
   const [showSearch, setShowSearch]     = useState(false);
+  const [editingLabel, setEditingLabel] = useState(false);
+  const [labelDraft, setLabelDraft]     = useState(wallet.label || "");
+  const labelInputRef                   = useRef(null);
 
   // Tick every 30s so "X ago" stays fresh
   const [, setTick] = useState(0);
@@ -3043,7 +3046,30 @@ const WalletCard = ({ wallet, onRemove, onHoldingsLoaded, pinnedMints, onPin }) 
             {expanded ? "▾" : "▸"}
           </button>
           <div>
-            {wallet.label && <div style={{ color: "#f1f5f9", fontWeight: 600, fontSize: 14 }}>{wallet.label}</div>}
+            {/* Label — click to edit inline */}
+            {editingLabel ? (
+              <input
+                ref={labelInputRef}
+                value={labelDraft}
+                autoFocus
+                onChange={(e) => setLabelDraft(e.target.value)}
+                onBlur={() => { setEditingLabel(false); if (onUpdateLabel) onUpdateLabel(wallet.address, labelDraft.trim()); }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter")  { e.target.blur(); }
+                  if (e.key === "Escape") { setLabelDraft(wallet.label || ""); setEditingLabel(false); }
+                }}
+                placeholder="Add a label…"
+                style={{ background: "#0d1321", border: "1px solid #6366f1", borderRadius: 6, color: "#e2e8f0", fontSize: 13, fontWeight: 600, padding: "2px 8px", outline: "none", width: 160 }}
+              />
+            ) : (
+              <div
+                onClick={() => { setLabelDraft(wallet.label || ""); setEditingLabel(true); }}
+                title="Click to edit label"
+                style={{ color: wallet.label ? "#f1f5f9" : "#334155", fontWeight: 600, fontSize: 14, cursor: "text", minHeight: 20 }}
+              >
+                {wallet.label || <span style={{ fontStyle: "italic", fontSize: 12 }}>Add label…</span>}
+              </div>
+            )}
             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
               <span style={{ color: "#64748b", fontSize: 12, fontFamily: "monospace", cursor: "pointer" }} title={wallet.address} onClick={() => copyAddr(wallet.address)}>
                 {truncateAddr(wallet.address)}
@@ -4316,7 +4342,8 @@ export default function App() {
         const price = h.pair?.priceUsd ? parseFloat(h.pair.priceUsd) : 0;
         const icon = h.pair?.icon || h.pair?.info?.imageUrl || null;
         const symbol = h.pair?.baseToken?.symbol || null;
-        const entry = { address: walletAddr, label: walletLabel, amount: h.amount, usdValue: price * h.amount, icon, symbol };
+        const priceChange24h = h.pair?.priceChange?.h24 ?? null;
+        const entry = { address: walletAddr, label: walletLabel, amount: h.amount, usdValue: price * h.amount, icon, symbol, priceChange24h };
         next[h.mint] = [...(next[h.mint] || []), entry];
       });
       return next;
@@ -4329,6 +4356,7 @@ export default function App() {
   const [minVol, setMinVol] = useState("");
   const [minMcap, setMinMcap] = useState("");
   const [minChange1h, setMinChange1h] = useState("");
+  const [tokenSearch, setTokenSearch] = useState("");
 
   const handleSort = (key) => {
     if (sortBy === key) setSortDir((d) => (d === "desc" ? "asc" : "desc"));
@@ -4386,6 +4414,10 @@ export default function App() {
     setWallets((prev) => prev.find((w) => w.address === address) ? prev : [...prev, { address, label }]);
   };
 
+  const updateWalletLabel = useCallback((address, label) => {
+    setWallets((prev) => prev.map((w) => w.address === address ? { ...w, label } : w));
+  }, []);
+
   const removeWallet = (address) => {
     setWallets((prev) => prev.filter((w) => w.address !== address));
     // Remove this wallet's holdings from the mint map so badges disappear
@@ -4404,11 +4436,20 @@ export default function App() {
     activeChain === "Base"   ? t.chainId === "base"   : true;
 
   // Memoised so filter+sort only runs when inputs actually change, not every keystroke.
-  const filteredTokens = useMemo(
-    () => applyFilters(tokens.filter(chainFilter)),
+  const filteredTokens = useMemo(() => {
+    const q = tokenSearch.trim().toLowerCase();
+    const base = tokens.filter(chainFilter).filter((t) => {
+      if (!q) return true;
+      return (
+        (t.baseToken?.symbol || "").toLowerCase().includes(q) ||
+        (t.baseToken?.name   || "").toLowerCase().includes(q) ||
+        (t.baseToken?.address || "").toLowerCase().startsWith(q)
+      );
+    });
+    return applyFilters(base);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [tokens, activeChain, sortBy, sortDir, minVol, minMcap, minChange1h]
-  );
+  }, [tokens, activeChain, sortBy, sortDir, minVol, minMcap, minChange1h, tokenSearch]);
+
   const filteredPinned = useMemo(
     () => applyFilters(pinnedTokens.filter(chainFilter)),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -4621,9 +4662,22 @@ export default function App() {
           )}
 
           {/* Trending tokens */}
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 16 }}>
-            <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#f1f5f9", margin: 0 }}>Trending</h2>
-            <span style={{ color: "#64748b", fontSize: 12 }}>Powered by GeckoTerminal • Click card to view</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
+            <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#f1f5f9", margin: 0, flexShrink: 0 }}>Trending</h2>
+            {/* Token search */}
+            <div style={{ position: "relative", flex: 1, minWidth: 160, maxWidth: 280 }}>
+              <input
+                value={tokenSearch}
+                onChange={(e) => setTokenSearch(e.target.value)}
+                placeholder="Search symbol, name, CA…"
+                style={{ width: "100%", background: "#0d1321", border: "1px solid #334155", borderRadius: 8, color: "#e2e8f0", fontSize: 12, padding: "6px 10px 6px 28px", outline: "none", boxSizing: "border-box" }}
+              />
+              <span style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", fontSize: 12, color: "#475569", pointerEvents: "none" }}>🔍</span>
+              {tokenSearch && (
+                <button onClick={() => setTokenSearch("")} style={{ position: "absolute", right: 6, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 14, padding: 0, lineHeight: 1 }}>✕</button>
+              )}
+            </div>
+            <span style={{ color: "#334155", fontSize: 11, marginLeft: "auto", flexShrink: 0 }}>Powered by GeckoTerminal</span>
           </div>
 
           {tokenError && (
@@ -4653,7 +4707,10 @@ export default function App() {
 
           {!tokenLoading && filteredTokens.length === 0 && !tokenError && (
             <div className="animate-in" style={{ textAlign: "center", color: "#475569", padding: 48, fontSize: 14 }}>
-              No trending tokens found for this chain right now. Try adjusting your filters or switching chains.
+              {tokenSearch
+                ? <>No tokens matching <strong style={{ color: "#94a3b8" }}>"{tokenSearch}"</strong>. <button onClick={() => setTokenSearch("")} style={{ background: "none", border: "none", color: "#818cf8", cursor: "pointer", fontSize: 14, padding: 0 }}>Clear search</button></>
+                : "No trending tokens found for this chain right now. Try adjusting your filters or switching chains."
+              }
             </div>
           )}
         </>
@@ -4669,18 +4726,54 @@ export default function App() {
             </div>
             <div style={{ display: "flex", gap: 8 }}>
               {wallets.length > 0 && (
-                <button
-                  onClick={() => {
-                    const data = wallets.map((w) => ({ address: w.address, name: w.label || "", emoji: "", groups: [] }));
-                    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-                    const url = URL.createObjectURL(blob);
-                    Object.assign(document.createElement("a"), { href: url, download: "cryptodawn-wallets.json" }).click();
-                    URL.revokeObjectURL(url);
-                  }}
-                  style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid #334155", background: "transparent", color: "#64748b", fontSize: 13, fontWeight: 600, cursor: "pointer" }}
-                >
-                  ↓ Export
-                </button>
+                <div style={{ display: "flex", gap: 6 }}>
+                  {/* Holdings CSV — all token positions across all wallets */}
+                  {Object.keys(walletMintMap).length > 0 && (
+                    <button
+                      onClick={() => {
+                        const rows = [["Wallet Address", "Wallet Label", "Token", "USD Value", "Amount", "24h Change %"]];
+                        Object.entries(walletMintMap).forEach(([, entries]) => {
+                          entries.forEach((e) => {
+                            const price = e.amount > 0 ? e.usdValue / e.amount : 0;
+                            rows.push([
+                              e.address,
+                              e.label || "",
+                              e.symbol || "",
+                              e.usdValue.toFixed(2),
+                              e.amount.toFixed(6),
+                              Number.isFinite(e.priceChange24h) ? e.priceChange24h.toFixed(2) : "",
+                            ]);
+                          });
+                        });
+                        const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
+                        const blob = new Blob([csv], { type: "text/csv" });
+                        const url = URL.createObjectURL(blob);
+                        Object.assign(document.createElement("a"), { href: url, download: "portfolio-holdings.csv" }).click();
+                        URL.revokeObjectURL(url);
+                        showCopyToast("Holdings exported!");
+                      }}
+                      title="Export all holdings as CSV"
+                      style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid #334155", background: "transparent", color: "#64748b", fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+                    >
+                      ↓ CSV
+                    </button>
+                  )}
+                  {/* Wallets JSON */}
+                  <button
+                    onClick={() => {
+                      const data = wallets.map((w) => ({ address: w.address, name: w.label || "", emoji: "", groups: [] }));
+                      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+                      const url = URL.createObjectURL(blob);
+                      Object.assign(document.createElement("a"), { href: url, download: "cryptodawn-wallets.json" }).click();
+                      URL.revokeObjectURL(url);
+                      showCopyToast("Wallets exported!");
+                    }}
+                    title="Export wallet list as JSON"
+                    style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid #334155", background: "transparent", color: "#64748b", fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+                  >
+                    ↓ JSON
+                  </button>
+                </div>
               )}
               <button
                 onClick={() => setShowAddWallet(!showAddWallet)}
@@ -4712,16 +4805,49 @@ export default function App() {
             const allEntries = Object.values(walletMintMap).flat();
             const totalValue = allEntries.reduce((sum, h) => sum + (h.usdValue || 0), 0);
             const uniqueTokens = new Set(Object.keys(walletMintMap)).size;
+
+            // Daily P&L: sum of (usdValue × priceChange24h / 100) for entries with change data
+            const dailyPnl = allEntries.reduce((sum, h) => {
+              if (!Number.isFinite(h.priceChange24h) || !h.usdValue) return sum;
+              // h.usdValue = currentValue; yesterdayValue = currentValue / (1 + h24/100)
+              // pnl = currentValue - yesterdayValue = currentValue × h24/100 / (1 + h24/100)
+              return sum + h.usdValue * (h.priceChange24h / 100) / (1 + h.priceChange24h / 100);
+            }, 0);
+            const pnlKnown = allEntries.some((h) => Number.isFinite(h.priceChange24h));
+            const pnlPct = totalValue > 0 ? (dailyPnl / (totalValue - dailyPnl)) * 100 : 0;
+
+            // Top movers: per-token rolled up, sorted by abs 24h change with meaningful value
+            const tokenSummary = {};
+            allEntries.forEach((h) => {
+              const k = h.symbol || "???";
+              if (!tokenSummary[k]) tokenSummary[k] = { symbol: k, icon: h.icon, usdValue: 0, priceChange24h: h.priceChange24h };
+              tokenSummary[k].usdValue += h.usdValue || 0;
+            });
+            const movers = Object.values(tokenSummary)
+              .filter((m) => Number.isFinite(m.priceChange24h) && m.usdValue >= 1)
+              .sort((a, b) => Math.abs(b.priceChange24h) - Math.abs(a.priceChange24h))
+              .slice(0, 5);
+            const gainers = movers.filter((m) => m.priceChange24h > 0);
+            const losers  = movers.filter((m) => m.priceChange24h < 0);
+
             return (
               <div className="animate-in" style={{ background: "linear-gradient(135deg, #111827 0%, #0d1321 100%)", border: "1px solid #1e293b", borderRadius: 14, padding: "18px 24px", marginBottom: 16 }}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+                {/* Row 1: Value + stats */}
+                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 16, marginBottom: movers.length > 0 ? 14 : 0 }}>
                   <div>
                     <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8, color: "#475569", marginBottom: 4 }}>Total Portfolio Value</div>
-                    <div style={{ fontSize: 28, fontWeight: 800, color: totalValue > 0 ? "#4ade80" : "#64748b", letterSpacing: -0.5 }}>
-                      {totalValue > 0 ? formatVolume(totalValue) : "—"}
+                    <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
+                      <span style={{ fontSize: 28, fontWeight: 800, color: totalValue > 0 ? "#f1f5f9" : "#64748b", letterSpacing: -0.5 }}>
+                        {totalValue > 0 ? formatVolume(totalValue) : "—"}
+                      </span>
+                      {pnlKnown && totalValue > 0 && (
+                        <span style={{ fontSize: 13, fontWeight: 700, color: dailyPnl >= 0 ? "#4ade80" : "#f87171" }}>
+                          {dailyPnl >= 0 ? "+" : ""}{formatVolume(Math.abs(dailyPnl))} ({dailyPnl >= 0 ? "+" : ""}{pnlPct.toFixed(1)}%) today
+                        </span>
+                      )}
                     </div>
                   </div>
-                  <div style={{ display: "flex", gap: 20 }}>
+                  <div style={{ display: "flex", gap: 20, paddingTop: 4 }}>
                     <div style={{ textAlign: "center" }}>
                       <div style={{ fontSize: 18, fontWeight: 800, color: "#e2e8f0" }}>{wallets.length}</div>
                       <div style={{ fontSize: 10, color: "#475569", fontWeight: 600 }}>wallet{wallets.length !== 1 ? "s" : ""}</div>
@@ -4738,6 +4864,24 @@ export default function App() {
                     )}
                   </div>
                 </div>
+
+                {/* Row 2: Top movers */}
+                {movers.length > 0 && (
+                  <div>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: "#334155", textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 8 }}>Top movers today</div>
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      {[...gainers.slice(0, 3), ...losers.slice(0, 3)].map((m) => (
+                        <div key={m.symbol} style={{ display: "flex", alignItems: "center", gap: 5, background: m.priceChange24h >= 0 ? "#4ade8011" : "#f8717111", border: `1px solid ${m.priceChange24h >= 0 ? "#4ade8033" : "#f8717133"}`, borderRadius: 8, padding: "4px 10px" }}>
+                          {m.icon && <img src={m.icon} alt={m.symbol} style={{ width: 14, height: 14, borderRadius: "50%", objectFit: "cover" }} onError={(e) => { e.target.style.display = "none"; }} />}
+                          <span style={{ fontSize: 11, fontWeight: 700, color: "#e2e8f0" }}>{m.symbol}</span>
+                          <span style={{ fontSize: 11, fontWeight: 700, color: m.priceChange24h >= 0 ? "#4ade80" : "#f87171" }}>
+                            {m.priceChange24h >= 0 ? "+" : ""}{m.priceChange24h.toFixed(1)}%
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             );
           })()}
@@ -4763,6 +4907,7 @@ export default function App() {
               onHoldingsLoaded={handleHoldingsLoaded}
               pinnedMints={pinnedMints}
               onPin={pinToken}
+              onUpdateLabel={updateWalletLabel}
             />
           ))}
 
