@@ -666,9 +666,31 @@ function usePoolChart(chainId, tokenCA, gtPoolAddr, enabled, timeframe = "1D") {
   return { priceData, volumeData, loading, failed, retry };
 }
 
+// ─── Copy-to-clipboard utility with toast feedback ───
+function showCopyToast(text = "Copied!") {
+  const existing = document.querySelector(".copy-toast");
+  if (existing) existing.remove();
+  const el = document.createElement("div");
+  el.className = "copy-toast";
+  el.textContent = text;
+  document.body.appendChild(el);
+  setTimeout(() => {
+    el.classList.add("hiding");
+    setTimeout(() => el.remove(), 200);
+  }, 1200);
+}
+
+function copyAddr(text) {
+  if (!text) return;
+  navigator.clipboard?.writeText(text).then(
+    () => showCopyToast("Copied!"),
+    () => showCopyToast("Copy failed")
+  );
+}
+
 // ─── Helpers ───
 function formatPrice(num) {
-  if (!num || num === 0) return "$0";
+  if (!Number.isFinite(num) || num === 0) return "$0";
   if (num >= 1000) return "$" + num.toLocaleString("en-US", { maximumFractionDigits: 0 });
   if (num >= 1) return "$" + num.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   if (num >= 0.01) return "$" + num.toFixed(4);
@@ -677,13 +699,13 @@ function formatPrice(num) {
 }
 
 function formatChange(num) {
-  if (num === null || num === undefined) return "—";
+  if (!Number.isFinite(num)) return "—";
   const sign = num >= 0 ? "+" : "";
   return sign + num.toFixed(1) + "%";
 }
 
 function formatVolume(num) {
-  if (!num) return "$0";
+  if (!Number.isFinite(num) || num === 0) return "$0";
   if (num >= 1e12) return "$" + (num / 1e12).toFixed(2) + "T";
   if (num >= 1e9)  return "$" + (num / 1e9).toFixed(1)  + "B";
   if (num >= 1e6)  return "$" + (num / 1e6).toFixed(1)  + "M";
@@ -693,6 +715,7 @@ function formatVolume(num) {
 }
 
 function formatTokenAmount(n) {
+  if (!Number.isFinite(n)) return "0";
   if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
   if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
   return n.toFixed(2);
@@ -807,7 +830,7 @@ const HolderPanel = ({ ca, chainId, holders, loading, error, onRefresh }) => {
   const [copiedIdx, setCopiedIdx] = useState(null);
 
   const copyOwner = (addr, idx) => {
-    navigator.clipboard?.writeText(addr);
+    copyAddr(addr);
     setCopiedIdx(idx);
     setTimeout(() => setCopiedIdx(null), 1500);
   };
@@ -1163,7 +1186,7 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank, a
           <span style={{ color: "#334155", fontSize: 10, fontFamily: "monospace" }}>CA:</span>
           <span style={{ color: "#475569", fontSize: 10, fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{ca}</span>
           <button
-            onClick={() => { navigator.clipboard?.writeText(ca); setCaCopied(true); setTimeout(() => setCaCopied(false), 1500); }}
+            onClick={() => { copyAddr(ca); setCaCopied(true); setTimeout(() => setCaCopied(false), 1500); }}
             title="Copy CA"
             style={{ background: "none", border: "none", color: caCopied ? "#4ade80" : "#475569", cursor: "pointer", fontSize: 11, padding: "1px 4px", transition: "color 0.15s" }}
           >
@@ -2387,7 +2410,7 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
 
                 {/* Copy + Solscan + Track */}
                 <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
-                  <button onClick={() => navigator.clipboard?.writeText(f.address)} title="Copy address"
+                  <button onClick={() => copyAddr(f.address)} title="Copy address"
                     style={{ width: 24, height: 24, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", color: "#64748b", fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
                     ⎘
                   </button>
@@ -2510,7 +2533,7 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
 
                   {/* Copy + Track */}
                   <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
-                    <button onClick={() => navigator.clipboard?.writeText(r.address)} title="Copy address"
+                    <button onClick={() => copyAddr(r.address)} title="Copy address"
                       style={{ width: 24, height: 24, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", color: "#64748b", fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
                       ⎘
                     </button>
@@ -2548,7 +2571,7 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
   const hiddenCount = relatedWallets.length - shown.length;
 
   return (
-    <div style={{ background: "#0d1321", border: "1px solid #1e293b", borderRadius: 14, padding: "16px 20px", marginBottom: 20 }}>
+    <div className="animate-in" style={{ background: "#0d1321", border: "1px solid #1e293b", borderRadius: 14, padding: "16px 20px", marginBottom: 20 }}>
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 10, gap: 12, flexWrap: "wrap" }}>
         <div style={{ flexShrink: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -2789,7 +2812,7 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
                 {/* Copy + Solscan + Track */}
                 <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
                   <button
-                    onClick={() => navigator.clipboard?.writeText(r.address)}
+                    onClick={() => copyAddr(r.address)}
                     title="Copy address"
                     style={{ width: 24, height: 24, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", color: "#64748b", fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
                   >
@@ -2905,7 +2928,14 @@ const WalletHoldingRow = ({ holding }) => {
         <div style={{ color: "#64748b", fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</div>
       </div>
       <div style={{ textAlign: "right", flexShrink: 0 }}>
-        <div style={{ color: "#f1f5f9", fontSize: 13, fontWeight: 600 }}>{usdValue >= 0.01 ? formatVolume(usdValue) : "< $0.01"}</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, justifyContent: "flex-end" }}>
+          <span style={{ color: "#f1f5f9", fontSize: 13, fontWeight: 600 }}>{usdValue >= 0.01 ? formatVolume(usdValue) : "< $0.01"}</span>
+          {Number.isFinite(pair?.priceChange?.h24) && (
+            <span style={{ fontSize: 10, fontWeight: 700, color: pair.priceChange.h24 >= 0 ? "#4ade80" : "#f87171", background: pair.priceChange.h24 >= 0 ? "#4ade8011" : "#f8717111", padding: "1px 5px", borderRadius: 4, whiteSpace: "nowrap" }}>
+              {pair.priceChange.h24 >= 0 ? "+" : ""}{pair.priceChange.h24.toFixed(1)}%
+            </span>
+          )}
+        </div>
         <div style={{ color: "#64748b", fontSize: 11 }}>{formatTokenAmount(amount)}</div>
       </div>
       <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
@@ -2919,6 +2949,7 @@ const WalletHoldingRow = ({ holding }) => {
 const WalletCard = ({ wallet, onRemove, onHoldingsLoaded }) => {
   const { holdings, loading, error, refetch } = useWalletTokens(wallet.address);
   const [expanded, setExpanded] = useState(true);
+  const [confirmingRemove, setConfirmingRemove] = useState(false);
 
   // Report loaded holdings back to parent so it can build the mint → wallets map
   useEffect(() => {
@@ -2933,10 +2964,10 @@ const WalletCard = ({ wallet, onRemove, onHoldingsLoaded }) => {
   }, 0);
 
   return (
-    <div style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 14, padding: "16px 20px", marginBottom: 12 }}>
+    <div className="card-hover animate-in" style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 14, padding: "16px 20px", marginBottom: 12 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: expanded ? 12 : 0 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <button onClick={() => setExpanded(!expanded)} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 14, padding: 0 }}>
+          <button onClick={() => setExpanded(!expanded)} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 14, padding: 0 }} aria-label={expanded ? "Collapse" : "Expand"}>
             {expanded ? "▾" : "▸"}
           </button>
           <div>
@@ -2947,8 +2978,8 @@ const WalletCard = ({ wallet, onRemove, onHoldingsLoaded }) => {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           {totalUsd > 0 && <span style={{ color: "#4ade80", fontWeight: 700, fontSize: 14 }}>{formatVolume(totalUsd)}</span>}
-          <button onClick={refetch} title="Refresh" style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 14 }}>↺</button>
-          <button onClick={() => onRemove(wallet.address)} title="Remove wallet" style={{ background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 14 }}>✕</button>
+          <button onClick={refetch} title="Refresh" aria-label="Refresh holdings" style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 14 }}>↺</button>
+          <button onClick={() => setConfirmingRemove(true)} title="Remove wallet" aria-label="Remove wallet" style={{ background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 14 }}>✕</button>
         </div>
       </div>
 
@@ -2961,6 +2992,22 @@ const WalletCard = ({ wallet, onRemove, onHoldingsLoaded }) => {
           )}
           {holdings.map((h, i) => <WalletHoldingRow key={i} holding={h} />)}
         </>
+      )}
+
+      {/* Confirm remove dialog */}
+      {confirmingRemove && (
+        <div className="confirm-overlay" onClick={() => setConfirmingRemove(false)}>
+          <div className="confirm-box" onClick={(e) => e.stopPropagation()}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: "#f1f5f9", marginBottom: 8 }}>Remove wallet?</div>
+            <div style={{ fontSize: 12, color: "#64748b", marginBottom: 16, lineHeight: 1.5 }}>
+              This will stop tracking <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{wallet.label || truncateAddr(wallet.address)}</span>. You can re-add it later.
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button onClick={() => setConfirmingRemove(false)} style={{ padding: "7px 16px", borderRadius: 8, border: "1px solid #334155", background: "transparent", color: "#94a3b8", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Cancel</button>
+              <button onClick={() => { setConfirmingRemove(false); onRemove(wallet.address); }} style={{ padding: "7px 16px", borderRadius: 8, border: "1px solid #f8717144", background: "#f8717122", color: "#f87171", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Remove</button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -4061,6 +4108,22 @@ export default function App() {
   const [showAddCA, setShowAddCA] = useState(false);
   const [showAddWallet, setShowAddWallet] = useState(false);
 
+  // ── Keyboard shortcuts ──
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.key === "Escape") {
+        // Close any open panel
+        if (showAddCA) { setShowAddCA(false); e.preventDefault(); return; }
+        if (showAddWallet) { setShowAddWallet(false); e.preventDefault(); return; }
+        // Close confirm dialogs via click on overlay
+        const overlay = document.querySelector(".confirm-overlay");
+        if (overlay) { overlay.click(); e.preventDefault(); }
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [showAddCA, showAddWallet]);
+
   // Wallet Monitor — discovers wallets from pinned CA token transactions
   const monitor = useWalletMonitor(pinnedCAs, tokens);
 
@@ -4405,7 +4468,9 @@ export default function App() {
           </div>
 
           {!tokenLoading && filteredTokens.length === 0 && !tokenError && (
-            <div style={{ textAlign: "center", color: "#475569", padding: 48, fontSize: 14 }}>No trending tokens found for this chain right now.</div>
+            <div className="animate-in" style={{ textAlign: "center", color: "#475569", padding: 48, fontSize: 14 }}>
+              No trending tokens found for this chain right now. Try adjusting your filters or switching chains.
+            </div>
           )}
         </>
       )}
@@ -4445,12 +4510,53 @@ export default function App() {
           {showAddWallet && <AddWalletPanel onAdd={addWallet} onClose={() => setShowAddWallet(false)} />}
 
           {wallets.length === 0 && !showAddWallet && (
-            <div style={{ textAlign: "center", color: "#475569", padding: 64, fontSize: 14, border: "1px dashed #1e293b", borderRadius: 14 }}>
+            <div className="animate-in" style={{ textAlign: "center", color: "#475569", padding: 64, fontSize: 14, border: "1px dashed #1e293b", borderRadius: 14 }}>
               <div style={{ fontSize: 32, marginBottom: 12 }}>👜</div>
               <div style={{ fontWeight: 600, marginBottom: 6, color: "#64748b" }}>No wallets tracked yet</div>
-              <div>Add a Solana wallet address to see its token positions</div>
+              <div style={{ marginBottom: 16 }}>Add a Solana wallet address to see its token positions</div>
+              <button
+                onClick={() => setShowAddWallet(true)}
+                style={{ padding: "8px 20px", borderRadius: 8, border: "1px solid #4ade8044", background: "#4ade8011", color: "#4ade80", fontSize: 13, fontWeight: 700, cursor: "pointer" }}
+              >
+                + Add Your First Wallet
+              </button>
             </div>
           )}
+
+          {/* ── Portfolio Summary ── */}
+          {wallets.length > 0 && (() => {
+            const allEntries = Object.values(walletMintMap).flat();
+            const totalValue = allEntries.reduce((sum, h) => sum + (h.usdValue || 0), 0);
+            const uniqueTokens = new Set(Object.keys(walletMintMap)).size;
+            return (
+              <div className="animate-in" style={{ background: "linear-gradient(135deg, #111827 0%, #0d1321 100%)", border: "1px solid #1e293b", borderRadius: 14, padding: "18px 24px", marginBottom: 16 }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+                  <div>
+                    <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8, color: "#475569", marginBottom: 4 }}>Total Portfolio Value</div>
+                    <div style={{ fontSize: 28, fontWeight: 800, color: totalValue > 0 ? "#4ade80" : "#64748b", letterSpacing: -0.5 }}>
+                      {totalValue > 0 ? formatVolume(totalValue) : "—"}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 20 }}>
+                    <div style={{ textAlign: "center" }}>
+                      <div style={{ fontSize: 18, fontWeight: 800, color: "#e2e8f0" }}>{wallets.length}</div>
+                      <div style={{ fontSize: 10, color: "#475569", fontWeight: 600 }}>wallet{wallets.length !== 1 ? "s" : ""}</div>
+                    </div>
+                    <div style={{ textAlign: "center" }}>
+                      <div style={{ fontSize: 18, fontWeight: 800, color: "#818cf8" }}>{uniqueTokens}</div>
+                      <div style={{ fontSize: 10, color: "#475569", fontWeight: 600 }}>token{uniqueTokens !== 1 ? "s" : ""}</div>
+                    </div>
+                    {relatedWalletList.length > 0 && (
+                      <div style={{ textAlign: "center" }}>
+                        <div style={{ fontSize: 18, fontWeight: 800, color: "#f59e0b" }}>{relatedWalletList.length}</div>
+                        <div style={{ fontSize: 10, color: "#475569", fontWeight: 600 }}>related</div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
 
           <WalletGraph wallets={wallets} links={walletLinks} loading={walletLinksLoading} onRescan={rescanWalletLinks} />
 
