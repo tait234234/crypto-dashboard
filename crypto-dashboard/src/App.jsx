@@ -377,6 +377,7 @@ function useWalletTokens(address) {
   const [holdings, setHoldings] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [lastFetchedAt, setLastFetchedAt] = useState(null);
 
   const fetch_ = useCallback(async () => {
     if (!address) return;
@@ -450,6 +451,7 @@ function useWalletTokens(address) {
         .slice(0, 50);
 
       setHoldings(enriched);
+      setLastFetchedAt(new Date());
     } catch (err) {
       setError(err.message);
     } finally {
@@ -458,7 +460,7 @@ function useWalletTokens(address) {
   }, [address]);
 
   useEffect(() => { fetch_(); }, [fetch_]);
-  return { holdings, loading, error, refetch: fetch_ };
+  return { holdings, loading, error, lastFetchedAt, refetch: fetch_ };
 }
 
 // ─── Token Holders Hook (Solana RPC) ───
@@ -762,6 +764,16 @@ function getBubbleMapsUrl(chainId, ca) {
 function truncateAddr(addr) {
   if (!addr) return "";
   return addr.slice(0, 6) + "…" + addr.slice(-4);
+}
+
+function timeAgo(date) {
+  if (!date) return null;
+  const s = Math.floor((Date.now() - date.getTime()) / 1000);
+  if (s < 15)  return "just now";
+  if (s < 60)  return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60)  return `${m}m ago`;
+  return `${Math.floor(m / 60)}h ago`;
 }
 
 function getGreeting() {
@@ -2899,7 +2911,7 @@ function RelatedWallets({ relatedWallets, fundingWallets = [], trackedAddrs, loa
 }
 
 // ─── Wallet Card ───
-const WalletHoldingRow = ({ holding }) => {
+const WalletHoldingRow = ({ holding, allocPct, onPin, isPinned }) => {
   const { pair, amount, mint } = holding;
   const symbol = pair.baseToken?.symbol || "???";
   const name = pair.baseToken?.name || "Unknown";
@@ -2909,9 +2921,11 @@ const WalletHoldingRow = ({ holding }) => {
   const iconUrl = pair.icon || pair.info?.imageUrl || null;
   const dexUrl = pair.url || `https://dexscreener.com/${pair.chainId}/${pair.pairAddress}`;
   const bubbleMapsUrl = getBubbleMapsUrl(pair.chainId, mint);
+  const ch24 = pair?.priceChange?.h24;
 
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 0", borderBottom: "1px solid #1e293b" }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 0", borderBottom: "1px solid #1e293b" }}>
+      {/* Token icon */}
       <div style={{ position: "relative", width: 32, height: 32, flexShrink: 0 }}>
         {iconUrl && (
           <img src={iconUrl} alt={symbol} style={{ width: 32, height: 32, borderRadius: 8, border: "1px solid #ffffff11", objectFit: "cover", position: "absolute", top: 0, left: 0 }} onError={(e) => { e.target.style.display = "none"; }} />
@@ -2920,51 +2934,109 @@ const WalletHoldingRow = ({ holding }) => {
           {symbol.slice(0, 2)}
         </div>
       </div>
+
+      {/* Symbol + name */}
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <span style={{ color: "#f1f5f9", fontWeight: 700, fontSize: 13 }}>{symbol}</span>
           <ChainBadge chain={chain} />
+          {Number.isFinite(allocPct) && allocPct >= 1 && (
+            <span style={{ fontSize: 9, color: "#475569", fontWeight: 600 }}>{allocPct.toFixed(0)}%</span>
+          )}
         </div>
         <div style={{ color: "#64748b", fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</div>
       </div>
+
+      {/* Value + change */}
       <div style={{ textAlign: "right", flexShrink: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 6, justifyContent: "flex-end" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 5, justifyContent: "flex-end" }}>
           <span style={{ color: "#f1f5f9", fontSize: 13, fontWeight: 600 }}>{usdValue >= 0.01 ? formatVolume(usdValue) : "< $0.01"}</span>
-          {Number.isFinite(pair?.priceChange?.h24) && (
-            <span style={{ fontSize: 10, fontWeight: 700, color: pair.priceChange.h24 >= 0 ? "#4ade80" : "#f87171", background: pair.priceChange.h24 >= 0 ? "#4ade8011" : "#f8717111", padding: "1px 5px", borderRadius: 4, whiteSpace: "nowrap" }}>
-              {pair.priceChange.h24 >= 0 ? "+" : ""}{pair.priceChange.h24.toFixed(1)}%
+          {Number.isFinite(ch24) && (
+            <span style={{ fontSize: 10, fontWeight: 700, color: ch24 >= 0 ? "#4ade80" : "#f87171", background: ch24 >= 0 ? "#4ade8011" : "#f8717111", padding: "1px 4px", borderRadius: 4, whiteSpace: "nowrap" }}>
+              {ch24 >= 0 ? "+" : ""}{ch24.toFixed(1)}%
             </span>
           )}
         </div>
-        <div style={{ color: "#64748b", fontSize: 11 }}>{formatTokenAmount(amount)}</div>
+        <div style={{ color: "#64748b", fontSize: 11 }}>{formatTokenAmount(amount)} · {formatPrice(price)}</div>
       </div>
-      <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
-        <a href={dexUrl} target="_blank" rel="noopener noreferrer" title="DexScreener" style={{ width: 26, height: 26, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", display: "flex", alignItems: "center", justifyContent: "center", textDecoration: "none", fontSize: 12, color: "#94a3b8" }}>↗</a>
+
+      {/* Action buttons */}
+      <div style={{ display: "flex", gap: 3, flexShrink: 0 }}>
+        {onPin && (
+          <button
+            onClick={() => onPin(mint, pair.chainId || "solana")}
+            title={isPinned ? "Already pinned" : "Pin token to Discover tab"}
+            aria-label={isPinned ? "Pinned" : "Pin token"}
+            style={{ width: 26, height: 26, borderRadius: 5, background: isPinned ? "#6366f122" : "#1e293b", border: `1px solid ${isPinned ? "#6366f144" : "#334155"}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: isPinned ? "#818cf8" : "#64748b", cursor: isPinned ? "default" : "pointer" }}
+          >
+            {isPinned ? "✓" : "📌"}
+          </button>
+        )}
+        <a href={dexUrl} target="_blank" rel="noopener noreferrer" title="View on DexScreener" style={{ width: 26, height: 26, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", display: "flex", alignItems: "center", justifyContent: "center", textDecoration: "none", fontSize: 12, color: "#94a3b8" }}>↗</a>
         <a href={bubbleMapsUrl} target="_blank" rel="noopener noreferrer" title="BubbleMaps" style={{ width: 26, height: 26, borderRadius: 5, background: "#1e293b", border: "1px solid #334155", display: "flex", alignItems: "center", justifyContent: "center", textDecoration: "none", fontSize: 12, color: "#60a5fa" }}>🫧</a>
       </div>
     </div>
   );
 };
 
-const WalletCard = ({ wallet, onRemove, onHoldingsLoaded }) => {
-  const { holdings, loading, error, refetch } = useWalletTokens(wallet.address);
-  const [expanded, setExpanded] = useState(true);
-  const [confirmingRemove, setConfirmingRemove] = useState(false);
+const WALLET_SORTS = [
+  { key: "value",  label: "Value"  },
+  { key: "change", label: "24h %"  },
+  { key: "name",   label: "Name"   },
+];
 
-  // Report loaded holdings back to parent so it can build the mint → wallets map
+const WalletCard = ({ wallet, onRemove, onHoldingsLoaded, pinnedMints, onPin }) => {
+  const { holdings, loading, error, lastFetchedAt, refetch } = useWalletTokens(wallet.address);
+  const [expanded, setExpanded]         = useState(true);
+  const [confirmingRemove, setConfirming] = useState(false);
+  const [sort, setSort]                 = useState("value"); // value | change | name
+  const [search, setSearch]             = useState("");
+  const [showSearch, setShowSearch]     = useState(false);
+
+  // Tick every 30s so "X ago" stays fresh
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 30000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Report loaded holdings back to parent for the mint→wallets map
   useEffect(() => {
     if (!loading && !error && holdings.length > 0) {
       onHoldingsLoaded?.(wallet.address, wallet.label || "", holdings);
     }
   }, [holdings, loading, error, wallet.address, wallet.label, onHoldingsLoaded]);
 
-  const totalUsd = holdings.reduce((sum, h) => {
-    const price = h.pair?.priceUsd ? parseFloat(h.pair.priceUsd) : 0;
-    return sum + price * h.amount;
-  }, 0);
+  const totalUsd = useMemo(
+    () => holdings.reduce((s, h) => s + (parseFloat(h.pair?.priceUsd || 0) * h.amount), 0),
+    [holdings]
+  );
+
+  // Sorted + filtered view of holdings
+  const displayed = useMemo(() => {
+    let list = holdings;
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      list = list.filter((h) => {
+        const sym  = (h.pair?.baseToken?.symbol || "").toLowerCase();
+        const name = (h.pair?.baseToken?.name   || "").toLowerCase();
+        return sym.includes(q) || name.includes(q);
+      });
+    }
+    if (sort === "value")  return [...list].sort((a, b) => {
+      const uA = parseFloat(a.pair?.priceUsd || 0) * a.amount;
+      const uB = parseFloat(b.pair?.priceUsd || 0) * b.amount;
+      return uB - uA;
+    });
+    if (sort === "change") return [...list].sort((a, b) => (b.pair?.priceChange?.h24 ?? -999) - (a.pair?.priceChange?.h24 ?? -999));
+    if (sort === "name")   return [...list].sort((a, b) => (a.pair?.baseToken?.symbol || "").localeCompare(b.pair?.baseToken?.symbol || ""));
+    return list;
+  }, [holdings, sort, search]);
 
   return (
     <div className="card-hover animate-in" style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 14, padding: "16px 20px", marginBottom: 12 }}>
+
+      {/* ── Header ── */}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: expanded ? 12 : 0 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <button onClick={() => setExpanded(!expanded)} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 14, padding: 0 }} aria-label={expanded ? "Collapse" : "Expand"}>
@@ -2972,39 +3044,139 @@ const WalletCard = ({ wallet, onRemove, onHoldingsLoaded }) => {
           </button>
           <div>
             {wallet.label && <div style={{ color: "#f1f5f9", fontWeight: 600, fontSize: 14 }}>{wallet.label}</div>}
-            <div style={{ color: "#64748b", fontSize: 12, fontFamily: "monospace" }} title={wallet.address}>{truncateAddr(wallet.address)}</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ color: "#64748b", fontSize: 12, fontFamily: "monospace", cursor: "pointer" }} title={wallet.address} onClick={() => copyAddr(wallet.address)}>
+                {truncateAddr(wallet.address)}
+              </span>
+              {lastFetchedAt && !loading && (
+                <span style={{ fontSize: 10, color: "#334155" }}>{timeAgo(lastFetchedAt)}</span>
+              )}
+            </div>
           </div>
           <span style={{ background: "#9945FF22", color: "#c084fc", border: "1px solid #9945FF44", fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, fontFamily: "monospace" }}>SOL</span>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           {totalUsd > 0 && <span style={{ color: "#4ade80", fontWeight: 700, fontSize: 14 }}>{formatVolume(totalUsd)}</span>}
-          <button onClick={refetch} title="Refresh" aria-label="Refresh holdings" style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 14 }}>↺</button>
-          <button onClick={() => setConfirmingRemove(true)} title="Remove wallet" aria-label="Remove wallet" style={{ background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 14 }}>✕</button>
+          {/* Search toggle */}
+          {holdings.length > 5 && (
+            <button
+              onClick={() => { setShowSearch((v) => !v); if (showSearch) setSearch(""); }}
+              aria-label="Search holdings"
+              title="Search holdings"
+              style={{ background: showSearch ? "#6366f122" : "none", border: showSearch ? "1px solid #6366f144" : "none", borderRadius: 5, color: showSearch ? "#818cf8" : "#64748b", cursor: "pointer", fontSize: 13, padding: "2px 6px" }}
+            >
+              🔍
+            </button>
+          )}
+          <button onClick={refetch} title="Refresh" aria-label="Refresh holdings" style={{ background: "none", border: "none", color: loading ? "#6366f1" : "#64748b", cursor: loading ? "default" : "pointer", fontSize: 14, animation: loading ? "spin 0.8s linear infinite" : "none" }}>↺</button>
+          <button onClick={() => setConfirming(true)} title="Remove wallet" aria-label="Remove wallet" style={{ background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 14 }}>✕</button>
         </div>
       </div>
 
       {expanded && (
         <>
-          {loading && <div style={{ color: "#475569", fontSize: 13, textAlign: "center", padding: 16 }}>Loading holdings…</div>}
-          {error && <div style={{ color: "#fca5a5", fontSize: 13, padding: 8 }}>⚠ {error}</div>}
-          {!loading && !error && holdings.length === 0 && (
-            <div style={{ color: "#475569", fontSize: 13, textAlign: "center", padding: 16 }}>No tradeable tokens found. Only tokens listed on DexScreener are shown.</div>
+          {/* Search + Sort controls */}
+          {(showSearch || sort !== "value") && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+              {showSearch && (
+                <input
+                  autoFocus
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Search tokens…"
+                  style={{ flex: 1, background: "#0d1321", border: "1px solid #334155", borderRadius: 7, color: "#e2e8f0", fontSize: 12, padding: "6px 10px", outline: "none" }}
+                />
+              )}
+              <div style={{ display: "flex", gap: 3, marginLeft: "auto", flexShrink: 0 }}>
+                {WALLET_SORTS.map((s) => (
+                  <button
+                    key={s.key}
+                    onClick={() => setSort(s.key)}
+                    style={{ padding: "3px 9px", borderRadius: 5, border: "1px solid #334155", background: sort === s.key ? "#6366f122" : "transparent", color: sort === s.key ? "#818cf8" : "#64748b", fontSize: 11, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}
+                  >
+                    {s.label}
+                  </button>
+                ))}
+              </div>
+            </div>
           )}
-          {holdings.map((h, i) => <WalletHoldingRow key={i} holding={h} />)}
+
+          {/* Default sort tab strip (only when search not open) */}
+          {!showSearch && sort === "value" && holdings.length > 1 && (
+            <div style={{ display: "flex", gap: 3, marginBottom: 10, justifyContent: "flex-end" }}>
+              {WALLET_SORTS.map((s) => (
+                <button
+                  key={s.key}
+                  onClick={() => setSort(s.key)}
+                  style={{ padding: "3px 9px", borderRadius: 5, border: "1px solid #334155", background: sort === s.key ? "#6366f122" : "transparent", color: sort === s.key ? "#818cf8" : "#64748b", fontSize: 11, fontWeight: 600, cursor: "pointer" }}
+                >
+                  {s.label}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Allocation bar — coloured strip showing portfolio breakdown */}
+          {totalUsd > 0 && holdings.length > 1 && (
+            <div style={{ display: "flex", height: 4, borderRadius: 4, overflow: "hidden", marginBottom: 12, gap: 1 }}>
+              {[...holdings]
+                .sort((a, b) => parseFloat(b.pair?.priceUsd || 0) * b.amount - parseFloat(a.pair?.priceUsd || 0) * a.amount)
+                .slice(0, 12)
+                .map((h) => {
+                  const usd = parseFloat(h.pair?.priceUsd || 0) * h.amount;
+                  const pct = totalUsd > 0 ? (usd / totalUsd) * 100 : 0;
+                  const sym = h.pair?.baseToken?.symbol || "?";
+                  return (
+                    <div
+                      key={h.mint}
+                      title={`${sym}: ${pct.toFixed(1)}%`}
+                      style={{ flex: pct, background: hashColor(sym), minWidth: 2, borderRadius: 2 }}
+                    />
+                  );
+                })}
+            </div>
+          )}
+
+          {/* Holdings rows */}
+          {loading && (
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, color: "#475569", fontSize: 13, padding: 16 }}>
+              <div style={{ width: 14, height: 14, border: "2px solid #334155", borderTopColor: "#6366f1", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+              Loading holdings…
+            </div>
+          )}
+          {error && <div style={{ color: "#fca5a5", fontSize: 13, padding: 8 }}>⚠ {error} — <button onClick={refetch} style={{ background: "none", border: "none", color: "#818cf8", cursor: "pointer", fontSize: 13, padding: 0 }}>Retry</button></div>}
+          {!loading && !error && displayed.length === 0 && (
+            <div style={{ color: "#475569", fontSize: 13, textAlign: "center", padding: 16 }}>
+              {search ? `No tokens matching "${search}"` : "No tradeable tokens found. Only tokens listed on DexScreener are shown."}
+            </div>
+          )}
+          {displayed.map((h, i) => {
+            const usd = parseFloat(h.pair?.priceUsd || 0) * h.amount;
+            const allocPct = totalUsd > 0 ? (usd / totalUsd) * 100 : 0;
+            const isPin = pinnedMints?.has(h.mint);
+            return <WalletHoldingRow key={i} holding={h} allocPct={allocPct} onPin={onPin} isPinned={isPin} />;
+          })}
+
+          {!loading && !error && displayed.length > 0 && (
+            <div style={{ paddingTop: 8, fontSize: 10, color: "#334155", textAlign: "right" }}>
+              {displayed.length} token{displayed.length !== 1 ? "s" : ""}
+              {search && ` matching "${search}"`}
+            </div>
+          )}
         </>
       )}
 
       {/* Confirm remove dialog */}
       {confirmingRemove && (
-        <div className="confirm-overlay" onClick={() => setConfirmingRemove(false)}>
+        <div className="confirm-overlay" onClick={() => setConfirming(false)}>
           <div className="confirm-box" onClick={(e) => e.stopPropagation()}>
             <div style={{ fontSize: 14, fontWeight: 700, color: "#f1f5f9", marginBottom: 8 }}>Remove wallet?</div>
             <div style={{ fontSize: 12, color: "#64748b", marginBottom: 16, lineHeight: 1.5 }}>
               This will stop tracking <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{wallet.label || truncateAddr(wallet.address)}</span>. You can re-add it later.
             </div>
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-              <button onClick={() => setConfirmingRemove(false)} style={{ padding: "7px 16px", borderRadius: 8, border: "1px solid #334155", background: "transparent", color: "#94a3b8", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Cancel</button>
-              <button onClick={() => { setConfirmingRemove(false); onRemove(wallet.address); }} style={{ padding: "7px 16px", borderRadius: 8, border: "1px solid #f8717144", background: "#f8717122", color: "#f87171", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Remove</button>
+              <button onClick={() => setConfirming(false)} style={{ padding: "7px 16px", borderRadius: 8, border: "1px solid #334155", background: "transparent", color: "#94a3b8", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Cancel</button>
+              <button onClick={() => { setConfirming(false); onRemove(wallet.address); }} style={{ padding: "7px 16px", borderRadius: 8, border: "1px solid #f8717144", background: "#f8717122", color: "#f87171", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Remove</button>
             </div>
           </div>
         </div>
@@ -4207,6 +4379,9 @@ export default function App() {
     setPinnedCAs((prev) => prev.filter((p) => p.ca !== ca));
   };
 
+  // Set of CA addresses already pinned — passed down to WalletCard so holdings can show pin state
+  const pinnedMints = useMemo(() => new Set(pinnedCAs.map((p) => p.ca)), [pinnedCAs]);
+
   const addWallet = (address, label) => {
     setWallets((prev) => prev.find((w) => w.address === address) ? prev : [...prev, { address, label }]);
   };
@@ -4228,8 +4403,17 @@ export default function App() {
     activeChain === "Solana" ? t.chainId === "solana" :
     activeChain === "Base"   ? t.chainId === "base"   : true;
 
-  const filteredTokens = applyFilters(tokens.filter(chainFilter));
-  const filteredPinned = applyFilters(pinnedTokens.filter(chainFilter));
+  // Memoised so filter+sort only runs when inputs actually change, not every keystroke.
+  const filteredTokens = useMemo(
+    () => applyFilters(tokens.filter(chainFilter)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [tokens, activeChain, sortBy, sortDir, minVol, minMcap, minChange1h]
+  );
+  const filteredPinned = useMemo(
+    () => applyFilters(pinnedTokens.filter(chainFilter)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [pinnedTokens, activeChain, sortBy, sortDir, minVol, minMcap, minChange1h]
+  );
 
   const coinConfigs = [
     { id: "bitcoin", symbol: "BTC", color: "#F7931A", newsKey: "bitcoin" },
@@ -4572,7 +4756,14 @@ export default function App() {
           />
 
           {wallets.map((wallet) => (
-            <WalletCard key={wallet.address} wallet={wallet} onRemove={removeWallet} onHoldingsLoaded={handleHoldingsLoaded} />
+            <WalletCard
+              key={wallet.address}
+              wallet={wallet}
+              onRemove={removeWallet}
+              onHoldingsLoaded={handleHoldingsLoaded}
+              pinnedMints={pinnedMints}
+              onPin={pinToken}
+            />
           ))}
 
           {wallets.length > 0 && (
