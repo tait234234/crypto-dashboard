@@ -3507,6 +3507,24 @@ const Sparkline = ({ data, volumeData, width = 140, height = 32, color, interact
   );
 };
 
+// ─── Countdown to next token refresh ───
+function CountdownToRefresh({ fetchedAt, interval = 120000 }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  if (!fetchedAt) return null;
+  const remaining = Math.max(0, Math.round((fetchedAt + interval - now) / 1000));
+  const mins = Math.floor(remaining / 60);
+  const secs = String(remaining % 60).padStart(2, "0");
+  return (
+    <span style={{ color: "#334155", fontSize: 11, fontVariantNumeric: "tabular-nums" }}>
+      {remaining > 0 ? `↺ ${mins}:${secs}` : "↺ soon…"}
+    </span>
+  );
+}
+
 // ─── Filter / Sort Bar ───
 const SORT_OPTIONS = [
   { key: "vol",      label: "Vol 24h" },
@@ -3518,7 +3536,7 @@ const SORT_OPTIONS = [
   { key: "age",      label: "Age" },
 ];
 
-const FilterBar = ({ sortBy, sortDir, onSort, minVol, onMinVol, minMcap, onMinMcap, minChange1h, onMinChange1h, count, total }) => (
+const FilterBar = ({ sortBy, sortDir, onSort, minVol, onMinVol, minMcap, onMinMcap, minChange1h, onMinChange1h, count, total, onClear }) => (
   <div style={{ background: "#0d1321", border: "1px solid #1e293b", borderRadius: 10, padding: "10px 14px", marginBottom: 16, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
     {/* Sort pills */}
     <span style={{ color: "#475569", fontSize: 11, fontWeight: 600, letterSpacing: 0.5 }}>SORT</span>
@@ -3573,7 +3591,10 @@ const FilterBar = ({ sortBy, sortDir, onSort, minVol, onMinVol, minMcap, onMinMc
       <span style={{ color: "#475569", fontSize: 11 }}>%</span>
     </label>
 
-    {/* Token count */}
+    {/* Clear filters + token count */}
+    {onClear && (minVol || minMcap || minChange1h) && (
+      <button onClick={onClear} title="Clear all filters" style={{ padding: "3px 9px", borderRadius: 6, border: "1px solid #f8717133", background: "#f8717111", color: "#f87171", fontSize: 11, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>✕ Clear</button>
+    )}
     <span style={{ marginLeft: "auto", color: "#334155", fontSize: 11 }}>{count}{total !== count ? `/${total}` : ""} tokens</span>
   </div>
 );
@@ -4289,7 +4310,7 @@ export default function App() {
 
   const { prices, sparklines, loading: priceLoading, error: priceError } = useCryptoPrices();
   const { articles: newsArticles, loading: newsLoading, error: newsError } = useCryptoNews();
-  const { tokens, loading: tokenLoading, refreshing: tokenRefreshing, fetchedAt: tokenFetchedAt, error: tokenError } = useTrendingTokens(activeChain);
+  const { tokens, loading: tokenLoading, refreshing: tokenRefreshing, fetchedAt: tokenFetchedAt, error: tokenError, refetch: refetchTokens } = useTrendingTokens(activeChain);
 
   // Pinned CAs: [{ca, chainId}]
   const [pinnedCAs, setPinnedCAs] = useState(() => {
@@ -4305,22 +4326,36 @@ export default function App() {
 
   const [showAddCA, setShowAddCA] = useState(false);
   const [showAddWallet, setShowAddWallet] = useState(false);
+  const [showShortcutsHelp, setShowShortcutsHelp] = useState(false);
 
   // ── Keyboard shortcuts ──
   useEffect(() => {
     const handler = (e) => {
+      // Never hijack when user is typing in an input or textarea
+      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
       if (e.key === "Escape") {
-        // Close any open panel
-        if (showAddCA) { setShowAddCA(false); e.preventDefault(); return; }
-        if (showAddWallet) { setShowAddWallet(false); e.preventDefault(); return; }
-        // Close confirm dialogs via click on overlay
+        if (showShortcutsHelp) { setShowShortcutsHelp(false); e.preventDefault(); return; }
+        if (showAddCA)     { setShowAddCA(false);     e.preventDefault(); return; }
+        if (showAddWallet) { setShowAddWallet(false);  e.preventDefault(); return; }
         const overlay = document.querySelector(".confirm-overlay");
         if (overlay) { overlay.click(); e.preventDefault(); }
+        return;
+      }
+      if (e.key === "?") { setShowShortcutsHelp((v) => !v); e.preventDefault(); return; }
+      if (e.metaKey || e.ctrlKey || e.altKey) return; // don't steal browser shortcuts
+      const k = e.key.toLowerCase();
+      if (k === "d") { setActiveSection("discover"); e.preventDefault(); }
+      else if (k === "w") { setActiveSection("wallets");  e.preventDefault(); }
+      else if (k === "m") { setActiveSection("monitor");  e.preventDefault(); }
+      else if (k === "r") { refetchTokens?.(); e.preventDefault(); }
+      else if (k === "n") {
+        if (activeSection === "wallets")  { setShowAddWallet(true); e.preventDefault(); }
+        if (activeSection === "discover") { setShowAddCA(true);     e.preventDefault(); }
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [showAddCA, showAddWallet]);
+  }, [showAddCA, showAddWallet, showShortcutsHelp, activeSection, refetchTokens]);
 
   // Wallet Monitor — discovers wallets from pinned CA token transactions
   const monitor = useWalletMonitor(pinnedCAs, tokens);
@@ -4497,14 +4532,18 @@ export default function App() {
           <span style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase" }}>Market Overview</span>
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
             <LiveIndicator />
-            {tokenRefreshing && (
+            {tokenRefreshing ? (
               <span style={{ color: "#475569", fontSize: 11, display: "flex", alignItems: "center", gap: 4 }}>
                 <span style={{ display: "inline-block", animation: "spin 1s linear infinite" }}>↺</span> Refreshing…
               </span>
+            ) : (
+              <CountdownToRefresh fetchedAt={tokenFetchedAt} />
             )}
-            {lastFetchedAt && !tokenRefreshing && (
-              <span style={{ color: "#334155", fontSize: 11 }}>Updated {lastFetchedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
-            )}
+            <button
+              onClick={() => refetchTokens?.()}
+              title="Refresh trending tokens now (R)"
+              style={{ padding: "3px 8px", borderRadius: 6, border: "1px solid #1e293b", background: "transparent", color: "#334155", fontSize: 12, cursor: "pointer", lineHeight: 1 }}
+            >↺</button>
           </div>
         </div>
 
@@ -4601,6 +4640,7 @@ export default function App() {
             onMinChange1h={setMinChange1h}
             count={filteredTokens.length}
             total={tokens.filter(chainFilter).length}
+            onClear={() => { setMinVol(""); setMinMcap(""); setMinChange1h(""); }}
           />
 
           {/* Pinned tokens */}
@@ -4816,7 +4856,7 @@ export default function App() {
             const pnlKnown = allEntries.some((h) => Number.isFinite(h.priceChange24h));
             const pnlPct = totalValue > 0 ? (dailyPnl / (totalValue - dailyPnl)) * 100 : 0;
 
-            // Top movers: per-token rolled up, sorted by abs 24h change with meaningful value
+            // Token summary: per-token rolled up (used for movers + allocation bar)
             const tokenSummary = {};
             allEntries.forEach((h) => {
               const k = h.symbol || "???";
@@ -4829,6 +4869,14 @@ export default function App() {
               .slice(0, 5);
             const gainers = movers.filter((m) => m.priceChange24h > 0);
             const losers  = movers.filter((m) => m.priceChange24h < 0);
+
+            // Allocation bar: top-6 holdings by value + "Others"
+            const BAR_COLORS = ["#818cf8", "#4ade80", "#f59e0b", "#f87171", "#34d399", "#a78bfa"];
+            const byValue = Object.values(tokenSummary).sort((a, b) => b.usdValue - a.usdValue);
+            const top6 = byValue.slice(0, 6);
+            const othersValue = byValue.slice(6).reduce((s, t) => s + t.usdValue, 0);
+            const barSlices = othersValue > 0 ? [...top6, { symbol: "Others", usdValue: othersValue, icon: null }] : top6;
+            const barTotal = barSlices.reduce((s, t) => s + t.usdValue, 0);
 
             return (
               <div className="animate-in" style={{ background: "linear-gradient(135deg, #111827 0%, #0d1321 100%)", border: "1px solid #1e293b", borderRadius: 14, padding: "18px 24px", marginBottom: 16 }}>
@@ -4867,7 +4915,7 @@ export default function App() {
 
                 {/* Row 2: Top movers */}
                 {movers.length > 0 && (
-                  <div>
+                  <div style={{ marginBottom: barSlices.length > 0 ? 14 : 0 }}>
                     <div style={{ fontSize: 10, fontWeight: 700, color: "#334155", textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 8 }}>Top movers today</div>
                     <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                       {[...gainers.slice(0, 3), ...losers.slice(0, 3)].map((m) => (
@@ -4878,6 +4926,33 @@ export default function App() {
                             {m.priceChange24h >= 0 ? "+" : ""}{m.priceChange24h.toFixed(1)}%
                           </span>
                         </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Row 3: Allocation bar */}
+                {barSlices.length > 1 && barTotal > 0 && (
+                  <div>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: "#334155", textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 8 }}>Allocation</div>
+                    {/* Stacked horizontal bar */}
+                    <div style={{ height: 8, borderRadius: 4, overflow: "hidden", display: "flex", gap: 1, marginBottom: 8 }}>
+                      {barSlices.map((t, i) => (
+                        <div
+                          key={t.symbol}
+                          title={`${t.symbol}: ${formatVolume(t.usdValue)} (${((t.usdValue / barTotal) * 100).toFixed(0)}%)`}
+                          style={{ flex: t.usdValue / barTotal, background: i < BAR_COLORS.length ? BAR_COLORS[i] : "#475569", minWidth: 4 }}
+                        />
+                      ))}
+                    </div>
+                    {/* Legend */}
+                    <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                      {barSlices.map((t, i) => (
+                        <span key={t.symbol} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 10, color: "#64748b" }}>
+                          <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: 2, background: i < BAR_COLORS.length ? BAR_COLORS[i] : "#475569", flexShrink: 0 }} />
+                          <span style={{ color: "#94a3b8", fontWeight: 600 }}>{t.symbol}</span>
+                          <span>{((t.usdValue / barTotal) * 100).toFixed(0)}%</span>
+                        </span>
                       ))}
                     </div>
                   </div>
@@ -4924,9 +4999,44 @@ export default function App() {
         <MonitorPanel pinnedCAs={pinnedCAs} pinnedTokens={pinnedTokens} trendingTokens={tokens} monitor={monitor} />
       )}
 
+      {/* ── Keyboard shortcuts help modal ── */}
+      {showShortcutsHelp && (
+        <div
+          style={{ position: "fixed", inset: 0, background: "#000000cc", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center" }}
+          onClick={() => setShowShortcutsHelp(false)}
+        >
+          <div
+            className="animate-in"
+            style={{ background: "#111827", border: "1px solid #334155", borderRadius: 16, padding: "28px 32px", minWidth: 300, maxWidth: 420 }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
+              <span style={{ fontWeight: 800, fontSize: 15, color: "#f1f5f9" }}>Keyboard Shortcuts</span>
+              <button onClick={() => setShowShortcutsHelp(false)} style={{ background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 0 }}>✕</button>
+            </div>
+            {[
+              ["D", "Switch to Discover tab"],
+              ["W", "Switch to Wallets tab"],
+              ["M", "Switch to Monitor tab"],
+              ["N", "Add wallet / Track CA (tab-sensitive)"],
+              ["R", "Refresh trending tokens now"],
+              ["?", "Toggle this shortcuts panel"],
+              ["Esc", "Close any open panel or dialog"],
+            ].map(([key, desc]) => (
+              <div key={key} style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 12 }}>
+                <kbd style={{ background: "#1e293b", border: "1px solid #334155", borderRadius: 6, padding: "3px 10px", fontFamily: "monospace", fontSize: 12, color: "#94a3b8", minWidth: 32, textAlign: "center", flexShrink: 0 }}>{key}</kbd>
+                <span style={{ color: "#64748b", fontSize: 13 }}>{desc}</span>
+              </div>
+            ))}
+            <div style={{ marginTop: 16, fontSize: 11, color: "#334155", textAlign: "center" }}>Shortcuts disabled while typing in an input</div>
+          </div>
+        </div>
+      )}
+
       <div className="gradient-divider" style={{ marginTop: 40, marginBottom: 16 }} />
-      <div style={{ textAlign: "center", color: "#1e293b", fontSize: 11, paddingBottom: 24, letterSpacing: 0.5 }}>
-        CryptoDawn • Prices via CoinGecko • Tokens via GeckoTerminal • Auto-refreshes every 2 min
+      <div style={{ textAlign: "center", color: "#1e293b", fontSize: 11, paddingBottom: 24, letterSpacing: 0.5, display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
+        <span>CryptoDawn • Prices via CoinGecko • Tokens via GeckoTerminal • Auto-refreshes every 2 min</span>
+        <button onClick={() => setShowShortcutsHelp(true)} title="Keyboard shortcuts (?)" style={{ background: "#1e293b", border: "1px solid #1e293b", borderRadius: 6, color: "#334155", fontSize: 11, cursor: "pointer", padding: "2px 7px", fontFamily: "monospace" }}>?</button>
       </div>
     </div>
   );
