@@ -3098,7 +3098,7 @@ const WALLET_SORTS = [
   { key: "name",   label: "Name"   },
 ];
 
-const WalletCard = memo(({ wallet, onRemove, onHoldingsLoaded, pinnedMints, onPin, onUpdateLabel, compact = false, walletStats, note = "", onNoteChange, externalSearch = "" }) => {
+const WalletCard = memo(({ wallet, onRemove, onHoldingsLoaded, pinnedMints, onPin, onUpdateLabel, compact = false, walletStats, note = "", onNoteChange, externalSearch = "", expansionSignal }) => {
   const { holdings, loading, error, lastFetchedAt, refetch } = useWalletTokens(wallet.address);
   const [expanded, setExpanded]         = useState(true);
   const [confirmingRemove, setConfirming] = useState(false);
@@ -3127,6 +3127,11 @@ const WalletCard = memo(({ wallet, onRemove, onHoldingsLoaded, pinnedMints, onPi
   useEffect(() => {
     if (externalSearch.trim()) setExpanded(true);
   }, [externalSearch]);
+
+  // Respond to expand/collapse-all signal from parent
+  useEffect(() => {
+    if (expansionSignal && expansionSignal.v > 0) setExpanded(expansionSignal.expanded);
+  }, [expansionSignal?.v]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const totalUsd = useMemo(
     () => holdings.reduce((s, h) => s + (parseFloat(h.pair?.priceUsd || 0) * h.amount), 0),
@@ -4612,6 +4617,7 @@ export default function App() {
       if (k === "d") { setActiveSection("discover"); window.scrollTo({ top: 0, behavior: "smooth" }); e.preventDefault(); }
       else if (k === "w") { setActiveSection("wallets");  window.scrollTo({ top: 0, behavior: "smooth" }); e.preventDefault(); }
       else if (k === "m") { setActiveSection("monitor");  window.scrollTo({ top: 0, behavior: "smooth" }); e.preventDefault(); }
+      else if (k === "g") { setActiveSection("guide");   window.scrollTo({ top: 0, behavior: "smooth" }); e.preventDefault(); }
       else if (k === "r") { refetchTokens?.(); e.preventDefault(); }
       else if (k === "n") {
         if (activeSection === "wallets")  { setShowAddWallet(true); e.preventDefault(); }
@@ -4677,7 +4683,7 @@ export default function App() {
       return alert;
     });
     if (changed) setPriceAlerts(updated);
-  }, [tokens, pinnedTokens]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [tokens, pinnedTokens, priceAlerts]); // priceAlerts included so new alerts are checked immediately
 
   const addPriceAlert = useCallback((ca, chainId, symbol, targetPrice, direction) => {
     setPriceAlerts((prev) => {
@@ -4715,7 +4721,13 @@ export default function App() {
 
   // ── Alerts panel + wallet import ──
   const [showAlertsPanel, setShowAlertsPanel] = useState(false);
+  // Auto-close the alerts panel when there are no alerts left
+  useEffect(() => {
+    if (!priceAlerts.length) setShowAlertsPanel(false);
+  }, [priceAlerts.length]);
   const [holdingsSearch, setHoldingsSearch] = useState("");
+  // { v: number, expanded: bool } — increment v to broadcast expand/collapse to all WalletCards
+  const [walletExpansionSignal, setWalletExpansionSignal] = useState({ v: 0, expanded: true });
   const importFileRef = useRef(null);
 
   const handleWalletImport = useCallback((e) => {
@@ -5057,6 +5069,7 @@ export default function App() {
             { key: "discover", label: "🔥 Discover" },
             { key: "wallets",  label: `👜 Wallets${wallets.length > 0 ? ` (${wallets.length})` : ""}` },
             { key: "monitor",  label: `📡 Monitor${monitor.alerts.length > 0 ? ` (${monitor.alerts.length})` : ""}` },
+            { key: "guide",    label: "📖 Guide" },
           ].map((s) => (
             <button
               key={s.key}
@@ -5281,6 +5294,17 @@ export default function App() {
                     <button key={v} onClick={() => setWalletView(v)} title={title} style={{ padding: "4px 10px", borderRadius: 6, border: "none", background: walletView === v ? "#334155" : "transparent", color: walletView === v ? "#e2e8f0" : "#475569", fontSize: 14, cursor: "pointer", lineHeight: 1 }}>{icon}</button>
                   ))}
                 </div>
+              )}
+
+              {/* Expand / collapse all */}
+              {wallets.length > 1 && walletView === "cards" && (
+                <button
+                  onClick={() => setWalletExpansionSignal((s) => ({ v: s.v + 1, expanded: !s.expanded }))}
+                  title={walletExpansionSignal.expanded ? "Collapse all wallet cards" : "Expand all wallet cards"}
+                  style={{ padding: "4px 10px", borderRadius: 8, border: "1px solid #334155", background: "transparent", color: "#475569", fontSize: 12, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}
+                >
+                  {walletExpansionSignal.expanded ? "⊟ Collapse all" : "⊞ Expand all"}
+                </button>
               )}
 
               {/* Sort toggle: Added / Value */}
@@ -5564,6 +5588,7 @@ export default function App() {
                     note={walletNotes[wallet.address] || ""}
                     onNoteChange={(n) => updateWalletNote(wallet.address, n)}
                     externalSearch={holdingsSearch.trim()}
+                    expansionSignal={walletExpansionSignal}
                   />
                 ))}
                 {q && visibleWallets.length === 0 && (
@@ -5588,6 +5613,136 @@ export default function App() {
         <MonitorPanel pinnedCAs={pinnedCAs} pinnedTokens={pinnedTokens} trendingTokens={tokens} monitor={monitor} />
       )}
 
+      {/* ─── Guide Section ─── */}
+      {activeSection === "guide" && (() => {
+        const S = ({ children, color = "#818cf8" }) => (
+          <span style={{ color, fontWeight: 700 }}>{children}</span>
+        );
+        const Kbd = ({ children }) => (
+          <kbd style={{ background: "#1e293b", border: "1px solid #334155", borderRadius: 5, padding: "1px 7px", fontFamily: "monospace", fontSize: 11, color: "#94a3b8" }}>{children}</kbd>
+        );
+        const Badge = ({ children, color = "#6366f1" }) => (
+          <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", background: `${color}22`, border: `1px solid ${color}55`, borderRadius: 6, padding: "2px 8px", fontSize: 12, fontWeight: 700, color, margin: "0 2px" }}>{children}</span>
+        );
+        const Section = ({ icon, title, color, children }) => (
+          <div style={{ background: "#111827", border: `1px solid ${color}33`, borderRadius: 14, padding: "20px 24px", marginBottom: 16 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, borderBottom: `1px solid ${color}22`, paddingBottom: 12 }}>
+              <span style={{ fontSize: 20 }}>{icon}</span>
+              <span style={{ fontSize: 14, fontWeight: 800, color, letterSpacing: 0.5, textTransform: "uppercase" }}>{title}</span>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>{children}</div>
+          </div>
+        );
+        const Row = ({ icon, label, desc }) => (
+          <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+            <span style={{ fontSize: 16, flexShrink: 0, width: 22, textAlign: "center", marginTop: 1 }}>{icon}</span>
+            <div>
+              <span style={{ fontSize: 12, fontWeight: 700, color: "#e2e8f0" }}>{label}</span>
+              {desc && <span style={{ fontSize: 12, color: "#64748b" }}> — {desc}</span>}
+            </div>
+          </div>
+        );
+        const Tip = ({ children }) => (
+          <div style={{ display: "flex", gap: 10, alignItems: "flex-start", background: "#0d1321", border: "1px solid #1e293b", borderRadius: 8, padding: "10px 14px" }}>
+            <span style={{ fontSize: 14, flexShrink: 0 }}>💡</span>
+            <span style={{ fontSize: 12, color: "#64748b", lineHeight: 1.6 }}>{children}</span>
+          </div>
+        );
+        return (
+          <div className="animate-in" style={{ maxWidth: 760, margin: "0 auto" }}>
+            {/* Header */}
+            <div style={{ marginBottom: 28 }}>
+              <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#818cf8", margin: "0 0 6px" }}>📖 CryptoDawn Guide</h2>
+              <p style={{ color: "#475569", fontSize: 13, margin: 0 }}>
+                Everything runs locally in your browser — no logins, no servers, no wallet connections required.
+              </p>
+            </div>
+
+            <Section icon="🔥" title="Discover" color="#f59e0b">
+              <Row icon="📋" label="Trending tokens" desc="Auto-fetched from GeckoTerminal every 60 seconds. Filter by chain with the buttons at the top right." />
+              <Row icon="🔍" label="Token search" desc="Type to filter by symbol, name, or contract address. Press / to jump straight to the search box." />
+              <Row icon="📌" label="Pin a token" desc="Click the 🔖 bookmark icon on any card. Pinned tokens appear at the top and keep refreshing even if they fall off trending." />
+              <Row icon="🔔" label="Price alerts" desc="Click the 🔔 bell on any card. Set a target price (above or below). A toast fires the moment the price crosses. Manage all alerts from the bell icon in the header." />
+              <Row icon="📈" label="Mini chart" desc="Click 📈 to expand a 1H/12H/1D price or market-cap chart built from live OHLCV data." />
+              <Row icon="👥" label="Holder analysis" desc="Click 👥 (Solana only) to see the top 20 holder accounts, their share of supply, and a concentration bar. Whale-heavy tokens (top 10 > 60%) are flagged red." />
+              <Row icon="🫧" label="BubbleMaps" desc="Click 🫧 to open the token on BubbleMaps for cluster analysis." />
+              <Row icon="DS" label="DexScreener" desc="Click DS to open the token's DexScreener page in a new tab." />
+              <Row icon="📝" label="Token notes" desc="Pinned tokens have a notes textarea at the bottom. Write entry targets, risk notes, anything. Auto-saved." />
+              <Row icon="➕" label="Track a custom CA" desc="Press N (or click + Track CA) to pin any token by contract address directly, even before it's trending." />
+              <Tip>Pin your watchlist first, then check the 👜 badge on each card — it shows how many of your tracked wallets hold that token.</Tip>
+            </Section>
+
+            <Section icon="👜" title="Wallets" color="#4ade80">
+              <Row icon="➕" label="Add a wallet" desc="Press N, paste any Solana or EVM address. Holdings load automatically with live USD values." />
+              <Row icon="📥" label="Import wallets" desc="Click ↑ Import to load a JSON file. Accepts arrays of addresses or {address, label} objects — including exports from this app." />
+              <Row icon="📤" label="Export" desc="↓ CSV exports all token positions across all wallets. ↓ JSON exports your wallet list for backup or sharing." />
+              <Row icon="🔍" label="Cross-wallet search" desc="Type in the search bar above the wallet list to filter by token symbol, mint address, or wallet label/address. All matching cards auto-expand." />
+              <Row icon="📝" label="Wallet notes" desc="Expand any wallet card — there's a freeform notes area at the bottom. Auto-saved per wallet address." />
+              <Row icon="✏️" label="Wallet labels" desc="Click the wallet label (or 'Add label') to rename it inline. Press Enter or click away to save." />
+              <Row icon="↕" label="Sort & view" desc="Sort wallets by value or by added order. Toggle between card view and compact list view with the ⊞/≡ buttons." />
+              <Row icon="📊" label="Portfolio summary" desc="Appears above your wallet list. Shows total value, 24h P&L, top movers, allocation bar, sparkline history, and a per-wallet breakdown." />
+              <Tip>Use '/' to jump to the search box and type a token symbol to instantly find which of your wallets hold it — all matching cards expand automatically.</Tip>
+            </Section>
+
+            <Section icon="📡" title="Monitor" color="#f59e0b">
+              <Row icon="🔭" label="What it does" desc="Scans the on-chain transactions of your pinned tokens and discovers wallets that traded them recently." />
+              <Row icon="▶️" label="Scan Now" desc="Click Scan Now to trigger a manual scan. The monitor looks for fresh wallets (new to trading) and dormant wallets (suddenly active)." />
+              <Row icon="⚙️" label="Settings" desc="Configure which chains to scan, how many transactions to analyze, and alert thresholds." />
+              <Row icon="🚨" label="Alerts" desc="Discovered wallets appear as alerts — you can inspect them, track them directly, or dismiss." />
+              <Tip>Combine Monitor with Wallets: when Monitor finds an interesting whale wallet, click Track to add it — then see its full holdings in the Wallets tab.</Tip>
+            </Section>
+
+            <Section icon="🔔" title="Price Alerts" color="#f59e0b">
+              <Row icon="1️⃣" label="Set an alert" desc="Click 🔔 on any token card → choose 'above' or 'below' → enter your target price → click Set." />
+              <Row icon="2️⃣" label="Alert fires" desc="When the token price crosses your target, a toast notification appears immediately. The alert is marked ✓ triggered." />
+              <Row icon="3️⃣" label="Manage alerts" desc="Click the 🔔 bell in the top-right of the header to open the alerts panel. Per-alert dismiss, 'Clear triggered', or 'Clear all'." />
+              <Tip>Alerts are checked every time price data refreshes (~60 seconds). For best results, pin the token so its price data stays current even off trending.</Tip>
+            </Section>
+
+            <Section icon="⌨️" title="Keyboard Shortcuts" color="#818cf8">
+              {[
+                ["D", "Switch to Discover"],
+                ["W", "Switch to Wallets"],
+                ["M", "Switch to Monitor"],
+                ["G", "Switch to Guide (this page)"],
+                ["N", "Add wallet (Wallets tab) or Track CA (Discover tab)"],
+                ["R", "Refresh trending token data now"],
+                ["/", "Focus the search bar for the current tab"],
+                ["?", "Toggle the keyboard shortcuts modal"],
+                ["Esc", "Close any open panel or dialog"],
+              ].map(([key, desc]) => (
+                <div key={key} style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                  <Kbd>{key}</Kbd>
+                  <span style={{ fontSize: 12, color: "#64748b" }}>{desc}</span>
+                </div>
+              ))}
+            </Section>
+
+            <Section icon="💡" title="Tips & Tricks" color="#34d399">
+              <Tip>
+                <S color="#4ade80">Best workflow:</S> Pin the tokens you're researching → open the 👥 holder panel to check concentration → track the top holder wallets → use the portfolio summary to see your total exposure.
+              </Tip>
+              <Tip>
+                <S color="#4ade80">Research notes:</S> Pin a token, scroll to the bottom of its card, and write notes directly there. Great for entry price targets, risk flags, or news context. Notes survive page reloads.
+              </Tip>
+              <Tip>
+                <S color="#4ade80">Backup wallets:</S> Click ↓ JSON in the Wallets tab to download your wallet list. To restore later, use ↑ Import. Duplicate wallets are silently skipped.
+              </Tip>
+              <Tip>
+                <S color="#4ade80">Cross-wallet search:</S> Want to know which of your wallets hold BONK? Press <Kbd>/</Kbd> in the Wallets tab and type "BONK". All matching wallets expand instantly.
+              </Tip>
+              <Tip>
+                <S color="#4ade80">Price alert strategy:</S> Pin a token, set a "below" alert at your stop-loss price and an "above" alert at your take-profit target. The toast fires whether the tab is active or not (as long as the page is open).
+              </Tip>
+            </Section>
+
+            <div style={{ textAlign: "center", color: "#1e293b", fontSize: 11, marginTop: 8, marginBottom: 24 }}>
+              All data is stored locally in your browser via localStorage. Nothing is sent to any server.
+            </div>
+          </div>
+        );
+      })()}
+
       {/* ── Keyboard shortcuts help modal ── */}
       {showShortcutsHelp && (
         <div
@@ -5607,6 +5762,7 @@ export default function App() {
               ["D", "Switch to Discover tab"],
               ["W", "Switch to Wallets tab"],
               ["M", "Switch to Monitor tab"],
+              ["G", "Switch to Guide tab"],
               ["N", "Add wallet / Track CA (tab-sensitive)"],
               ["R", "Refresh trending tokens now"],
               ["/", "Focus search bar for current tab"],
