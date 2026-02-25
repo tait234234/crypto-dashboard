@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo, memo } from "react";
 
 // ─── Live Price Hook (CoinGecko) ───
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -934,7 +934,7 @@ const HolderPanel = ({ ca, chainId, holders, loading, error, onRefresh }) => {
 };
 
 // ─── Token Card ───
-const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank, allNews = [], newsLoading = false }) => {
+const TokenCard = memo(({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank, allNews = [], newsLoading = false }) => {
   const symbol = pair.baseToken?.symbol || "???";
   const name = pair.baseToken?.name || "Unknown";
   const chain = getChainLabel(pair.chainId);
@@ -1273,7 +1273,7 @@ const TokenCard = ({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank, a
       })()}
     </div>
   );
-};
+});
 
 // ─── Wallet Link Graph ───
 const HELIUS_KEY = "0dd8f0ec-f2a5-4f9e-b275-379afa3e73cd";
@@ -2985,7 +2985,7 @@ const WALLET_SORTS = [
   { key: "name",   label: "Name"   },
 ];
 
-const WalletCard = ({ wallet, onRemove, onHoldingsLoaded, pinnedMints, onPin, onUpdateLabel }) => {
+const WalletCard = memo(({ wallet, onRemove, onHoldingsLoaded, pinnedMints, onPin, onUpdateLabel }) => {
   const { holdings, loading, error, lastFetchedAt, refetch } = useWalletTokens(wallet.address);
   const [expanded, setExpanded]         = useState(true);
   const [confirmingRemove, setConfirming] = useState(false);
@@ -3209,7 +3209,7 @@ const WalletCard = ({ wallet, onRemove, onHoldingsLoaded, pinnedMints, onPin, on
       )}
     </div>
   );
-};
+});
 
 // ─── Add CA Panel ───
 const AddCAPanel = ({ onAdd, onClose }) => {
@@ -3340,7 +3340,7 @@ function NewsSnippet({ articles, loading, label }) {
   );
 }
 
-function CoinCard({ coin, data, sparkline, allNews, newsLoading }) {
+const CoinCard = memo(function CoinCard({ coin, data, sparkline, allNews, newsLoading }) {
   const price = data?.usd || 0;
   const change = data?.usd_24h_change || 0;
   const vol = data?.usd_24h_vol || 0;
@@ -3374,7 +3374,7 @@ function CoinCard({ coin, data, sparkline, allNews, newsLoading }) {
       </div>
     </div>
   );
-}
+});
 
 const LiveIndicator = () => (
   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
