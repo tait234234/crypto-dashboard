@@ -934,7 +934,7 @@ const HolderPanel = ({ ca, chainId, holders, loading, error, onRefresh }) => {
 };
 
 // ─── Token Card ───
-const TokenCard = memo(({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank, allNews = [], newsLoading = false }) => {
+const TokenCard = memo(({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank, allNews = [], newsLoading = false, priceAlerts = [], onSetAlert, onRemoveAlert }) => {
   const symbol = pair.baseToken?.symbol || "???";
   const name = pair.baseToken?.name || "Unknown";
   const chain = getChainLabel(pair.chainId);
@@ -959,6 +959,11 @@ const TokenCard = memo(({ pair, isPinned, onPin, onUnpin, walletHolders = [], ra
   const [chartMode, setChartMode] = useState("price"); // "price" | "mcap"
   const [chartTf, setChartTf] = useState("1D");        // "1H" | "12H" | "1D"
   const [caCopied, setCaCopied] = useState(false);
+  const [showAlertForm, setShowAlertForm] = useState(false);
+  const [alertTarget, setAlertTarget] = useState("");
+  const [alertDir, setAlertDir] = useState("above");
+  const myAlerts = priceAlerts.filter((a) => a.ca === ca);
+  const hasAlert = myAlerts.length > 0;
   const { holders, loading: holdersLoading, error: holdersError, refetch: refetchHolders } = useTokenHolders(ca, pair.chainId, showHolders);
   const gtPoolAddr = pair.source === "gt" ? pair.pairAddress : null;
   const { priceData: chartData, volumeData, loading: chartLoading, failed: chartFailed, retry: retryChart } = usePoolChart(pair.chainId, ca, gtPoolAddr, showChart, chartTf);
@@ -1030,7 +1035,75 @@ const TokenCard = memo(({ pair, isPinned, onPin, onUnpin, walletHolders = [], ra
             </span>
           </button>
         )}
+        {/* Price alert bell */}
+        {ca && (
+          <button
+            onClick={(e) => { e.stopPropagation(); setShowAlertForm((v) => !v); }}
+            title={hasAlert ? `${myAlerts.length} alert active — click to manage` : "Set price alert"}
+            style={{ position: "relative", width: 28, height: 28, borderRadius: 6, background: showAlertForm ? "#f59e0b22" : hasAlert ? "#f59e0b18" : "#1e293b", border: `1px solid ${hasAlert || showAlertForm ? "#f59e0b55" : "#334155"}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, color: hasAlert || showAlertForm ? "#f59e0b" : "#64748b", cursor: "pointer", flexShrink: 0 }}
+          >
+            🔔
+            {hasAlert && (
+              <span style={{ position: "absolute", top: -4, right: -4, background: "#f59e0b", color: "#0d1321", borderRadius: "50%", fontSize: 8, fontWeight: 800, minWidth: 12, height: 12, display: "flex", alignItems: "center", justifyContent: "center", lineHeight: 1 }}>
+                {myAlerts.length}
+              </span>
+            )}
+          </button>
+        )}
       </div>
+
+      {/* Price alert form */}
+      {showAlertForm && ca && (
+        <div style={{ background: "#0d1321", border: "1px solid #f59e0b33", borderRadius: 8, padding: "10px 12px", marginTop: 8, display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }} onClick={(e) => e.stopPropagation()}>
+          <span style={{ fontSize: 11, color: "#94a3b8", fontWeight: 600 }}>Alert when</span>
+          <select
+            value={alertDir}
+            onChange={(e) => setAlertDir(e.target.value)}
+            style={{ background: "#111827", border: "1px solid #334155", borderRadius: 5, color: "#e2e8f0", fontSize: 11, padding: "2px 6px", cursor: "pointer" }}
+          >
+            <option value="above">price goes above</option>
+            <option value="below">price drops below</option>
+          </select>
+          <input
+            type="number"
+            value={alertTarget}
+            onChange={(e) => setAlertTarget(e.target.value)}
+            placeholder={pair.priceUsd ? `current: $${parseFloat(pair.priceUsd).toPrecision(4)}` : "target price"}
+            style={{ width: 120, background: "#111827", border: "1px solid #334155", borderRadius: 5, color: "#e2e8f0", fontSize: 11, padding: "2px 8px", outline: "none" }}
+          />
+          <button
+            onClick={() => {
+              const t = parseFloat(alertTarget);
+              if (!isNaN(t) && t > 0) {
+                onSetAlert?.(ca, pair.chainId, symbol, t, alertDir);
+                showCopyToast(`🔔 Alert set: ${symbol} ${alertDir} $${t.toPrecision(4)}`);
+                setShowAlertForm(false);
+                setAlertTarget("");
+              }
+            }}
+            style={{ padding: "2px 10px", borderRadius: 5, border: "1px solid #f59e0b44", background: "#f59e0b22", color: "#f59e0b", fontSize: 11, fontWeight: 700, cursor: "pointer" }}
+          >
+            Set
+          </button>
+          {hasAlert && (
+            <button
+              onClick={() => { onRemoveAlert?.(ca); setShowAlertForm(false); showCopyToast("Alert cleared"); }}
+              style={{ padding: "2px 8px", borderRadius: 5, border: "1px solid #334155", background: "transparent", color: "#64748b", fontSize: 11, cursor: "pointer" }}
+            >
+              Clear all
+            </button>
+          )}
+          {myAlerts.length > 0 && (
+            <div style={{ width: "100%", display: "flex", flexWrap: "wrap", gap: 4, marginTop: 2 }}>
+              {myAlerts.map((a) => (
+                <span key={a.direction} style={{ fontSize: 10, color: a.triggered ? "#4ade80" : "#f59e0b", background: a.triggered ? "#4ade8011" : "#f59e0b11", borderRadius: 5, padding: "2px 7px", border: `1px solid ${a.triggered ? "#4ade8033" : "#f59e0b33"}` }}>
+                  {a.triggered ? "✓ triggered" : a.direction === "above" ? "↑" : "↓"} ${a.targetPrice.toPrecision(4)}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Wallet holders popover */}
       {showWalletHolders && walletHolders.length > 0 && (
@@ -2985,7 +3058,7 @@ const WALLET_SORTS = [
   { key: "name",   label: "Name"   },
 ];
 
-const WalletCard = memo(({ wallet, onRemove, onHoldingsLoaded, pinnedMints, onPin, onUpdateLabel, compact = false, walletStats }) => {
+const WalletCard = memo(({ wallet, onRemove, onHoldingsLoaded, pinnedMints, onPin, onUpdateLabel, compact = false, walletStats, note = "", onNoteChange }) => {
   const { holdings, loading, error, lastFetchedAt, refetch } = useWalletTokens(wallet.address);
   const [expanded, setExpanded]         = useState(true);
   const [confirmingRemove, setConfirming] = useState(false);
@@ -3258,6 +3331,17 @@ const WalletCard = memo(({ wallet, onRemove, onHoldingsLoaded, pinnedMints, onPi
               {search && ` matching "${search}"`}
             </div>
           )}
+
+          {/* Notes */}
+          <div style={{ marginTop: 8, borderTop: "1px solid #0f172a", paddingTop: 8 }}>
+            <textarea
+              value={note}
+              onChange={(e) => onNoteChange?.(e.target.value)}
+              placeholder="Notes about this wallet…"
+              rows={note ? Math.max(2, (note.match(/\n/g) || []).length + 1) : 1}
+              style={{ width: "100%", background: "transparent", border: "none", outline: "none", color: note ? "#64748b" : "#1e293b", fontSize: 11, resize: "none", fontFamily: "inherit", boxSizing: "border-box", padding: 0, lineHeight: 1.5 }}
+            />
+          </div>
         </>
       )}
 
@@ -4468,9 +4552,9 @@ export default function App() {
       if (e.key === "?") { setShowShortcutsHelp((v) => !v); e.preventDefault(); return; }
       if (e.metaKey || e.ctrlKey || e.altKey) return; // don't steal browser shortcuts
       const k = e.key.toLowerCase();
-      if (k === "d") { setActiveSection("discover"); e.preventDefault(); }
-      else if (k === "w") { setActiveSection("wallets");  e.preventDefault(); }
-      else if (k === "m") { setActiveSection("monitor");  e.preventDefault(); }
+      if (k === "d") { setActiveSection("discover"); window.scrollTo({ top: 0, behavior: "smooth" }); e.preventDefault(); }
+      else if (k === "w") { setActiveSection("wallets");  window.scrollTo({ top: 0, behavior: "smooth" }); e.preventDefault(); }
+      else if (k === "m") { setActiveSection("monitor");  window.scrollTo({ top: 0, behavior: "smooth" }); e.preventDefault(); }
       else if (k === "r") { refetchTokens?.(); e.preventDefault(); }
       else if (k === "n") {
         if (activeSection === "wallets")  { setShowAddWallet(true); e.preventDefault(); }
@@ -4507,6 +4591,58 @@ export default function App() {
       });
       return next;
     });
+  }, []);
+
+  // ── Price alerts ──
+  const [priceAlerts, setPriceAlerts] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("priceAlerts") || "[]"); } catch { return []; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("priceAlerts", JSON.stringify(priceAlerts)); } catch { /* quota */ }
+  }, [priceAlerts]);
+
+  // Check alerts whenever prices update (tokens or pinnedTokens refresh)
+  useEffect(() => {
+    if (!priceAlerts.length) return;
+    const allPairs = [...tokens, ...pinnedTokens];
+    let changed = false;
+    const updated = priceAlerts.map((alert) => {
+      if (alert.triggered) return alert;
+      const pair = allPairs.find((t) => t.baseToken?.address === alert.ca);
+      if (!pair?.priceUsd) return alert;
+      const price = parseFloat(pair.priceUsd);
+      const hit = alert.direction === "above" ? price >= alert.targetPrice : price <= alert.targetPrice;
+      if (hit) {
+        changed = true;
+        showCopyToast(`🔔 ${alert.symbol} ${alert.direction === "above" ? "↑" : "↓"} $${alert.targetPrice.toPrecision(4)}`);
+        return { ...alert, triggered: true, triggeredAt: Date.now() };
+      }
+      return alert;
+    });
+    if (changed) setPriceAlerts(updated);
+  }, [tokens, pinnedTokens]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const addPriceAlert = useCallback((ca, chainId, symbol, targetPrice, direction) => {
+    setPriceAlerts((prev) => {
+      const deduped = prev.filter((a) => !(a.ca === ca && a.direction === direction));
+      return [...deduped, { ca, chainId, symbol, targetPrice, direction, triggered: false, createdAt: Date.now() }];
+    });
+  }, []);
+
+  const removePriceAlert = useCallback((ca) => {
+    setPriceAlerts((prev) => prev.filter((a) => a.ca !== ca));
+  }, []);
+
+  // ── Wallet notes ──
+  const [walletNotes, setWalletNotes] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("walletNotes") || "{}"); } catch { return {}; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("walletNotes", JSON.stringify(walletNotes)); } catch { /* quota */ }
+  }, [walletNotes]);
+
+  const updateWalletNote = useCallback((address, note) => {
+    setWalletNotes((prev) => ({ ...prev, [address]: note }));
   }, []);
 
   // ── Derived wallet stats (value + token count per wallet address) ──
@@ -4767,7 +4903,7 @@ export default function App() {
           ].map((s) => (
             <button
               key={s.key}
-              onClick={() => setActiveSection(s.key)}
+              onClick={() => { setActiveSection(s.key); window.scrollTo({ top: 0, behavior: "smooth" }); }}
               className={`tab-btn ${activeSection === s.key ? "active" : "inactive"}`}
             >
               {s.label}
@@ -4827,6 +4963,9 @@ export default function App() {
                       walletHolders={(pair.baseToken?.address && walletMintMap[pair.baseToken.address]) || []}
                       allNews={newsArticles}
                       newsLoading={newsLoading}
+                      priceAlerts={priceAlerts}
+                      onSetAlert={addPriceAlert}
+                      onRemoveAlert={removePriceAlert}
                     />
                   ))}
                 </div>
@@ -4892,6 +5031,9 @@ export default function App() {
                       walletHolders={(ca && walletMintMap[ca]) || []}
                       allNews={newsArticles}
                       newsLoading={newsLoading}
+                      priceAlerts={priceAlerts}
+                      onSetAlert={addPriceAlert}
+                      onRemoveAlert={removePriceAlert}
                     />
                   );
                 })}
@@ -5141,6 +5283,38 @@ export default function App() {
                     </div>
                   </div>
                 )}
+
+                {/* Row 4: Per-wallet breakdown */}
+                {wallets.length > 1 && totalValue > 0 && (
+                  <div style={{ marginTop: 14, borderTop: "1px solid #1e293b", paddingTop: 12 }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: "#334155", textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 8 }}>Per Wallet</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                      {[...wallets]
+                        .map((w) => ({ ...w, value: walletStats[w.address]?.value || 0 }))
+                        .sort((a, b) => b.value - a.value)
+                        .map((w) => {
+                          const pct = (w.value / totalValue) * 100;
+                          return (
+                            <div key={w.address} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                              <span style={{ flex: 1, fontSize: 11, color: "#94a3b8", fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                {w.label || truncateAddr(w.address)}
+                              </span>
+                              <span style={{ fontSize: 11, color: "#f1f5f9", fontWeight: 700, flexShrink: 0, minWidth: 52, textAlign: "right" }}>
+                                {formatVolume(w.value)}
+                              </span>
+                              <div style={{ width: 56, height: 4, background: "#1e293b", borderRadius: 2, overflow: "hidden", flexShrink: 0 }}>
+                                <div style={{ width: `${pct}%`, height: "100%", background: "#6366f1", borderRadius: 2 }} />
+                              </div>
+                              <span style={{ fontSize: 10, color: "#475569", flexShrink: 0, minWidth: 26, textAlign: "right" }}>
+                                {pct.toFixed(0)}%
+                              </span>
+                            </div>
+                          );
+                        })
+                      }
+                    </div>
+                  </div>
+                )}
               </div>
             );
           })()}
@@ -5169,6 +5343,8 @@ export default function App() {
               onUpdateLabel={updateWalletLabel}
               compact={walletView === "list"}
               walletStats={walletStats}
+              note={walletNotes[wallet.address] || ""}
+              onNoteChange={(n) => updateWalletNote(wallet.address, n)}
             />
           ))}
 
