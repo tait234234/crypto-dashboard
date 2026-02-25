@@ -860,20 +860,16 @@ const HolderPanel = ({ ca, chainId, holders, loading, error, onRefresh }) => {
     );
   }
 
+  const top3pct  = holders ? holders.slice(0, 3).reduce((s, h) => s + h.pct, 0) : null;
   const top10pct = holders ? holders.slice(0, 10).reduce((s, h) => s + h.pct, 0) : null;
   const concColor = top10pct == null ? "#64748b" : top10pct > 60 ? "#f87171" : top10pct > 40 ? "#f59e0b" : "#4ade80";
-  const concLabel = top10pct == null ? "" : top10pct > 60 ? " ⚠ concentrated" : top10pct > 40 ? " moderate" : " healthy";
+  const concLabel = top10pct == null ? "" : top10pct > 60 ? "⚠ Concentrated" : top10pct > 40 ? "Moderate" : "Healthy";
 
   return (
     <div style={{ marginTop: 12, padding: "10px 14px", background: "#0d1321", borderRadius: 8, border: "1px solid #1e293b" }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: top10pct != null ? 6 : 8 }}>
         <span style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700 }}>Top Holders</span>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          {top10pct != null && (
-            <span style={{ fontSize: 11, color: concColor, fontWeight: 700 }}>
-              Top 10: {top10pct.toFixed(1)}%{concLabel}
-            </span>
-          )}
           {onRefresh && (
             <button
               onClick={(e) => { e.stopPropagation(); onRefresh(); }}
@@ -886,6 +882,26 @@ const HolderPanel = ({ ca, chainId, holders, loading, error, onRefresh }) => {
           )}
         </div>
       </div>
+
+      {/* Concentration summary bar */}
+      {top10pct != null && !loading && (
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+            <div style={{ display: "flex", gap: 12 }}>
+              <span style={{ fontSize: 10, color: "#64748b" }}>
+                Top 3: <span style={{ fontWeight: 700, color: (top3pct || 0) > 40 ? "#f87171" : "#94a3b8" }}>{(top3pct || 0).toFixed(1)}%</span>
+              </span>
+              <span style={{ fontSize: 10, color: "#64748b" }}>
+                Top 10: <span style={{ fontWeight: 700, color: concColor }}>{top10pct.toFixed(1)}%</span>
+              </span>
+            </div>
+            <span style={{ fontSize: 10, fontWeight: 700, color: concColor, background: `${concColor}18`, border: `1px solid ${concColor}44`, borderRadius: 5, padding: "1px 6px" }}>{concLabel}</span>
+          </div>
+          <div style={{ height: 4, background: "#1e293b", borderRadius: 2, overflow: "hidden" }}>
+            <div style={{ height: "100%", width: `${Math.min(top10pct, 100)}%`, background: concColor, borderRadius: 2, transition: "width 0.4s ease" }} />
+          </div>
+        </div>
+      )}
 
       {loading && <div style={{ color: "#475569", fontSize: 12, textAlign: "center", padding: "8px 0" }}>Fetching holders…</div>}
       {error && <div style={{ color: "#fca5a5", fontSize: 12 }}>⚠ {error}</div>}
@@ -934,7 +950,7 @@ const HolderPanel = ({ ca, chainId, holders, loading, error, onRefresh }) => {
 };
 
 // ─── Token Card ───
-const TokenCard = memo(({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank, allNews = [], newsLoading = false, priceAlerts = [], onSetAlert, onRemoveAlert }) => {
+const TokenCard = memo(({ pair, isPinned, onPin, onUnpin, walletHolders = [], rank, allNews = [], newsLoading = false, priceAlerts = [], onSetAlert, onRemoveAlert, note = "", onNoteChange }) => {
   const symbol = pair.baseToken?.symbol || "???";
   const name = pair.baseToken?.name || "Unknown";
   const chain = getChainLabel(pair.chainId);
@@ -1355,6 +1371,19 @@ const TokenCard = memo(({ pair, isPinned, onPin, onUnpin, walletHolders = [], ra
           </div>
         );
       })()}
+
+      {/* Notes — only for pinned tokens */}
+      {isPinned && (
+        <div style={{ borderTop: "1px solid #1e293b", marginTop: 10, paddingTop: 8 }} onClick={(e) => e.stopPropagation()}>
+          <textarea
+            value={note}
+            onChange={(e) => onNoteChange?.(e.target.value)}
+            placeholder="Add research notes…"
+            rows={note ? Math.max(2, (note.match(/\n/g) || []).length + 1) : 1}
+            style={{ width: "100%", background: "transparent", border: "none", outline: "none", color: note ? "#64748b" : "#1e293b", fontSize: 11, resize: "none", fontFamily: "inherit", boxSizing: "border-box", padding: 0, lineHeight: 1.5, cursor: "text" }}
+          />
+        </div>
+      )}
     </div>
   );
 });
@@ -3094,6 +3123,11 @@ const WalletCard = memo(({ wallet, onRemove, onHoldingsLoaded, pinnedMints, onPi
     }
   }, [holdings, loading, error, wallet.address, wallet.label, onHoldingsLoaded]);
 
+  // Auto-expand when a global holdings search is active
+  useEffect(() => {
+    if (externalSearch.trim()) setExpanded(true);
+  }, [externalSearch]);
+
   const totalUsd = useMemo(
     () => holdings.reduce((s, h) => s + (parseFloat(h.pair?.priceUsd || 0) * h.amount), 0),
     [holdings]
@@ -4549,6 +4583,10 @@ export default function App() {
   const [showAddWallet, setShowAddWallet] = useState(false);
   const [showShortcutsHelp, setShowShortcutsHelp] = useState(false);
 
+  // ── Search refs (for '/' shortcut focus) ──
+  const tokenSearchRef   = useRef(null);
+  const holdingsSearchRef = useRef(null);
+
   // ── Keyboard shortcuts ──
   useEffect(() => {
     const handler = (e) => {
@@ -4563,6 +4601,12 @@ export default function App() {
         return;
       }
       if (e.key === "?") { setShowShortcutsHelp((v) => !v); e.preventDefault(); return; }
+      if (e.key === "/") {
+        // Focus the contextual search bar for the active section
+        const ref = activeSection === "discover" ? tokenSearchRef : holdingsSearchRef;
+        if (ref.current) { ref.current.focus(); ref.current.select(); e.preventDefault(); }
+        return;
+      }
       if (e.metaKey || e.ctrlKey || e.altKey) return; // don't steal browser shortcuts
       const k = e.key.toLowerCase();
       if (k === "d") { setActiveSection("discover"); window.scrollTo({ top: 0, behavior: "smooth" }); e.preventDefault(); }
@@ -4656,6 +4700,17 @@ export default function App() {
 
   const updateWalletNote = useCallback((address, note) => {
     setWalletNotes((prev) => ({ ...prev, [address]: note }));
+  }, []);
+
+  // ── Pinned token notes ──
+  const [pinnedNotes, setPinnedNotes] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("pinnedNotes") || "{}"); } catch { return {}; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("pinnedNotes", JSON.stringify(pinnedNotes)); } catch { /* quota */ }
+  }, [pinnedNotes]);
+  const updatePinnedNote = useCallback((ca, note) => {
+    setPinnedNotes((prev) => ({ ...prev, [ca]: note }));
   }, []);
 
   // ── Alerts panel + wallet import ──
@@ -5055,21 +5110,26 @@ export default function App() {
               )}
               {!pinnedLoading && filteredPinned.length > 0 && (
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 14 }}>
-                  {filteredPinned.map((pair, i) => (
+                  {filteredPinned.map((pair, i) => {
+                    const pinnedCA = pair.baseToken?.address || "";
+                    return (
                     <TokenCard
                       key={`pinned-${pair.pairAddress}-${i}`}
                       pair={pair}
                       isPinned={true}
                       onPin={pinToken}
                       onUnpin={unpinToken}
-                      walletHolders={(pair.baseToken?.address && walletMintMap[pair.baseToken.address]) || []}
+                      walletHolders={(pinnedCA && walletMintMap[pinnedCA]) || []}
                       allNews={newsArticles}
                       newsLoading={newsLoading}
                       priceAlerts={priceAlerts}
                       onSetAlert={addPriceAlert}
                       onRemoveAlert={removePriceAlert}
+                      note={pinnedNotes[pinnedCA] || ""}
+                      onNoteChange={(n) => updatePinnedNote(pinnedCA, n)}
                     />
-                  ))}
+                    );
+                  })}
                 </div>
               )}
               {!pinnedLoading && filteredPinned.length === 0 && pinnedCAs.length > 0 && (
@@ -5100,6 +5160,7 @@ export default function App() {
             {/* Token search */}
             <div style={{ position: "relative", flex: 1, minWidth: 160, maxWidth: 280 }}>
               <input
+                ref={tokenSearchRef}
                 value={tokenSearch}
                 onChange={(e) => setTokenSearch(e.target.value)}
                 placeholder="Search symbol, name, CA…"
@@ -5136,6 +5197,8 @@ export default function App() {
                       priceAlerts={priceAlerts}
                       onSetAlert={addPriceAlert}
                       onRemoveAlert={removePriceAlert}
+                      note={pinnedNotes[ca] || ""}
+                      onNoteChange={(n) => updatePinnedNote(ca, n)}
                     />
                   );
                 })}
@@ -5471,6 +5534,7 @@ export default function App() {
               <>
                 <div style={{ position: "relative", marginBottom: 14, maxWidth: 400 }}>
                   <input
+                    ref={holdingsSearchRef}
                     value={holdingsSearch}
                     onChange={(e) => setHoldingsSearch(e.target.value)}
                     placeholder="Search wallets & holdings (symbol, address, label)…"
@@ -5545,6 +5609,7 @@ export default function App() {
               ["M", "Switch to Monitor tab"],
               ["N", "Add wallet / Track CA (tab-sensitive)"],
               ["R", "Refresh trending tokens now"],
+              ["/", "Focus search bar for current tab"],
               ["?", "Toggle this shortcuts panel"],
               ["Esc", "Close any open panel or dialog"],
             ].map(([key, desc]) => (
