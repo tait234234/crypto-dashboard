@@ -98,6 +98,19 @@ body {
   50%       { text-shadow: 0 0 30px #6366f188, 0 0 60px #9945ff44; }
 }
 
+@keyframes price-up {
+  0%   { color: #4ade80; text-shadow: 0 0 8px #4ade8088; }
+  100% { color: inherit; text-shadow: none; }
+}
+
+@keyframes price-down {
+  0%   { color: #f87171; text-shadow: 0 0 8px #f8717188; }
+  100% { color: inherit; text-shadow: none; }
+}
+
+.price-flash-up   { animation: price-up   1.4s ease forwards; }
+.price-flash-down { animation: price-down 1.4s ease forwards; }
+
 /* ─── Background art ─── */
 .app-bg {
   background-color: var(--bg-base);

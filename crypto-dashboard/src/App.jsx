@@ -740,6 +740,17 @@ function formatAge(createdAt) {
   return Math.round(diffDays / 30) + "mo";
 }
 
+// Returns a color representing token freshness: new = red (risky), old = green (established)
+function getAgeColor(createdAt) {
+  if (!createdAt) return "#64748b";
+  const ms = Date.now() - createdAt;
+  if (ms < 3_600_000)    return "#f87171"; // < 1h  — very new, high risk
+  if (ms < 86_400_000)   return "#fb923c"; // < 1d  — new
+  if (ms < 7*86_400_000) return "#f59e0b"; // < 7d  — recent
+  if (ms < 30*86_400_000)return "#94a3b8"; // < 30d — established
+  return "#4ade80";                         // ≥ 30d — veteran
+}
+
 function getChainLabel(chainId) {
   if (chainId === "solana") return "SOL";
   if (chainId === "base") return "BASE";
@@ -975,6 +986,19 @@ const TokenCard = memo(({ pair, isPinned, onPin, onUnpin, walletHolders = [], ra
   const [chartMode, setChartMode] = useState("price"); // "price" | "mcap"
   const [chartTf, setChartTf] = useState("1D");        // "1H" | "12H" | "1D"
   const [caCopied, setCaCopied] = useState(false);
+  const prevPriceRef = useRef(null);
+  const [flashClass, setFlashClass] = useState("");
+  useEffect(() => {
+    const cur = pair.priceUsd ? parseFloat(pair.priceUsd) : null;
+    if (cur !== null && prevPriceRef.current !== null && cur !== prevPriceRef.current) {
+      const cls = cur > prevPriceRef.current ? "price-flash-up" : "price-flash-down";
+      setFlashClass(cls);
+      const t = setTimeout(() => setFlashClass(""), 1400);
+      prevPriceRef.current = cur;
+      return () => clearTimeout(t);
+    }
+    if (cur !== null) prevPriceRef.current = cur;
+  }, [pair.priceUsd]);
   const [showAlertForm, setShowAlertForm] = useState(false);
   const [alertTarget, setAlertTarget] = useState("");
   const [alertDir, setAlertDir] = useState("above");
@@ -1180,8 +1204,8 @@ const TokenCard = memo(({ pair, isPinned, onPin, onUnpin, walletHolders = [], ra
               </div>
               <div style={{ color: "#94a3b8", fontSize: 12, marginTop: 2, maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</div>
               <div style={{ display: "flex", gap: 10, color: "#64748b", fontSize: 11, marginTop: 2 }}>
-                <span>Age <span style={{ color: "#94a3b8" }}>{age}</span></span>
-                <span>Price <span style={{ color: "#94a3b8" }}>{pair.priceUsd ? formatPrice(parseFloat(pair.priceUsd)) : "—"}</span></span>
+                <span>Age <span style={{ color: getAgeColor(pair.pairCreatedAt), fontWeight: age === "new" ? 700 : undefined }}>{age}</span></span>
+                <span>Price <span className={flashClass} style={{ color: flashClass ? undefined : "#94a3b8" }}>{pair.priceUsd ? formatPrice(parseFloat(pair.priceUsd)) : "—"}</span></span>
               </div>
             </div>
           </div>
@@ -3796,7 +3820,10 @@ const SORT_OPTIONS = [
   { key: "age",      label: "Age" },
 ];
 
-const FilterBar = ({ sortBy, sortDir, onSort, minVol, onMinVol, minMcap, onMinMcap, minChange1h, onMinChange1h, count, total, onClear }) => (
+const FB_INPUT = { width: 52, background: "#111827", border: "1px solid #1e293b", borderRadius: 5, color: "#e2e8f0", fontSize: 12, padding: "3px 7px", outline: "none" };
+const FB_LABEL = { color: "#475569", fontSize: 11 };
+
+const FilterBar = ({ sortBy, sortDir, onSort, minVol, onMinVol, minMcap, onMinMcap, minChange1h, onMinChange1h, minLiq, onMinLiq, maxAgeDays, onMaxAgeDays, count, total, onClear }) => (
   <div style={{ background: "#0d1321", border: "1px solid #1e293b", borderRadius: 10, padding: "10px 14px", marginBottom: 16, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
     {/* Sort pills */}
     <span style={{ color: "#475569", fontSize: 11, fontWeight: 600, letterSpacing: 0.5 }}>SORT</span>
@@ -3821,38 +3848,43 @@ const FilterBar = ({ sortBy, sortDir, onSort, minVol, onMinVol, minMcap, onMinMc
     <span style={{ color: "#475569", fontSize: 11, fontWeight: 600, letterSpacing: 0.5 }}>FILTER</span>
 
     <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
-      <span style={{ color: "#475569", fontSize: 11 }}>{sortBy === "vol1h" ? "Vol1h≥" : sortBy === "vol6h" ? "Vol6h≥" : "Vol≥"}</span>
-      <input
-        value={minVol}
-        onChange={(e) => onMinVol(e.target.value)}
-        placeholder="10K"
-        style={{ width: 56, background: "#111827", border: "1px solid #1e293b", borderRadius: 5, color: "#e2e8f0", fontSize: 12, padding: "3px 7px", outline: "none" }}
-      />
+      <span style={FB_LABEL}>{sortBy === "vol1h" ? "Vol1h≥" : sortBy === "vol6h" ? "Vol6h≥" : "Vol≥"}</span>
+      <input value={minVol} onChange={(e) => onMinVol(e.target.value)} placeholder="10K" style={FB_INPUT} />
     </label>
 
     <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
-      <span style={{ color: "#475569", fontSize: 11 }}>MCap≥</span>
-      <input
-        value={minMcap}
-        onChange={(e) => onMinMcap(e.target.value)}
-        placeholder="100K"
-        style={{ width: 56, background: "#111827", border: "1px solid #1e293b", borderRadius: 5, color: "#e2e8f0", fontSize: 12, padding: "3px 7px", outline: "none" }}
-      />
+      <span style={FB_LABEL}>MCap≥</span>
+      <input value={minMcap} onChange={(e) => onMinMcap(e.target.value)} placeholder="100K" style={FB_INPUT} />
     </label>
 
     <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
-      <span style={{ color: "#475569", fontSize: 11 }}>1h≥</span>
-      <input
-        value={minChange1h}
-        onChange={(e) => onMinChange1h(e.target.value)}
-        placeholder="5"
-        style={{ width: 42, background: "#111827", border: "1px solid #1e293b", borderRadius: 5, color: "#e2e8f0", fontSize: 12, padding: "3px 7px", outline: "none" }}
-      />
-      <span style={{ color: "#475569", fontSize: 11 }}>%</span>
+      <span style={FB_LABEL}>Liq≥</span>
+      <input value={minLiq} onChange={(e) => onMinLiq(e.target.value)} placeholder="50K" style={FB_INPUT} />
+    </label>
+
+    <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+      <span style={FB_LABEL}>1h≥</span>
+      <input value={minChange1h} onChange={(e) => onMinChange1h(e.target.value)} placeholder="5" style={{ ...FB_INPUT, width: 40 }} />
+      <span style={FB_LABEL}>%</span>
+    </label>
+
+    <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+      <span style={FB_LABEL}>Age≤</span>
+      <select
+        value={maxAgeDays}
+        onChange={(e) => onMaxAgeDays(e.target.value)}
+        style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 5, color: maxAgeDays ? "#e2e8f0" : "#475569", fontSize: 12, padding: "3px 5px", outline: "none", cursor: "pointer" }}
+      >
+        <option value="">Any</option>
+        <option value="0.04">1h</option>
+        <option value="1">1d</option>
+        <option value="7">7d</option>
+        <option value="30">30d</option>
+      </select>
     </label>
 
     {/* Clear filters + token count */}
-    {onClear && (minVol || minMcap || minChange1h) && (
+    {onClear && (minVol || minMcap || minChange1h || minLiq || maxAgeDays) && (
       <button onClick={onClear} title="Clear all filters" style={{ padding: "3px 9px", borderRadius: 6, border: "1px solid #f8717133", background: "#f8717111", color: "#f87171", fontSize: 11, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>✕ Clear</button>
     )}
     <span style={{ marginLeft: "auto", color: "#334155", fontSize: 11 }}>{count}{total !== count ? `/${total}` : ""} tokens</span>
@@ -4728,6 +4760,18 @@ export default function App() {
   const [holdingsSearch, setHoldingsSearch] = useState("");
   // { v: number, expanded: bool } — increment v to broadcast expand/collapse to all WalletCards
   const [walletExpansionSignal, setWalletExpansionSignal] = useState({ v: 0, expanded: true });
+
+  // ── Portfolio goal ──
+  const [portfolioGoal, setPortfolioGoal] = useState(() => {
+    const v = localStorage.getItem("portfolioGoal");
+    return v ? parseFloat(v) : null;
+  });
+  const [goalEditing, setGoalEditing] = useState(false);
+  useEffect(() => {
+    if (portfolioGoal != null) localStorage.setItem("portfolioGoal", String(portfolioGoal));
+    else localStorage.removeItem("portfolioGoal");
+  }, [portfolioGoal]);
+
   const importFileRef = useRef(null);
 
   const handleWalletImport = useCallback((e) => {
@@ -4787,6 +4831,8 @@ export default function App() {
   const [minVol, setMinVol] = useState("");
   const [minMcap, setMinMcap] = useState("");
   const [minChange1h, setMinChange1h] = useState("");
+  const [minLiq, setMinLiq] = useState("");
+  const [maxAgeDays, setMaxAgeDays] = useState(""); // "" = no limit
   const [tokenSearch, setTokenSearch] = useState("");
 
   const handleSort = (key) => {
@@ -4797,7 +4843,10 @@ export default function App() {
   const applyFilters = (list) => {
     const volMin = parseVolInput(minVol);
     const mcapMin = parseVolInput(minMcap);
+    const liqMin = parseVolInput(minLiq);
     const change1hMin = minChange1h !== "" ? parseFloat(minChange1h) : null;
+    const maxAgeMs = maxAgeDays !== "" ? parseFloat(maxAgeDays) * 86_400_000 : null;
+    const now = Date.now();
     return list
       .filter((t) => {
         if (!volMin) return true;
@@ -4805,7 +4854,9 @@ export default function App() {
         return v >= volMin;
       })
       .filter((t) => !mcapMin || (t.marketCap || t.fdv || 0) >= mcapMin)
+      .filter((t) => !liqMin || (t.liquidity?.usd || 0) >= liqMin)
       .filter((t) => change1hMin === null || (t.priceChange?.h1 ?? -Infinity) >= change1hMin)
+      .filter((t) => maxAgeMs === null || !t.pairCreatedAt || (now - t.pairCreatedAt) <= maxAgeMs)
       .sort((a, b) => {
         let aVal, bVal;
         if (sortBy === "vol")        { aVal = a.volume?.h24 || 0;          bVal = b.volume?.h24 || 0; }
@@ -4879,12 +4930,12 @@ export default function App() {
     });
     return applyFilters(base);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tokens, activeChain, sortBy, sortDir, minVol, minMcap, minChange1h, tokenSearch]);
+  }, [tokens, activeChain, sortBy, sortDir, minVol, minMcap, minChange1h, minLiq, maxAgeDays, tokenSearch]);
 
   const filteredPinned = useMemo(
     () => applyFilters(pinnedTokens.filter(chainFilter)),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [pinnedTokens, activeChain, sortBy, sortDir, minVol, minMcap, minChange1h]
+    [pinnedTokens, activeChain, sortBy, sortDir, minVol, minMcap, minChange1h, minLiq, maxAgeDays]
   );
 
   const coinConfigs = [
@@ -5096,9 +5147,13 @@ export default function App() {
             onMinMcap={setMinMcap}
             minChange1h={minChange1h}
             onMinChange1h={setMinChange1h}
+            minLiq={minLiq}
+            onMinLiq={setMinLiq}
+            maxAgeDays={maxAgeDays}
+            onMaxAgeDays={setMaxAgeDays}
             count={filteredTokens.length}
             total={tokens.filter(chainFilter).length}
-            onClear={() => { setMinVol(""); setMinMcap(""); setMinChange1h(""); }}
+            onClear={() => { setMinVol(""); setMinMcap(""); setMinChange1h(""); setMinLiq(""); setMaxAgeDays(""); }}
           />
 
           {/* Pinned tokens */}
@@ -5517,6 +5572,66 @@ export default function App() {
                         })
                       }
                     </div>
+                  </div>
+                )}
+
+                {/* Row 5: Portfolio goal */}
+                {totalValue > 0 && (
+                  <div style={{ marginTop: 14, borderTop: "1px solid #1e293b", paddingTop: 12 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: portfolioGoal ? 8 : 0 }}>
+                      <span style={{ fontSize: 10, fontWeight: 700, color: "#334155", textTransform: "uppercase", letterSpacing: 0.6 }}>Goal</span>
+                      {goalEditing ? (
+                        <input
+                          autoFocus
+                          type="number"
+                          defaultValue={portfolioGoal || ""}
+                          placeholder="e.g. 10000"
+                          onBlur={(e) => {
+                            const v = parseFloat(e.target.value);
+                            setPortfolioGoal(!isNaN(v) && v > 0 ? v : null);
+                            setGoalEditing(false);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") e.target.blur();
+                            if (e.key === "Escape") { setGoalEditing(false); }
+                          }}
+                          style={{ width: 100, background: "#0d1321", border: "1px solid #6366f1", borderRadius: 6, color: "#e2e8f0", fontSize: 12, padding: "2px 8px", outline: "none" }}
+                        />
+                      ) : (
+                        <button
+                          onClick={() => setGoalEditing(true)}
+                          style={{ fontSize: 11, color: portfolioGoal ? "#818cf8" : "#334155", background: "transparent", border: "none", cursor: "pointer", padding: 0, fontWeight: 600 }}
+                        >
+                          {portfolioGoal ? `$${portfolioGoal >= 1000 ? (portfolioGoal / 1000).toFixed(0) + "K" : portfolioGoal}` : "+ Set goal"}
+                        </button>
+                      )}
+                      {portfolioGoal && !goalEditing && (
+                        <button
+                          onClick={() => setPortfolioGoal(null)}
+                          title="Remove goal"
+                          style={{ fontSize: 10, color: "#334155", background: "transparent", border: "none", cursor: "pointer", padding: 0, lineHeight: 1 }}
+                        >✕</button>
+                      )}
+                    </div>
+                    {portfolioGoal && !goalEditing && (() => {
+                      const pct = Math.min((totalValue / portfolioGoal) * 100, 100);
+                      const reached = totalValue >= portfolioGoal;
+                      return (
+                        <>
+                          <div style={{ height: 5, background: "#1e293b", borderRadius: 3, overflow: "hidden" }}>
+                            <div style={{ width: `${pct}%`, height: "100%", background: reached ? "#4ade80" : "#6366f1", borderRadius: 3, transition: "width 0.6s ease" }} />
+                          </div>
+                          <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
+                            <span style={{ fontSize: 10, color: reached ? "#4ade80" : "#475569" }}>
+                              {reached ? "🎉 Goal reached!" : `${pct.toFixed(1)}% there`}
+                            </span>
+                            <span style={{ fontSize: 10, color: "#334155" }}>
+                              {reached ? "" : `${formatVolume(portfolioGoal - totalValue)} to go`}
+                            </span>
+                          </div>
+                        </>
+                      );
+                    })()}
                   </div>
                 )}
               </div>
