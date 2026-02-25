@@ -2985,7 +2985,7 @@ const WALLET_SORTS = [
   { key: "name",   label: "Name"   },
 ];
 
-const WalletCard = memo(({ wallet, onRemove, onHoldingsLoaded, pinnedMints, onPin, onUpdateLabel }) => {
+const WalletCard = memo(({ wallet, onRemove, onHoldingsLoaded, pinnedMints, onPin, onUpdateLabel, compact = false, walletStats }) => {
   const { holdings, loading, error, lastFetchedAt, refetch } = useWalletTokens(wallet.address);
   const [expanded, setExpanded]         = useState(true);
   const [confirmingRemove, setConfirming] = useState(false);
@@ -3035,6 +3035,75 @@ const WalletCard = memo(({ wallet, onRemove, onHoldingsLoaded, pinnedMints, onPi
     if (sort === "name")   return [...list].sort((a, b) => (a.pair?.baseToken?.symbol || "").localeCompare(b.pair?.baseToken?.symbol || ""));
     return list;
   }, [holdings, sort, search]);
+
+  // ── Compact list row ──
+  if (compact) {
+    const wValue  = walletStats?.[wallet.address]?.value      || 0;
+    const wTokens = walletStats?.[wallet.address]?.tokenCount || 0;
+    return (
+      <div className="animate-in" style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 14px", background: "#111827", border: "1px solid #1e293b", borderRadius: 10, marginBottom: 4 }}>
+        {/* Status dot */}
+        <div style={{ width: 6, height: 6, borderRadius: "50%", background: loading ? "#f59e0b" : wValue > 0 ? "#4ade80" : "#334155", flexShrink: 0 }} title={loading ? "Loading…" : "Ready"} />
+
+        {/* Label + address */}
+        <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 8 }}>
+          {editingLabel ? (
+            <input
+              ref={labelInputRef}
+              value={labelDraft}
+              autoFocus
+              onChange={(e) => setLabelDraft(e.target.value)}
+              onBlur={() => { setEditingLabel(false); if (onUpdateLabel) onUpdateLabel(wallet.address, labelDraft.trim()); }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter")  e.target.blur();
+                if (e.key === "Escape") { setLabelDraft(wallet.label || ""); setEditingLabel(false); }
+              }}
+              style={{ background: "#0d1321", border: "1px solid #6366f1", borderRadius: 5, color: "#e2e8f0", fontSize: 12, fontWeight: 600, padding: "2px 7px", outline: "none", width: 130 }}
+            />
+          ) : (
+            <span
+              onClick={() => { setLabelDraft(wallet.label || ""); setEditingLabel(true); }}
+              title="Click to edit label"
+              style={{ color: wallet.label ? "#e2e8f0" : "#334155", fontWeight: 600, fontSize: 13, cursor: "text", flexShrink: 0, fontStyle: wallet.label ? "normal" : "italic" }}
+            >
+              {wallet.label || "Add label"}
+            </span>
+          )}
+          <span
+            style={{ color: "#475569", fontSize: 11, fontFamily: "monospace", cursor: "pointer", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+            title={wallet.address}
+            onClick={() => copyAddr(wallet.address)}
+          >
+            {truncateAddr(wallet.address)}
+          </span>
+        </div>
+
+        {/* Value */}
+        <span style={{ color: wValue > 0 ? "#f1f5f9" : "#475569", fontWeight: 700, fontSize: 13, flexShrink: 0, minWidth: 64, textAlign: "right" }}>
+          {loading ? <span style={{ color: "#334155", fontWeight: 400 }}>…</span> : wValue > 0 ? formatVolume(wValue) : "—"}
+        </span>
+
+        {/* Token count */}
+        <span style={{ color: "#475569", fontSize: 11, flexShrink: 0, minWidth: 52, textAlign: "right" }}>
+          {wTokens > 0 ? `${wTokens} token${wTokens !== 1 ? "s" : ""}` : ""}
+        </span>
+
+        {/* Actions */}
+        <div style={{ display: "flex", gap: 3, flexShrink: 0 }}>
+          <button onClick={() => copyAddr(wallet.address)} title="Copy address" style={{ width: 24, height: 24, borderRadius: 5, border: "1px solid #1e293b", background: "transparent", color: "#475569", fontSize: 12, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>⎘</button>
+          <a href={`https://solscan.io/account/${wallet.address}`} target="_blank" rel="noopener noreferrer" title="View on Solscan" style={{ width: 24, height: 24, borderRadius: 5, border: "1px solid #1e293b", background: "transparent", color: "#475569", fontSize: 12, display: "flex", alignItems: "center", justifyContent: "center", textDecoration: "none" }}>↗</a>
+          {!confirmingRemove ? (
+            <button onClick={() => setConfirming(true)} title="Remove wallet" style={{ width: 24, height: 24, borderRadius: 5, border: "1px solid #7f1d1d33", background: "transparent", color: "#7f1d1d", fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>✕</button>
+          ) : (
+            <>
+              <button onClick={() => { onRemove(wallet.address); setConfirming(false); }} style={{ padding: "2px 8px", borderRadius: 5, border: "1px solid #991b1b", background: "#7f1d1d44", color: "#f87171", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>Remove</button>
+              <button onClick={() => setConfirming(false)} style={{ padding: "2px 8px", borderRadius: 5, border: "1px solid #1e293b", background: "transparent", color: "#64748b", fontSize: 11, cursor: "pointer" }}>Cancel</button>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="card-hover animate-in" style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 14, padding: "16px 20px", marginBottom: 12 }}>
@@ -3506,6 +3575,61 @@ const Sparkline = ({ data, volumeData, width = 140, height = 32, color, interact
     </div>
   );
 };
+
+// ─── Portfolio history (persisted snapshots for sparkline) ───
+function usePortfolioHistory(totalValue) {
+  const KEY = "portfolioHistory";
+  const [history, setHistory] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(KEY) || "[]"); } catch { return []; }
+  });
+  useEffect(() => {
+    if (!(totalValue > 0)) return;
+    setHistory((prev) => {
+      const now   = Date.now();
+      const last  = prev[prev.length - 1];
+      if (last) {
+        const elapsedMin = (now - last.t) / 60000;
+        const changePct  = Math.abs((totalValue - last.v) / last.v);
+        // Only save if ≥5 min elapsed OR value changed >1%
+        if (elapsedMin < 5 && changePct < 0.01) return prev;
+      }
+      const cutoff = now - 7 * 24 * 60 * 60 * 1000; // keep 7 days
+      const next = [...prev.filter((p) => p.t >= cutoff), { t: now, v: totalValue }].slice(-288);
+      try { localStorage.setItem(KEY, JSON.stringify(next)); } catch { /* quota */ }
+      return next;
+    });
+  }, [totalValue]);
+  return history;
+}
+
+function MiniSparkline({ data, width = 120, height = 36 }) {
+  if (!data || data.length < 2) return null;
+  const vals  = data.map((d) => d.v);
+  const min   = Math.min(...vals);
+  const max   = Math.max(...vals);
+  const range = max - min || 1;
+  const pts   = data.map((d, i) => [
+    (i / (data.length - 1)) * width,
+    height - ((d.v - min) / range) * (height - 4) - 2,
+  ]);
+  const path  = "M " + pts.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" L ");
+  const area  = `${path} L ${width},${height} L 0,${height} Z`;
+  const isUp  = vals[vals.length - 1] >= vals[0];
+  const c     = isUp ? "#4ade80" : "#f87171";
+  return (
+    <svg width={width} height={height} style={{ overflow: "visible", display: "block" }}>
+      <defs>
+        <linearGradient id="pfGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%"   stopColor={c} stopOpacity="0.25" />
+          <stop offset="100%" stopColor={c} stopOpacity="0"    />
+        </linearGradient>
+      </defs>
+      <path d={area} fill="url(#pfGrad)" />
+      <path d={path} stroke={c} strokeWidth="1.5" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx={pts[pts.length - 1][0]} cy={pts[pts.length - 1][1]} r="2.5" fill={c} />
+    </svg>
+  );
+}
 
 // ─── Countdown to next token refresh ───
 function CountdownToRefresh({ fetchedAt, interval = 120000 }) {
@@ -4385,6 +4509,34 @@ export default function App() {
     });
   }, []);
 
+  // ── Derived wallet stats (value + token count per wallet address) ──
+  const walletStats = useMemo(() => {
+    const stats = {};
+    Object.values(walletMintMap).flat().forEach((h) => {
+      if (!stats[h.address]) stats[h.address] = { value: 0, tokenCount: 0 };
+      stats[h.address].value      += h.usdValue || 0;
+      stats[h.address].tokenCount += 1;
+    });
+    return stats;
+  }, [walletMintMap]);
+
+  const portfolioTotalValue = useMemo(
+    () => Object.values(walletStats).reduce((s, w) => s + w.value, 0),
+    [walletStats]
+  );
+  const portfolioHistory = usePortfolioHistory(portfolioTotalValue);
+
+  // Wallet list display options
+  const [walletView,  setWalletView]  = useState("cards"); // "cards" | "list"
+  const [walletOrder, setWalletOrder] = useState("added"); // "added" | "value"
+
+  const sortedWallets = useMemo(() => {
+    if (walletOrder === "value") {
+      return [...wallets].sort((a, b) => (walletStats[b.address]?.value || 0) - (walletStats[a.address]?.value || 0));
+    }
+    return wallets;
+  }, [wallets, walletOrder, walletStats]);
+
   // Filters & sort
   const [sortBy, setSortBy] = useState("vol");
   const [sortDir, setSortDir] = useState("desc");
@@ -4815,6 +4967,24 @@ export default function App() {
                   </button>
                 </div>
               )}
+              {/* View toggle: Cards / List */}
+              {wallets.length > 0 && (
+                <div style={{ display: "flex", gap: 1, background: "#1e293b", borderRadius: 8, padding: 2 }}>
+                  {[{ v: "cards", icon: "⊞", title: "Card view" }, { v: "list", icon: "≡", title: "List view" }].map(({ v, icon, title }) => (
+                    <button key={v} onClick={() => setWalletView(v)} title={title} style={{ padding: "4px 10px", borderRadius: 6, border: "none", background: walletView === v ? "#334155" : "transparent", color: walletView === v ? "#e2e8f0" : "#475569", fontSize: 14, cursor: "pointer", lineHeight: 1 }}>{icon}</button>
+                  ))}
+                </div>
+              )}
+
+              {/* Sort toggle: Added / Value */}
+              {wallets.length > 1 && (
+                <div style={{ display: "flex", gap: 1, background: "#1e293b", borderRadius: 8, padding: 2 }}>
+                  {[{ v: "added", label: "Added" }, { v: "value", label: "$ Value" }].map(({ v, label }) => (
+                    <button key={v} onClick={() => setWalletOrder(v)} style={{ padding: "4px 9px", borderRadius: 6, border: "none", background: walletOrder === v ? "#334155" : "transparent", color: walletOrder === v ? "#e2e8f0" : "#475569", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{label}</button>
+                  ))}
+                </div>
+              )}
+
               <button
                 onClick={() => setShowAddWallet(!showAddWallet)}
                 style={{ padding: "8px 16px", borderRadius: 8, border: "1px solid #4ade8044", background: showAddWallet ? "#4ade8022" : "transparent", color: "#4ade80", fontSize: 13, fontWeight: 600, cursor: "pointer" }}
@@ -4882,18 +5052,32 @@ export default function App() {
               <div className="animate-in" style={{ background: "linear-gradient(135deg, #111827 0%, #0d1321 100%)", border: "1px solid #1e293b", borderRadius: 14, padding: "18px 24px", marginBottom: 16 }}>
                 {/* Row 1: Value + stats */}
                 <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 16, marginBottom: movers.length > 0 ? 14 : 0 }}>
-                  <div>
-                    <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8, color: "#475569", marginBottom: 4 }}>Total Portfolio Value</div>
-                    <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
-                      <span style={{ fontSize: 28, fontWeight: 800, color: totalValue > 0 ? "#f1f5f9" : "#64748b", letterSpacing: -0.5 }}>
-                        {totalValue > 0 ? formatVolume(totalValue) : "—"}
-                      </span>
-                      {pnlKnown && totalValue > 0 && (
-                        <span style={{ fontSize: 13, fontWeight: 700, color: dailyPnl >= 0 ? "#4ade80" : "#f87171" }}>
-                          {dailyPnl >= 0 ? "+" : ""}{formatVolume(Math.abs(dailyPnl))} ({dailyPnl >= 0 ? "+" : ""}{pnlPct.toFixed(1)}%) today
+                  <div style={{ display: "flex", gap: 20, alignItems: "flex-end", flexWrap: "wrap" }}>
+                    <div>
+                      <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8, color: "#475569", marginBottom: 4 }}>Total Portfolio Value</div>
+                      <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
+                        <span style={{ fontSize: 28, fontWeight: 800, color: totalValue > 0 ? "#f1f5f9" : "#64748b", letterSpacing: -0.5 }}>
+                          {totalValue > 0 ? formatVolume(totalValue) : "—"}
                         </span>
-                      )}
+                        {pnlKnown && totalValue > 0 && (
+                          <span style={{ fontSize: 13, fontWeight: 700, color: dailyPnl >= 0 ? "#4ade80" : "#f87171" }}>
+                            {dailyPnl >= 0 ? "+" : ""}{formatVolume(Math.abs(dailyPnl))} ({dailyPnl >= 0 ? "+" : ""}{pnlPct.toFixed(1)}%) today
+                          </span>
+                        )}
+                      </div>
                     </div>
+                    {/* Portfolio history sparkline */}
+                    {portfolioHistory.length >= 2 && (
+                      <div style={{ paddingBottom: 4 }}>
+                        <MiniSparkline data={portfolioHistory} width={110} height={32} />
+                        <div style={{ fontSize: 9, color: "#334155", textAlign: "center", marginTop: 3 }}>
+                          {(() => {
+                            const span = portfolioHistory[portfolioHistory.length - 1].t - portfolioHistory[0].t;
+                            return span > 3600000 ? `${(span / 3600000).toFixed(0)}h history` : `${Math.round(span / 60000)}m history`;
+                          })()}
+                        </div>
+                      </div>
+                    )}
                   </div>
                   <div style={{ display: "flex", gap: 20, paddingTop: 4 }}>
                     <div style={{ textAlign: "center" }}>
@@ -4974,7 +5158,7 @@ export default function App() {
             onRescan={rescanWalletLinks}
           />
 
-          {wallets.map((wallet) => (
+          {sortedWallets.map((wallet) => (
             <WalletCard
               key={wallet.address}
               wallet={wallet}
@@ -4983,6 +5167,8 @@ export default function App() {
               pinnedMints={pinnedMints}
               onPin={pinToken}
               onUpdateLabel={updateWalletLabel}
+              compact={walletView === "list"}
+              walletStats={walletStats}
             />
           ))}
 
